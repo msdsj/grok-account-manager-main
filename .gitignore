@@ -1,0 +1,20 @@
+# Python / uv
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# 运行产物（捕获到的凭证、失败兜底文件）
+output/sso*.txt
+web/dist/
+web/node_modules/
+
+# 本地配置（含 DuckMail / Sub2API 密钥）
+.env
+.env.*
+!.env.example
+
+# 编辑器
+.idea/
+.vscode/
+.DS_Store
