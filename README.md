@@ -4,6 +4,10 @@ MSDSJ 的 Grok 账号注册与凭证管理工具。项目提供 Python 自动化
 
 本项目允许免费使用、学习和二次开发。请勿把 `.env`、Outlook refresh token、浏览器 cookie、SSO token 或 `output/` 里的凭证提交到 GitHub。
 
+## 项目界面
+
+![MSDSJ Grok 注册机控制台](docs/images/dashboard.png)
+
 ## 功能
 
 - Grok 邮箱注册自动化，注册资料姓名和密码每轮随机生成。
