@@ -5,7 +5,8 @@ __pycache__/
 .venv/
 
 # 运行产物（捕获到的凭证、失败兜底文件）
-output/sso*.txt
+output/*
+!output/.gitkeep
 web/dist/
 web/node_modules/
 
@@ -13,8 +14,11 @@ web/node_modules/
 .env
 .env.*
 !.env.example
+outlook_accounts*.txt
+mail_accounts*.txt
 
 # 编辑器
 .idea/
 .vscode/
 .DS_Store
+*.grok_credentials.json

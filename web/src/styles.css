@@ -16,9 +16,9 @@ body {
   background: radial-gradient(ellipse 80% 50% at 50% -10%, rgba(56,189,248,.08), transparent), #0d1117;
 }
 
-button, input { font: inherit; }
+button, input, textarea { font: inherit; }
 button { cursor: pointer; }
-button:disabled, input:disabled { cursor: not-allowed; opacity: 0.45; }
+button:disabled, input:disabled, textarea:disabled { cursor: not-allowed; opacity: 0.45; }
 
 .app-shell { min-height: 100vh; padding: 28px; }
 
@@ -102,6 +102,47 @@ button:disabled, input:disabled { cursor: not-allowed; opacity: 0.45; }
 .run-form input[type="number"]:focus {
   outline: none; border-color: #38bdf8;
   background: rgba(56,189,248,.06); box-shadow: 0 0 0 3px rgba(56,189,248,.15);
+}
+
+.field-group {
+  display: grid; gap: 7px; color: #94a3b8;
+  font-size: 12px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase;
+}
+
+.segmented-control {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+  min-height: 40px; padding: 3px;
+  border: 1px solid rgba(255,255,255,.1); border-radius: 8px;
+  background: rgba(255,255,255,.04);
+}
+
+.segmented-control button {
+  min-width: 0; border: 0; border-radius: 6px;
+  color: #94a3b8; background: transparent;
+  font-size: 12px; font-weight: 800;
+}
+
+.segmented-control button.active {
+  color: #0d1117; background: #38bdf8;
+  box-shadow: 0 3px 12px rgba(56,189,248,.2);
+}
+
+.textarea-field textarea {
+  width: 100%; min-height: 104px; resize: vertical;
+  border: 1px solid rgba(255,255,255,.1); border-radius: 8px;
+  padding: 10px 12px; color: #f1f5f9; background: rgba(255,255,255,.05);
+  line-height: 1.45; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12px;
+}
+
+.textarea-field textarea:focus {
+  outline: none; border-color: #38bdf8;
+  background: rgba(56,189,248,.06); box-shadow: 0 0 0 3px rgba(56,189,248,.15);
+}
+
+.textarea-field small {
+  color: #64748b; font-size: 11px; font-weight: 700;
+  text-transform: none; letter-spacing: 0;
 }
 
 .toggle-row {

@@ -1,152 +1,167 @@
-# ai_signuper
+# grok-account-manager
 
-AI 服务自动注册机框架。当前实现 Grok（xAI），并把产生的 sso JWT 灌入 [Sub2API](https://github.com/Wei-Shaw/sub2api) 当作可分发的上游账号。
+MSDSJ 的 Grok 账号注册与凭证管理工具。项目提供 Python 自动化注册流程和 React 本地控制台，支持 DuckMail 域名邮箱、Outlook 账号池接码、GrokAccount JSON 凭证归档，以及可选推送到外部 Sub2API 实例。
+
+本项目允许免费使用、学习和二次开发。请勿把 `.env`、Outlook refresh token、浏览器 cookie、SSO token 或 `output/` 里的凭证提交到 GitHub。
+
+## 功能
+
+- Grok 邮箱注册自动化，注册资料姓名和密码每轮随机生成。
+- 邮箱源支持 DuckMail 和 Outlook IMAP，Outlook 格式兼容 `邮箱----密码----clientId----refreshToken`。
+- 输出 cockpit-tools 可导入的 GrokAccount JSON 数组。
+- React 控制台支持注册任务、并发、日志、账号列表和 JSON 导出。
+- 可选 `sub2api` sink，把注册结果写入独立部署的 Sub2API 管理 API。
+
+## 环境要求
+
+- Python 3.12 或 3.13
+- uv
+- Google Chrome 或 Chromium
+- Node.js 20+ 与 npm，用于前端开发/构建
+
+注册流程默认打开可见浏览器窗口。Grok 的 Turnstile 验证对 headless 不稳定，不建议后台无窗口运行。
 
 ## 快速开始
 
 ```bash
-# 1. 装依赖（uv 管理；不要用 pip）
 uv sync
-
-# 2. 单轮试跑（产物默认落到 ./output/sso.txt）
-uv run python -m ai_signuper grok --count 1
-
-# 3. 保存 cockpit-tools 可导入的 GrokAccount JSON 数组
-uv run python -m ai_signuper grok --count 1 --sink json
-
-# 4. 同时保存 JSON 和 TXT（推荐）
-uv run python -m ai_signuper grok --count 1 --sink json+txt
-
-# 5. 长跑
-uv run python -m ai_signuper grok --count 0          # 无限循环，Ctrl-C 停
-uv run python -m ai_signuper grok --count 10         # 跑 10 轮
+cp .env.example .env
 ```
 
-注册流程会打开一个**可见的** Chromium 窗口。Turnstile 需要真人化的鼠标轨迹，请把窗口留在前台、不要最小化。
+编辑 `.env`，至少配置 DuckMail：
+
+```bash
+DUCKMAIL_API_KEY=your_duckmail_api_key
+DUCKMAIL_DOMAIN=@msdsj.cyou
+```
+
+单轮注册并保存 JSON：
+
+```bash
+uv run grok-account-manager grok --count 1 --sink json
+```
+
+也可以用模块方式运行：
+
+```bash
+uv run python -m grok_account_manager grok --count 1 --sink json
+```
+
+## Outlook 邮箱源
+
+把 Outlook 账号池保存为本地文件，例如 `outlook_accounts.txt`。该文件已被 `.gitignore` 忽略。
+
+```text
+email@example.com----password----clientId----refreshToken
+```
+
+运行：
+
+```bash
+uv run grok-account-manager grok --count 1 \
+  --email-source outlook \
+  --outlook-accounts-file outlook_accounts.txt \
+  --sink json
+```
+
+也可以在 `.env` 中设置：
+
+```bash
+GROK_ACCOUNT_MANAGER_EMAIL_SOURCE=outlook
+OUTLOOK_ACCOUNTS_FILE=outlook_accounts.txt
+```
 
 ## Web 控制台
 
-项目内置一个 React 控制台，可以设置注册次数、并发账号数，并查看已注册账号列表。
+开发模式需要两个终端：
 
 ```bash
-# 1. 启动本地 API
-uv run ai-signuper-web
+uv run grok-account-manager-web
+```
 
-# 2. 另开终端启动 React 页面
+```bash
 cd web
 npm install
 npm run dev
 ```
 
-打开 `http://127.0.0.1:5173`。React 开发服务器会把 `/api` 代理到 `http://127.0.0.1:8765`。
-
-生产模式也可以先构建前端，然后直接由 Python 服务托管：
+打开 `http://127.0.0.1:5173`。生产模式可先构建前端：
 
 ```bash
 cd web
 npm run build
 cd ..
-uv run ai-signuper-web
+uv run grok-account-manager-web
 ```
 
 然后打开 `http://127.0.0.1:8765`。
 
-控制台会把成功账号继续写到原目录：
+## 输出文件
 
-- `output/credentials/`：cockpit-tools 可导入的 GrokAccount JSON
-- `output/sso.txt`：每行一个 sso cookie 兜底记录
+- `output/credentials/grok_credentials.json`：GrokAccount JSON 数组。
+- `output/sso.txt`：使用 `txt` sink 时写入的 SSO 兜底文本。
+- `output/sso-failed.txt`：Sub2API 写入失败时的兜底文本。
 
-## 完整凭证（JSON 格式）
+`output/` 是运行产物目录，默认不纳入 Git。
 
-使用 `--sink json` 或 `--sink json+txt` 可以保存 cockpit-tools 可直接导入的 GrokAccount JSON 数组：
+## OAuth Refresh Token
 
-```bash
-# 保存到默认目录 output/credentials/
-uv run python -m ai_signuper grok --count 1 --sink json
-
-# 自定义输出目录
-uv run python -m ai_signuper grok --count 1 --sink json --json-output /path/to/credentials
-```
-
-JSON 文件固定保存为数组格式：`[{ ...GrokAccount }]`。字段名和 cockpit-tools 的 Grok 导入/导出保持一致，包含：
-
-- **基本信息**：id, email, auth_mode=oauth, access_token, refresh_token, created_at, last_used
-- **用户身份**：user_id, principal_id, principal_type, team_id, first_name, last_name 等
-- **订阅和配额**：plan_type, quota.subscriptionTier, quota.frequentUsage, quota.occasionalUsage 等
-- **原始 API 响应**：auth_raw, billing_raw, user_raw, subscription_raw, task_usage_raw
-
-如果 OAuth 换取或配额接口失败，`json` sink 也会兜底输出 cockpit-tools 可识别的 OAuth 账号结构；这种情况下可能缺少 `refresh_token` 和配额原始响应，但不会被误写成 `api_key` 格式。
-
-每个凭证保存为独立的 JSON 文件：`grok_{timestamp}_{email_hash}.json`
-
-**实现原理**：注册完成后默认使用浏览器里的 `sso` cookie 生成 cockpit-tools 可导入 JSON，并尽量调用以下 API 补全用户、订阅和配额：
-- `https://cli-chat-proxy.grok.com/v1/billing` - 账单和配额
-- `https://cli-chat-proxy.grok.com/v1/user` - 用户信息
-- `https://grok.com/rest/subscriptions` - 订阅详情
-- `https://grok.com/rest/tasks/usage` - 任务使用情况
-
-如需尝试换取 `refresh_token / id_token`，可显式加 `--oauth-exchange`：
+默认 JSON 会基于浏览器里的 `sso` cookie 尝试补全用户、订阅和额度信息。如需尝试换取 `refresh_token / id_token`：
 
 ```bash
-uv run python -m ai_signuper grok --count 1 --sink json --oauth-exchange
+uv run grok-account-manager grok --count 1 --sink json --oauth-exchange
 ```
 
-注意：`--oauth-exchange` 走 xAI Authorization Code + PKCE loopback 流程，会在本机监听 `127.0.0.1:56121/callback`。邮箱登录入口和最终“允许”授权会自动推进；Cloudflare 真人验证仍可能需要人工完成。浏览器回调本机后，程序再换取 `refresh_token`。
+该流程会监听 `127.0.0.1:56121/callback` 并可能需要人工完成网页授权或 Turnstile。
 
-## 灌入 Sub2API
+## Sub2API
 
-部署 Sub2API（参见 `sub2api/README.md`），在管理后台 `/admin/settings` 生成 Admin API Key，复制到项目根 `.env`：
+本仓库不再 vendored Sub2API 源码。请独立部署 [Sub2API](https://github.com/Wei-Shaw/sub2api)，在管理后台生成 Admin API Key 后配置：
 
 ```bash
-cp .env.example .env
-# 填 SUB2API_BASE_URL 和 SUB2API_ADMIN_API_KEY
+SUB2API_BASE_URL=http://localhost:8080
+SUB2API_ADMIN_API_KEY=your_admin_api_key
 ```
 
-然后：
+推送：
 
 ```bash
-uv run python -m ai_signuper grok --count 1 --sink sub2api
+uv run grok-account-manager grok --count 1 --sink sub2api
 ```
 
-注册成功的账号会以 `platform=grok, type=apikey, credentials.api_key=<sso jwt>` 的形态写入 Sub2API。批量入库失败会兜底落 `output/sso-failed.txt`，避免丢账号。
+## 项目结构
 
-## 目录结构
-
-```
-src/ai_signuper/
-  __main__.py        # CLI 入口
-  runtime.py         # Chromium 启停 + Python 守卫
-  mail_otp.py        # DuckMail + 验证码（provider 共用）
-  grok_api.py        # 使用 sso token 调用 xAI API 获取完整凭证
-  providers/
-    base.py          # Provider 协议（实现新 provider 时实现它）
-    grok.py          # Grok 注册流程
-  sinks/
-    base.py          # Sink 协议
-    txt_file.py      # 兜底：append 到 sso.txt
-    json_credential.py  # 保存完整 JSON 格式凭证
-    sub2api.py       # 灌入 Sub2API 管理 API
-turnstilePatch/      # Cloudflare Turnstile 鼠标坐标 spoof 扩展
-sub2api/             # vendored 的 Sub2API 网关（独立 .git，不要在里面 git push）
-output/              # 运行产物
-  sso.txt            # txt sink 输出（仅 sso cookie）
-  credentials/       # json sink 输出（完整凭证 JSON 文件）
-  sso-failed.txt     # sub2api sink 失败时的后备
+```text
+src/grok_account_manager/
+  cli.py                  # CLI 参数解析和轮次调度
+  core/browser.py         # Chromium 启停、扩展加载、cookie 等待
+  mail/duckmail.py        # DuckMail 接码
+  mail/sources.py         # DuckMail / Outlook 邮箱源
+  grok/client.py          # GrokAccount JSON 构建与额度 API
+  grok/oauth_exchange.py  # xAI OAuth PKCE loopback
+  providers/grok.py       # Grok 注册页面自动化
+  sinks/                  # JSON/TXT/Sub2API 输出
+  webapp/server.py        # 本地 API 和静态页面服务
+extensions/turnstile_patch/
+web/src/
+scripts/
+docs/
 ```
 
-## 加一个新 provider
+## 验证
 
-1. 在 `src/ai_signuper/providers/` 新建 `<name>.py`，写一个类实现 `Provider` 协议（见 `providers/base.py`）：`name / signup_url / chrome_lang / success_cookie_name` + `run_round(session)`。
-2. 在 `__main__.py` 的 `PROVIDERS` 字典里注册它。
-3. `chrome_lang` 决定页面渲染语言；如果你的 `run_round` 里写死了某种语言的按钮文本，就要用对应的 lang，否则按钮匹配会落空。
-4. 凭证类型不一样时直接复用 sinks——sub2api sink 用 `provider.name` 当 platform，credentials 字段 hack 走 `apikey`。
-5. 在 README 这一节加一条记录该 provider 的 sink 行为。
+```bash
+python3 -X pycache_prefix=/private/tmp/grok-account-manager-pyc -m compileall src
+cd web && npm run build
+```
 
-## 已知陷阱
+## 开源说明与致谢
 
-详见 `CLAUDE.md`。摘要：
+本项目由 MSDSJ 维护，允许免费使用和二次开发。项目实现参考和感谢以下开源项目：
 
-- **Python 必须 3.12 / 3.13**，3.14 上原 Mail.tm TLS 偶发挂掉（现已改用 DuckMail，但 `requires-python` 限制保留）。
-- **Chrome 必须 zh-CN locale**：所有按钮匹配字符串是中文。`runtime.build_chromium_options` 已强制 `--lang=zh-CN`。
-- **页面交互必须 JS 注入**：x.ai 是 React 受控表单，Python `.input()` 会让 React 内部状态不同步、按钮永远 disabled。providers/grok.py 里的 JS 块不要"简化"。
-- **每轮重启浏览器**，不要复用 cookie / session（反检测）。
+- [cockpit-tools](https://github.com/jlcodes99/cockpit-tools)：GrokAccount JSON 结构、OAuth 账号管理和导入格式参考。
+- [Kiro-account-manager](https://github.com/chaogei/Kiro-account-manager)：账号池管理、邮箱账号格式和桌面账号管理产品思路参考。
+- [Sub2API](https://github.com/Wei-Shaw/sub2api)：可选的账号下游管理 API，本项目仅通过其 Admin API 写入账号。
+- Turnstile MouseEvent patch 思路来自仓库内 `extensions/turnstile_patch/` 所保留的扩展说明。
+
+本项目与 xAI、Grok、Microsoft、Outlook、DuckMail、cockpit-tools、Kiro-account-manager、Sub2API 官方均无隶属关系。使用者需要自行遵守相关服务条款、当地法律和开源许可证要求。

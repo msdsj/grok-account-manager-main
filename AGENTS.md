@@ -2,21 +2,21 @@
 
 ## Project Structure & Module Organization
 
-This repository contains a Python automation package with a React control panel.
-Python source lives in `src/ai_signuper/`: `__main__.py` is the CLI entry,
-`web_server.py` serves the local API/UI, `providers/` contains registration
-flows such as `grok.py`, and `sinks/` contains output targets such as TXT,
-JSON credentials, and Sub2API. The React app lives in `web/src/`, with Vite
-configuration in `web/vite.config.ts`. Browser patch assets are in
-`turnstilePatch/`. Runtime output is written under `output/` and should not be
-treated as source.
+This repository contains the MSDSJ `grok-account-manager` Python automation
+package with a React control panel. Python source lives in
+`src/grok_account_manager/`: `cli.py` is the CLI entry, `webapp/server.py`
+serves the local API/UI, `providers/` contains registration flows such as
+`grok.py`, and `sinks/` contains output targets such as TXT, JSON credentials,
+and Sub2API. The React app lives in `web/src/`, with Vite configuration in
+`web/vite.config.ts`. Browser patch assets are in `extensions/turnstile_patch/`.
+Runtime output is written under `output/` and should not be treated as source.
 
 ## Build, Test, and Development Commands
 
 - `uv sync`: install Python dependencies from `pyproject.toml` and `uv.lock`.
-- `uv run python -m ai_signuper grok --count 1 --sink json+txt`: run one local
+- `uv run grok-account-manager grok --count 1 --sink json+txt`: run one local
   registration round and write JSON plus TXT outputs.
-- `uv run ai-signuper-web`: start the Python API and static UI host on
+- `uv run grok-account-manager-web`: start the Python API and static UI host on
   `127.0.0.1:8765`.
 - `cd web && npm install`: install frontend dependencies.
 - `cd web && npm run dev`: start the React dev server on `127.0.0.1:5173`.
@@ -37,7 +37,7 @@ interface.
 No dedicated test suite is currently present. Before submitting backend
 changes, at minimum run `uv run python -m compileall src`. For frontend changes,
 run `cd web && npm run build`. If adding tests, place Python tests under
-`tests/` mirroring `src/ai_signuper/`, and name files `test_<module>.py`.
+`tests/` mirroring `src/grok_account_manager/`, and name files `test_<module>.py`.
 
 ## Commit & Pull Request Guidelines
 

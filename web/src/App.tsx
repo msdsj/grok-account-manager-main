@@ -24,6 +24,8 @@ type JobStatus =
   | "completed_with_errors"
   | "stopped";
 
+type EmailSource = "duckmail" | "outlook";
+
 interface JobEvent {
   id: string;
   time: number;
@@ -40,6 +42,8 @@ interface RegistrationJob {
   total: number;
   concurrency: number;
   oauthExchange: boolean;
+  emailSource?: EmailSource;
+  outlookAccountCount?: number;
   issued: number;
   completed: number;
   failed: number;
@@ -136,6 +140,8 @@ export function App() {
   const [total, setTotal] = useState(5);
   const [concurrency, setConcurrency] = useState(1);
   const [oauthExchange, setOauthExchange] = useState(true);
+  const [emailSource, setEmailSource] = useState<EmailSource>("duckmail");
+  const [outlookData, setOutlookData] = useState("");
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [exporting, setExporting] = useState(false);
@@ -210,6 +216,9 @@ export function App() {
   const allSelected =
     accountsWithKeys.length > 0 &&
     accountsWithKeys.every((account) => selectedAccounts.has(account.rowKey));
+  const outlookAccountCount = useMemo(() => countOutlookAccounts(outlookData), [outlookData]);
+  const startDisabled =
+    isRunning || submitting || (emailSource === "outlook" && outlookAccountCount === 0);
 
   const latestEvents = useMemo(() => {
     return [...(job?.events || [])].reverse().slice(0, 80);
@@ -236,6 +245,8 @@ export function App() {
           total,
           concurrency: safeConcurrency,
           oauthExchange,
+          emailSource,
+          outlookData: emailSource === "outlook" ? outlookData : "",
         }),
       });
       setState((current) => ({ ...current, job: response.job }));
@@ -303,7 +314,7 @@ export function App() {
       const contentType = response.headers.get("Content-Type") || "";
       if (!response.ok) {
         if (response.status === 404) {
-          throw new Error("导出接口不存在，请重启后端 ai-signuper-web 后再试");
+          throw new Error("导出接口不存在，请重启后端 grok-account-manager-web 后再试");
         }
         if (contentType.includes("application/json")) {
           const data = (await response.json()) as { error?: string };
@@ -341,8 +352,8 @@ export function App() {
             <Cpu size={22} />
           </div>
           <div>
-            <span className="eyebrow">Grok Automation Console</span>
-            <h1>MSDSJ GROK注册机</h1>
+            <span className="eyebrow">grok-account-manager</span>
+            <h1>MSDSJ Grok 注册机</h1>
             <p>任务运行 / Token 状态 / 凭据归档</p>
           </div>
         </div>
@@ -419,11 +430,47 @@ export function App() {
               <span>获取 refresh_token</span>
             </label>
 
+            <div className="field-group">
+              <span>邮箱源</span>
+              <div className="segmented-control">
+                <button
+                  type="button"
+                  className={emailSource === "duckmail" ? "active" : ""}
+                  disabled={isRunning}
+                  onClick={() => setEmailSource("duckmail")}
+                >
+                  DuckMail
+                </button>
+                <button
+                  type="button"
+                  className={emailSource === "outlook" ? "active" : ""}
+                  disabled={isRunning}
+                  onClick={() => setEmailSource("outlook")}
+                >
+                  Outlook
+                </button>
+              </div>
+            </div>
+
+            {emailSource === "outlook" && (
+              <label className="textarea-field">
+                <span>Outlook 账号池</span>
+                <textarea
+                  value={outlookData}
+                  disabled={isRunning}
+                  placeholder="email----password----clientId----refreshToken"
+                  spellCheck={false}
+                  onChange={(event) => setOutlookData(event.target.value)}
+                />
+                <small>{outlookAccountCount > 0 ? `已识别 ${outlookAccountCount} 个邮箱` : "未识别到有效账号"}</small>
+              </label>
+            )}
+
             <div className="action-row">
               <button
                 className="primary-btn"
                 type="submit"
-                disabled={isRunning || submitting}
+                disabled={startDisabled}
               >
                 {submitting && !isRunning ? <Loader2 size={18} className="spin" /> : <Play size={18} />}
                 开始
@@ -461,6 +508,7 @@ export function App() {
               <span>失败 {job?.failed ?? 0}</span>
               <span>活跃 {job?.active ?? 0}</span>
               <span>启动异常 {job?.workerErrors ?? 0}</span>
+              <span>邮箱源 {job?.emailSource === "outlook" ? `Outlook(${job.outlookAccountCount ?? 0})` : "DuckMail"}</span>
             </div>
           </div>
         </aside>
@@ -650,6 +698,13 @@ function maskTextEmails(text: string): string {
   return String(text || "").replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, (email) =>
     maskEmail(email),
   );
+}
+
+function countOutlookAccounts(data: string): number {
+  const raw = String(data || "").trim();
+  if (!raw) return 0;
+  const entries = raw.includes("\n") ? raw.split(/\r?\n/) : raw.split(/\s+/);
+  return entries.filter((entry) => entry.split(/-{4,}/).length === 4).length;
 }
 
 function QuotaCell({ quota }: { quota: AccountRecord["quota"] }) {
