@@ -1,4 +1,4 @@
-"""把凭证按行追加到文本文件的 sink。每行一条凭证（如 sso JWT），无结构。"""
+"""把凭证按行追加到文本文件的  sink。每行一条凭证（如 sso JWT），无结构。"""
 
 from __future__ import annotations
 

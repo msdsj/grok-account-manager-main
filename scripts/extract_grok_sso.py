@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env  python3
 """从已登录的 Grok 浏览器会话中提取 sso token。
 
 用法：

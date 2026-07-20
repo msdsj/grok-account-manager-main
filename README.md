@@ -1,5 +1,5 @@
 # grok-account-manager
-
+ 
 MSDSJ 的 Grok 账号注册与凭证管理工具。项目提供 Python 自动化注册流程和 React 本地控制台，支持 DuckMail 域名邮箱、Outlook 账号池接码、GrokAccount JSON 凭证归档，以及可选推送到外部 Sub2API 实例。
 
 本项目允许免费使用、学习和二次开发。请勿把 `.env`、Outlook refresh token、浏览器 cookie、SSO token 或 `output/` 里的凭证提交到 GitHub。

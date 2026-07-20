@@ -1,4 +1,4 @@
-"""邮箱源抽象：DuckMail 和 Outlook IMAP 取码。"""
+"""邮箱源抽象：DuckMail  和 Outlook IMAP 取码。"""
 
 from __future__ import annotations
 

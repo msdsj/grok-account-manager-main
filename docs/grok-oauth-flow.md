@@ -1,4 +1,4 @@
-# Grok OAuth Flow
+#  Grok OAuth Flow
 
 Grok 注册完成后默认会用浏览器中的 `sso` cookie 生成 GrokAccount JSON。需要
 `refresh_token / id_token` 时，可以显式开启 OAuth 交换：

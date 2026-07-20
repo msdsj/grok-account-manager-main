@@ -1,4 +1,4 @@
-# DuckMail 邮箱源
+#  DuckMail 邮箱源
 
 DuckMail 是默认邮箱源，用于自动创建临时邮箱并轮询 Grok 验证码。
 

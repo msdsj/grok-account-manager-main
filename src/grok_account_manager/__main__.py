@@ -1,4 +1,4 @@
-"""`python -m grok_account_manager` entry."""
+"""`python  -m grok_account_manager` entry."""
 
 from .cli import main
 

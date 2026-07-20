@@ -1,4 +1,4 @@
-"""使用 sso cookie (access_token) 调用 xAI API 获取完整账号信息。
+"""使用 sso cookie (access_token) 调用  xAI API 获取完整账号信息。
 
 参考 cockpit-tools 的实现，调用以下 API：
 - /v1/billing - 账单和配额

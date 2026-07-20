@@ -1,4 +1,4 @@
-"""运行期工具：Python 解释器守卫 + Chromium 浏览器会话封装。"""
+"""运行期工具：Python  解释器守卫 + Chromium 浏览器会话封装。"""
 
 from __future__ import annotations
 

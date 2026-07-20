@@ -1,4 +1,4 @@
-"""Grok (xAI) 注册流程。
+"""Grok  (xAI) 注册流程。
 
 页面交互全部走 page.run_js() 注入 JS：x.ai 是 React 受控表单，必须经过
 HTMLInputElement.prototype 原生 setter + _valueTracker 重置才能让按钮可点击。

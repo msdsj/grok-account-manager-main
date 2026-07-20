@@ -1,4 +1,4 @@
-"""Sub2API sink：把注册产物批量灌入 Sub2API 的管理员账号 API。
+"""Sub2API  sink：把注册产物批量灌入 Sub2API 的管理员账号 API。
 
 接口规格（已读源码确认）：
 - 路径：POST {base_url}/api/v1/admin/accounts/batch

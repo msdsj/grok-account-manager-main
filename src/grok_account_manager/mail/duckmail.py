@@ -1,4 +1,4 @@
-"""通用临时邮箱 + 验证码工具（DuckMail）。
+"""通用临时邮箱  + 验证码工具（DuckMail）。
 
 虽然历史上叫 openai_register.py，但实际是 provider-agnostic 的邮箱 OTP 工具，
 被 grok / openai / 任何需要邮箱验证码的注册流程复用。

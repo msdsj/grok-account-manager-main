@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env  python3
 """连接到现有的 Chrome/Chromium 浏览器并提取 Grok sso token。
 
 前置条件：

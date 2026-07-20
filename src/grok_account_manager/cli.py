@@ -1,4 +1,4 @@
-"""CLI 入口：`uv run grok-account-manager grok --count 1 --sink json`"""
+"""CLI  入口：`uv run grok-account-manager grok --count 1 --sink json`"""
 
 from __future__ import annotations
 

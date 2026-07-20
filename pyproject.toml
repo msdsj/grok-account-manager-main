@@ -1,5 +1,5 @@
 [project]
-name = "grok-account-manager"
+ name = "grok-account-manager"
 version = "0.1.0"
 description = "MSDSJ Grok account registration and credential manager"
 readme = "README.md"

@@ -1,5 +1,5 @@
 # Repository Guidelines
-
+ 
 ## Project Structure & Module Organization
 
 This repository contains the MSDSJ `grok-account-manager` Python automation

@@ -1,4 +1,4 @@
-"""本地 Web 控制台：注册任务 API + 静态前端文件服务。"""
+"""本地  Web 控制台：注册任务 API + 静态前端文件服务。"""
 
 from __future__ import annotations
 

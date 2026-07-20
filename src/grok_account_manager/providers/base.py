@@ -1,4 +1,4 @@
-"""Provider 抽象。每个 AI 服务实现一个 Provider，描述 signup URL、所需浏览器语言、
+"""Provider  抽象。每个 AI 服务实现一个 Provider，描述 signup URL、所需浏览器语言、
 成功后取的 cookie 名，以及一轮完整的注册流程。"""
 
 from __future__ import annotations

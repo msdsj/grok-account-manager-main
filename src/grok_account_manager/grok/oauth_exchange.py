@@ -1,4 +1,4 @@
-"""使用 xAI Authorization Code + PKCE 换取 Grok OAuth tokens。
+"""使用 xAI Authorization Code  + PKCE 换取 Grok OAuth tokens。
 
 cockpit-tools 的 Grok 获取 refresh_token 走的是标准 OAuth 授权码流程：
 打开 xAI authorization_endpoint，监听 127.0.0.1:56121/callback，拿到 code 后

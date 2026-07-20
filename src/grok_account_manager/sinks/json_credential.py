@@ -1,4 +1,4 @@
-"""JSON 格式凭证 sink - 将所有 Grok 凭证追加到单个 JSON 数组文件。"""
+"""JSON  格式凭证 sink - 将所有 Grok 凭证追加到单个 JSON 数组文件。"""
 
 from __future__ import annotations
 
