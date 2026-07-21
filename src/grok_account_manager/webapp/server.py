@@ -300,11 +300,16 @@ class RegistrationJobManager:
 
     def stop(self) -> dict | None:
         with self._lock:
+            sessions_to_close: list[DrissionBrowserSession] = []
             if self._job and self._job.get("status") in {"running", "stopping"}:
                 self._job["status"] = "stopping"
-                self._event_locked("warning", "已请求停止；所有 worker 将在当前轮次完成后退出")
+                self._event_locked("warning", "已请求停止，正在关闭所有浏览器进程")
                 self._stop_event.set()
-            return self.snapshot()
+                sessions_to_close = list(self._sessions)
+            snapshot = self.snapshot()
+        if sessions_to_close:
+            self._close_sessions(sessions_to_close)
+        return snapshot
 
     def _close_sessions(self, sessions: list[DrissionBrowserSession]) -> None:
         for session in sessions:

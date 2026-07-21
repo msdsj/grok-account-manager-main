@@ -4,8 +4,9 @@ cockpit-tools 的 Grok 获取 refresh_token 走的是标准 OAuth 授权码流�
 打开 xAI authorization_endpoint，监听 127.0.0.1:56121/callback，拿到 code 后
 用 code_verifier 换 access_token / refresh_token / id_token。
 
-这里复用注册后已有登录态的浏览器 session，只自动推进邮箱、密码、邮箱验证码和授权确认页；
-Cloudflare 真人验证仍交给用户手动完成，避免错误提交导致 Invalid action。
+这里复用注册后已有登录态的浏览器 session，自动推进邮箱、密码、邮箱验证码、
+Cloudflare 真人验证复选框（与注册流程同一种 shadow DOM 点击方式）和授权确认页；
+自动点击失败时才回退到等待用户手动完成，避免错误提交导致 Invalid action。
 """
 
 from __future__ import annotations
@@ -305,6 +306,31 @@ def exchange_sso_for_oauth_tokens(
             callback_server.server_close()
 
 
+def _try_click_turnstile_checkbox(page) -> bool:
+    """尝试自动点击 Cloudflare Turnstile 复选框（与注册流程 _get_turnstile_token 同一手法）。"""
+    try:
+        challenge_solution = page.ele("@name=cf-turnstile-response")
+        challenge_wrapper = challenge_solution.parent()
+        challenge_iframe = challenge_wrapper.shadow_root.ele("tag:iframe")
+        challenge_iframe.run_js(
+            """
+function getRandomInt(min, max) {
+    return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+let screenX = getRandomInt(800, 1200);
+let screenY = getRandomInt(400, 600);
+Object.defineProperty(MouseEvent.prototype, 'screenX', { value: screenX });
+Object.defineProperty(MouseEvent.prototype, 'screenY', { value: screenY });
+            """
+        )
+        challenge_iframe_body = challenge_iframe.ele("tag:body").shadow_root
+        challenge_button = challenge_iframe_body.ele("tag:input")
+        challenge_button.click()
+        return True
+    except Exception:
+        return False
+
+
 def _drive_pkce_authorization_page(
     session,
     callback_queue: "queue.Queue[CallbackResult]",
@@ -540,8 +566,13 @@ return 'idle';
             continue
 
         if action == "needs-human-turnstile":
-            if "turnstile" not in notices:
-                print("[OAuth Exchange] 等待你手动完成 Cloudflare 真人验证...")
+            clicked = _try_click_turnstile_checkbox(page)
+            if clicked:
+                if "turnstile" not in notices:
+                    print("[OAuth Exchange] 已自动点击 Cloudflare 验证复选框，等待通过...")
+                    notices.add("turnstile")
+            elif "turnstile" not in notices:
+                print("[OAuth Exchange] 自动点击失败，等待你手动完成 Cloudflare 真人验证...")
                 notices.add("turnstile")
             time.sleep(2)
             continue
