@@ -312,11 +312,17 @@ class RegistrationJobManager:
         return snapshot
 
     def _close_sessions(self, sessions: list[DrissionBrowserSession]) -> None:
-        for session in sessions:
+        def _close_one(session: DrissionBrowserSession) -> None:
             try:
                 session.stop()
             except Exception:
                 pass
+
+        threads = [threading.Thread(target=_close_one, args=(session,), daemon=True) for session in sessions]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
 
     def _register_session(self, session: DrissionBrowserSession) -> None:
         with self._lock:

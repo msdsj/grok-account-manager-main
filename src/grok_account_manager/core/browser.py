@@ -168,7 +168,7 @@ class DrissionBrowserSession:
     def stop(self):
         if self._browser is not None:
             try:
-                self._browser.quit()
+                self._browser.quit(timeout=2, force=True)
             except Exception:
                 pass
         self._browser = None
