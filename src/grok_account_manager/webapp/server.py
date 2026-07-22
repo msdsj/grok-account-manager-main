@@ -26,6 +26,7 @@ from ..core.browser import (
 )
 from ..sinks.json_credential import JsonCredentialSink
 from ..sinks.txt_file import TxtFileSink
+from .relay import RELAY_MANAGER
 
 OUTPUT_DIR = PROJECT_ROOT / "output"
 CREDENTIALS_DIR = OUTPUT_DIR / "credentials"
@@ -220,6 +221,19 @@ def export_credentials(export_keys: list[str]) -> list[dict]:
     return exported
 
 
+def export_all_credentials() -> list[dict]:
+    exported: list[dict] = []
+    CREDENTIALS_DIR.mkdir(parents=True, exist_ok=True)
+    for file_path in sorted(CREDENTIALS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+        try:
+            data = json.loads(file_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        items = data if isinstance(data, list) else [data]
+        exported.extend(item for item in items if isinstance(item, dict))
+    return exported
+
+
 class RegistrationJobManager:
     def __init__(self) -> None:
         self._lock = threading.RLock()
@@ -243,6 +257,8 @@ class RegistrationJobManager:
         email_source: str = "duckmail",
         outlook_data: str = "",
         outlook_accounts_file: str = "",
+        google_data: str = "",
+        google_accounts_file: str = "",
     ) -> dict:
         total = _safe_int(total, default=1, minimum=1, maximum=10_000)
         requested_concurrency = _safe_int(concurrency, default=1, minimum=1, maximum=20)
@@ -258,6 +274,8 @@ class RegistrationJobManager:
             email_source=email_source,
             outlook_data=outlook_data,
             outlook_file=outlook_accounts_file,
+            google_data=google_data,
+            google_file=google_accounts_file,
         )
 
         with self._lock:
@@ -274,6 +292,7 @@ class RegistrationJobManager:
                 "oauthExchange": bool(oauth_exchange),
                 "emailSource": getattr(mail_source, "name", email_source),
                 "outlookAccountCount": getattr(mail_source, "count", 0) if getattr(mail_source, "name", "") == "outlook" else 0,
+                "googleAccountCount": getattr(mail_source, "count", 0) if getattr(mail_source, "name", "") in {"gmail", "google"} else 0,
                 "issued": 0,
                 "completed": 0,
                 "failed": 0,
@@ -602,12 +621,21 @@ class WebHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
+        if self._maybe_proxy_relay(parsed, body=b""):
+            return
         try:
             if parsed.path == "/api/accounts":
                 self._send_json({"accounts": list_accounts()})
                 return
             if parsed.path in {"/api/state", "/api/jobs/current"}:
-                self._send_json({"job": JOB_MANAGER.snapshot(), "accounts": list_accounts()})
+                self._send_json({
+                    "job": JOB_MANAGER.snapshot(),
+                    "accounts": list_accounts(),
+                    "relay": RELAY_MANAGER.snapshot(),
+                })
+                return
+            if parsed.path == "/api/relay":
+                self._send_json({"relay": RELAY_MANAGER.snapshot()})
                 return
         except Exception as error:
             self._send_json({"error": str(error)}, status=500)
@@ -616,6 +644,10 @@ class WebHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path.startswith("/v1/") or parsed.path.startswith("/admin/api/"):
+            body = self._read_raw_body()
+            if self._maybe_proxy_relay(parsed, body=body):
+                return
         try:
             if parsed.path == "/api/register":
                 body = _read_json_body(self)
@@ -626,6 +658,8 @@ class WebHandler(BaseHTTPRequestHandler):
                     email_source=str(body.get("emailSource") or "duckmail"),
                     outlook_data=str(body.get("outlookData") or ""),
                     outlook_accounts_file=str(body.get("outlookAccountsFile") or ""),
+                    google_data=str(body.get("googleData") or ""),
+                    google_accounts_file=str(body.get("googleAccountsFile") or ""),
                 )
                 self._send_json({"job": job})
                 return
@@ -649,9 +683,85 @@ class WebHandler(BaseHTTPRequestHandler):
                 result = refresh_account_quota(account_id)
                 self._send_json(result)
                 return
+            if parsed.path == "/api/relay/config":
+                body = _read_json_body(self)
+                self._send_json({"relay": RELAY_MANAGER.update_config(body)})
+                return
+            if parsed.path == "/api/relay/start":
+                self._send_json({"relay": RELAY_MANAGER.start()})
+                return
+            if parsed.path == "/api/relay/stop":
+                self._send_json({"relay": RELAY_MANAGER.stop()})
+                return
+            if parsed.path == "/api/relay/sync-accounts":
+                body = _read_json_body(self)
+                export_keys = body.get("exportKeys") or []
+                credentials = export_credentials(export_keys) if export_keys else export_all_credentials()
+                result = RELAY_MANAGER.sync_accounts(credentials)
+                self._send_json({"sync": result, "relay": RELAY_MANAGER.snapshot()})
+                return
+            if parsed.path == "/api/relay/models":
+                body = _read_json_body(self)
+                result = RELAY_MANAGER.probe_models(probe_chat=bool(body.get("probeChat", True)))
+                self._send_json({"result": result, "relay": RELAY_MANAGER.snapshot()})
+                return
             self._send_json({"error": "not found"}, status=404)
         except Exception as error:
             self._send_json({"error": str(error)}, status=400)
+
+    def do_PUT(self) -> None:
+        parsed = urlparse(self.path)
+        body = self._read_raw_body()
+        if self._maybe_proxy_relay(parsed, body=body):
+            return
+        self._send_json({"error": "not found"}, status=404)
+
+    def do_DELETE(self) -> None:
+        parsed = urlparse(self.path)
+        body = self._read_raw_body()
+        if self._maybe_proxy_relay(parsed, body=body):
+            return
+        self._send_json({"error": "not found"}, status=404)
+
+    def _read_raw_body(self) -> bytes:
+        length = int(self.headers.get("Content-Length") or "0")
+        if length <= 0:
+            return b""
+        return self.rfile.read(length)
+
+    def _maybe_proxy_relay(self, parsed, body: bytes) -> bool:
+        if not (parsed.path.startswith("/v1/") or parsed.path.startswith("/admin/api/")):
+            return False
+        try:
+            response = RELAY_MANAGER.proxy_request(
+                self.command,
+                parsed.path,
+                query=parsed.query,
+                headers={key: value for key, value in self.headers.items()},
+                body=body,
+            )
+            self._send_proxy_response(response)
+        except Exception as error:
+            self._send_json({"error": str(error)}, status=502)
+        return True
+
+    def _send_proxy_response(self, response) -> None:
+        raw = response.content or b""
+        self.send_response(response.status_code)
+        self._send_cors_headers()
+        blocked_headers = {
+            "content-length",
+            "transfer-encoding",
+            "connection",
+            "content-encoding",
+        }
+        for key, value in response.headers.items():
+            if key.lower() in blocked_headers:
+                continue
+            self.send_header(key, value)
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
 
     def _send_empty(self, status: int) -> None:
         self.send_response(status)

@@ -106,7 +106,7 @@ def main() -> None:
     parser.add_argument(
         "--oauth-exchange",
         action="store_true",
-        help="注册后尝试 xAI OAuth PKCE loopback 换取 refresh_token；需要网页授权，默认关闭以避免卡住注册",
+        help="注册后尝试 xAI OAuth Device Flow 换取 refresh_token；需要网页授权，默认关闭以避免卡住注册",
     )
     parser.add_argument(
         "--headless",
@@ -115,9 +115,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--email-source",
-        choices=["duckmail", "outlook"],
+        choices=["duckmail", "outlook", "gmail", "google"],
         default=os.environ.get("GROK_ACCOUNT_MANAGER_EMAIL_SOURCE", "duckmail"),
-        help="邮箱来源：duckmail 或 outlook",
+        help="邮箱来源：duckmail、outlook、gmail 或 google；google 表示走 Google 账号注册按钮",
     )
     parser.add_argument(
         "--outlook-accounts-file",
@@ -129,6 +129,16 @@ def main() -> None:
         default=os.environ.get("OUTLOOK_ACCOUNTS", ""),
         help="Outlook 账号池原文，支持多行，格式为 邮箱----密码----clientId----refreshToken",
     )
+    parser.add_argument(
+        "--google-accounts-file",
+        default=os.environ.get("GOOGLE_ACCOUNTS_FILE", ""),
+        help="Google 账号文件路径，每行格式为 邮箱----密码----辅助邮箱(可选)",
+    )
+    parser.add_argument(
+        "--google-accounts",
+        default=os.environ.get("GOOGLE_ACCOUNTS", ""),
+        help="Google 账号池原文，支持多行；gmail 模式建议填 邮箱----应用专用密码",
+    )
     args = parser.parse_args()
 
     provider_cls = PROVIDERS[args.provider]
@@ -139,6 +149,8 @@ def main() -> None:
         email_source=args.email_source,
         outlook_data=args.outlook_accounts,
         outlook_file=args.outlook_accounts_file,
+        google_data=args.google_accounts,
+        google_file=args.google_accounts_file,
     )
     sink = _make_sink(args)
 

@@ -41,25 +41,35 @@ class GrokProvider:
         if self.stop_event and self.stop_event.is_set():
             raise RuntimeError("任务已在开始前停止")
 
-        mailbox = (self.mail_source or DuckMailSource()).create_mailbox()
+        mail_source = self.mail_source or DuckMailSource()
+        mailbox = mail_source.create_mailbox()
+        registration_mode = getattr(mail_source, "registration_mode", "email")
 
         session.open_url(self.signup_url)
-        _click_email_signup_button(session.page)
 
-        if self.stop_event and self.stop_event.is_set():
-            raise RuntimeError("任务已停止")
+        if registration_mode == "google":
+            email = _register_with_google_account(session, mailbox, self.stop_event)
+            profile = {
+                "email": email,
+                "auth_provider": "google",
+            }
+        else:
+            _click_email_signup_button(session)
 
-        email = _fill_email_and_submit(session.page, mailbox.email)
+            if self.stop_event and self.stop_event.is_set():
+                raise RuntimeError("任务已停止")
 
-        if self.stop_event and self.stop_event.is_set():
-            raise RuntimeError("任务已停止")
+            email = _fill_email_and_submit(session, mailbox.email)
 
-        _fill_code_and_submit(session, email, mailbox, self.stop_event)
+            if self.stop_event and self.stop_event.is_set():
+                raise RuntimeError("任务已停止")
 
-        if self.stop_event and self.stop_event.is_set():
-            raise RuntimeError("任务已停止")
+            _fill_code_and_submit(session, email, mailbox, self.stop_event)
 
-        profile = _fill_profile_and_submit(session)
+            if self.stop_event and self.stop_event.is_set():
+                raise RuntimeError("任务已停止")
+
+            profile = _fill_profile_and_submit(session)
 
         if self.stop_event and self.stop_event.is_set():
             raise RuntimeError("任务已停止")
@@ -80,13 +90,25 @@ class GrokProvider:
             oauth_tokens = None
             if self.enable_oauth_exchange:
                 try:
-                    print(f"[Grok] 尝试换取 OAuth tokens...")
+                    oauth_password = profile.get("password")
+                    oauth_recovery_email = None
+                    if registration_mode == "google":
+                        oauth_password = str(getattr(mailbox, "password", "") or "").strip() or None
+                        oauth_recovery_email = str(getattr(mailbox, "recovery_email", "") or "").strip() or None
+                    print("[Grok] 尝试通过 xAI Device Flow 换取 OAuth tokens...")
                     oauth_tokens = exchange_sso_for_oauth_tokens(
                         session,
                         email=email,
-                        password=profile.get("password"),
+                        password=oauth_password,
                         code_getter=lambda: mailbox.wait_for_code(timeout=180, stop_event=self.stop_event),
+                        recovery_email=oauth_recovery_email,
+                        prefer_google_login=registration_mode == "google",
+                        stop_event=self.stop_event,
                     )
+                    if oauth_tokens and oauth_tokens.get("refresh_token"):
+                        print("[Grok] 已获取 OAuth refresh_token")
+                    elif oauth_tokens:
+                        print("[Grok] OAuth token 响应没有 refresh_token，导出结果可能无法自动续期")
                 except Exception as e:
                     print(f"[Grok] OAuth exchange 失败，回退到 sso cookie: {e}")
 
@@ -112,6 +134,9 @@ class GrokProvider:
                         sso_token=sso_value,
                         profile=profile
                     )
+                # grok2api's reverse transport authenticates with the browser
+                # sso cookie, so keep it even when OAuth exchange also succeeds.
+                full_credential["sso_token"] = sso_value
                 result["full_credential"] = full_credential
                 print(f"[Grok] 成功生成 JSON 凭证 (user_id: {full_credential.get('user_id', 'N/A')})")
             except Exception as e:
@@ -135,11 +160,26 @@ return !!(givenInput && familyInput && passwordInput);
         return False
 
 
-def _click_email_signup_button(page, timeout=10):
+def _is_transient_page_error(error: Exception) -> bool:
+    text = str(error)
+    name = error.__class__.__name__
+    return (
+        isinstance(error, PageDisconnectedError)
+        or "页面已被刷新" in text
+        or "页面已刷新" in text
+        or "page has been refreshed" in text.lower()
+        or "context" in text.lower() and "destroy" in text.lower()
+        or name in {"ContextLostError", "ElementLostError"}
+    )
+
+
+def _click_email_signup_button(session: DrissionBrowserSession, timeout=10):
     """页面打开后，自动点击"使用邮箱注册"按钮。"""
     deadline = time.time() + timeout
     while time.time() < deadline:
-        clicked = page.run_js(r"""
+        page = session.refresh_page()
+        try:
+            clicked = page.run_js(r"""
 const candidates = Array.from(document.querySelectorAll('button, a, [role="button"]'));
 const target = candidates.find((node) => {
     const text = (node.innerText || node.textContent || '').replace(/\s+/g, '');
@@ -153,8 +193,15 @@ if (!target) {
 target.click();
 return true;
         """)
+        except Exception as error:
+            if _is_transient_page_error(error):
+                time.sleep(0.8)
+                continue
+            raise
 
         if clicked:
+            time.sleep(1)
+            session.refresh_page()
             return True
 
         time.sleep(0.5)
@@ -162,11 +209,451 @@ return true;
     raise Exception('未找到"使用邮箱注册"按钮')
 
 
-def _fill_email_and_submit(page, email: str, timeout=15):
+def _click_google_signup_button(session: DrissionBrowserSession, timeout=15):
+    """页面打开后，自动点击 Google 账号注册按钮。"""
     deadline = time.time() + timeout
     while time.time() < deadline:
-        filled = page.run_js(
+        page = session.refresh_page()
+        try:
+            clicked = page.run_js(r"""
+const candidates = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+const target = candidates.find((node) => {
+    const text = [
+        node.innerText || '',
+        node.textContent || '',
+        node.getAttribute('aria-label') || '',
+        node.getAttribute('title') || '',
+    ].join(' ').replace(/\s+/g, '').toLowerCase();
+    return text.includes('google') || text.includes('谷歌');
+});
+
+if (!target) {
+    return false;
+}
+
+target.click();
+return true;
+        """)
+        except Exception as error:
+            if _is_transient_page_error(error):
+                time.sleep(0.8)
+                continue
+            raise
+
+        if clicked:
+            time.sleep(1)
+            session.refresh_page()
+            return True
+
+        time.sleep(0.5)
+
+    raise Exception('未找到"使用 Google 账号注册"按钮')
+
+
+def _register_with_google_account(
+    session: DrissionBrowserSession,
+    mailbox: VerificationMailbox,
+    stop_event=None,
+    timeout: int = 180,
+) -> str:
+    email = str(getattr(mailbox, "email", "") or "").strip()
+    password = str(getattr(mailbox, "password", "") or "").strip()
+    recovery_email = str(getattr(mailbox, "recovery_email", "") or "").strip()
+    if not email or not password:
+        raise RuntimeError("Google 账号注册需要邮箱和密码")
+
+    _click_google_signup_button(session)
+    page = session.refresh_page()
+    deadline = time.time() + timeout
+    recovery_done = False
+    email_next_clicked = False
+    password_next_clicked = False
+    account_choice_clicked = False
+    consent_clicked = False
+    last_google_path = ""
+
+    while time.time() < deadline:
+        if stop_event and stop_event.is_set():
+            raise RuntimeError("任务已停止")
+
+        page = session.refresh_page()
+        if _has_xai_session_ready(page):
+            print(f"[*] Google 账号授权完成: {email}")
+            return email
+
+        url = str(getattr(page, "url", "") or "")
+        try:
+            state = page.run_js(
+                """
+return {
+    href: location.href,
+    title: document.title || '',
+    text: (document.body?.innerText || '').slice(0, 2000),
+};
+                """
+            )
+        except Exception as error:
+            if _is_transient_page_error(error):
+                time.sleep(1)
+                continue
+            raise
+        href = str((state or {}).get("href") or url)
+
+        if "accounts.google." in href or "google.com" in href:
+            google_path = href.split("?", 1)[0].lower()
+            if google_path != last_google_path:
+                if "accountchooser" in google_path:
+                    account_choice_clicked = False
+                if "identifier" in google_path:
+                    email_next_clicked = False
+                if "challenge" in google_path or "password" in google_path:
+                    password_next_clicked = False
+                if "oauth" in google_path or "consent" in google_path:
+                    consent_clicked = False
+                last_google_path = google_path
+
+            try:
+                action = _handle_google_login_step(
+                    page,
+                    email=email,
+                    password=password,
+                    recovery_email=recovery_email,
+                    recovery_done=recovery_done,
+                    email_next_clicked=email_next_clicked,
+                    password_next_clicked=password_next_clicked,
+                    account_choice_clicked=account_choice_clicked,
+                    consent_clicked=consent_clicked,
+                )
+            except Exception as error:
+                if _is_transient_page_error(error):
+                    time.sleep(1)
+                    continue
+                raise
+            if action == "email-filled":
+                print(f"[*] 已输入 Google 邮箱: {email}")
+            elif action == "email":
+                email_next_clicked = True
+                print(f"[*] 已填写 Google 邮箱: {email}")
+            elif action == "password-filled":
+                print("[*] 已填写 Google 密码，等待页面确认")
+            elif action == "password":
+                password_next_clicked = True
+                print("[*] 已确认 Google 密码并点击下一步")
+            elif action == "recovery":
+                recovery_done = True
+                print("[*] 已填写 Google 辅助邮箱")
+            elif action == "account-choice":
+                account_choice_clicked = True
+                print("[*] 已选择 Google 账号")
+            elif action == "consent":
+                consent_clicked = True
+                print("[*] 已点击 Google 授权继续")
+            elif action == "missing-password":
+                raise RuntimeError("Google 账号池里的密码为空")
+            elif action == "blocked":
+                raise RuntimeError("Google 登录被拦截，需要人工验证或账号安全检查")
+            elif action == "manual":
+                print("[*] Google 登录需要人工处理，等待浏览器完成授权")
+
+        time.sleep(1)
+
+    raise Exception("Google 账号注册超时，未等到 x.ai 登录态")
+
+
+def _has_xai_session_ready(page) -> bool:
+    try:
+        return bool(page.run_js(
+            r"""
+const host = location.hostname;
+const path = location.pathname.toLowerCase();
+const text = (document.body?.innerText || '').replace(/\s+/g, '');
+const onXai = host.endsWith('x.ai') || host.endsWith('grok.com');
+const onAuthChoice = path.includes('sign-up') || path.includes('sign-in') || path.includes('login') || path.includes('signup');
+const hasChoiceButtons = text.includes('使用邮箱注册') || text.toLowerCase().includes('google');
+return onXai && !(onAuthChoice && hasChoiceButtons);
             """
+        ))
+    except Exception:
+        return False
+
+
+def _handle_google_login_step(
+    page,
+    email: str,
+    password: str,
+    recovery_email: str,
+    recovery_done: bool,
+    email_next_clicked: bool,
+    password_next_clicked: bool,
+    account_choice_clicked: bool,
+    consent_clicked: bool,
+) -> str:
+    return str(page.run_js(
+        r"""
+const email = arguments[0];
+const password = arguments[1];
+const recoveryEmail = arguments[2];
+const recoveryDone = Boolean(arguments[3]);
+const emailNextClicked = Boolean(arguments[4]);
+const passwordNextClicked = Boolean(arguments[5]);
+const accountChoiceClicked = Boolean(arguments[6]);
+const consentClicked = Boolean(arguments[7]);
+const bodyText = (document.body?.innerText || '').toLowerCase();
+const bodyCompact = bodyText.replace(/\s+/g, '');
+const pagePath = location.pathname.toLowerCase();
+
+function isVisible(node) {
+    if (!node) {
+        return false;
+    }
+    const style = window.getComputedStyle(node);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
+        return false;
+    }
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+}
+
+function setNativeValue(input, value) {
+    input.focus();
+    input.click();
+    const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+    const tracker = input._valueTracker;
+    if (tracker) {
+        tracker.setValue('');
+    }
+    if (nativeSetter) {
+        nativeSetter.call(input, '');
+        nativeSetter.call(input, value);
+    } else {
+        input.value = '';
+        input.value = value;
+    }
+    input.dispatchEvent(new InputEvent('beforeinput', {
+        bubbles: true,
+        cancelable: true,
+        data: value,
+        inputType: 'insertText',
+    }));
+    input.dispatchEvent(new InputEvent('input', {
+        bubbles: true,
+        cancelable: true,
+        data: value,
+        inputType: 'insertText',
+    }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    return String(input.value || '') === String(value || '');
+}
+
+function getButtonText(node) {
+    return [
+        node.innerText || '',
+        node.textContent || '',
+        node.value || '',
+        node.getAttribute('aria-label') || '',
+    ].join(' ').replace(/\s+/g, '').toLowerCase();
+}
+
+function clickButtonByKeywords(keywords, fallback = false) {
+    const candidates = Array.from(document.querySelectorAll('button, [role="button"], input[type="button"], input[type="submit"]')).filter((node) => {
+        return isVisible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true';
+    });
+    const target = candidates.find((node) => {
+        const text = getButtonText(node);
+        return keywords.some((keyword) => text === keyword || text.includes(keyword));
+    }) || (fallback && candidates.length === 1 ? candidates[0] : null);
+    if (!target) {
+        return false;
+    }
+    target.focus();
+    target.click();
+    return true;
+}
+
+function clickNext() {
+    return clickButtonByKeywords([
+        'next',
+        '下一步',
+    ], false);
+}
+
+if (
+    bodyText.includes("couldn't sign you in") ||
+    bodyText.includes("this browser or app may not be secure") ||
+    bodyText.includes('无法登录') ||
+    bodyText.includes('无法验证') ||
+    bodyText.includes('异常活动')
+) {
+    return 'blocked';
+}
+
+const isAccountChooserPage = (
+    pagePath.includes('/signin/accountchooser') ||
+    pagePath.includes('/v3/signin/accountchooser') ||
+    bodyText.includes('choose an account') ||
+    bodyCompact.includes('选择账号') ||
+    bodyCompact.includes('选择帐号') ||
+    bodyCompact.includes('选择一个账号') ||
+    bodyCompact.includes('选择一个帐号')
+);
+const isIdentifierPage = (
+    pagePath.includes('/signin/identifier') ||
+    pagePath.includes('/v3/signin/identifier')
+);
+const isPasswordPage = (
+    pagePath.includes('/signin/challenge') ||
+    pagePath.includes('/v3/signin/challenge') ||
+    pagePath.includes('/challenge/pwd') ||
+    pagePath.includes('/challenge/password')
+);
+const isConsentPage = !isAccountChooserPage && (
+    !isIdentifierPage &&
+    !isPasswordPage &&
+    (
+        pagePath.includes('/signin/oauth') ||
+        pagePath.includes('/oauth/consent') ||
+        bodyText.includes('wants to access your google account') ||
+        bodyText.includes('wants access to your google account') ||
+        bodyText.includes('review the permissions') ||
+        bodyText.includes('review permissions') ||
+        bodyText.includes('make sure you trust') ||
+        bodyCompact.includes('想要访问您的google账号') ||
+        bodyCompact.includes('想访问您的google账号') ||
+        bodyCompact.includes('请求访问您的google账号') ||
+        bodyCompact.includes('查看权限') ||
+        bodyCompact.includes('请确认您信任')
+    )
+);
+if (isConsentPage) {
+    if (consentClicked) {
+        return 'idle';
+    }
+    if (clickButtonByKeywords([
+        'continue',
+        'allow',
+        'agree',
+        '继续',
+        '同意',
+        '允许',
+        '授权',
+        '我同意',
+    ], false)) {
+        return 'consent';
+    }
+    return 'idle';
+}
+
+const identifierInput = Array.from(document.querySelectorAll(
+    'input[type="email"], input[name="identifier"], input#identifierId'
+)).find((node) => isVisible(node) && !node.disabled && !node.readOnly);
+if (identifierInput) {
+    const currentIdentifier = String(identifierInput.value || '').trim();
+    if (currentIdentifier.toLowerCase() !== email.toLowerCase()) {
+        if (!setNativeValue(identifierInput, email)) {
+            return 'idle';
+        }
+        return 'email-filled';
+    }
+    if (emailNextClicked) {
+        return 'idle';
+    }
+    if (clickNext()) {
+        return 'email';
+    }
+    return 'email-filled';
+}
+
+const passwordInput = Array.from(document.querySelectorAll(
+    'input[type="password"], input[name="Passwd"]'
+)).find((node) => isVisible(node) && !node.disabled && !node.readOnly);
+if (passwordInput) {
+    if (!password) {
+        return 'missing-password';
+    }
+    const currentPassword = String(passwordInput.value || '');
+    if (currentPassword !== password) {
+        if (!setNativeValue(passwordInput, password)) {
+            return 'idle';
+        }
+        return 'password-filled';
+    }
+    if (passwordNextClicked) {
+        return 'idle';
+    }
+    passwordInput.focus();
+    if (!clickNext()) {
+        return 'idle';
+    }
+    return 'password';
+}
+
+const recoveryInput = Array.from(document.querySelectorAll(
+    'input[type="email"], input[type="text"], input[name="knowledgePreregisteredEmailResponse"]'
+)).find((node) => {
+    const name = String(node.name || node.id || node.autocomplete || '').toLowerCase();
+    return isVisible(node) && !node.disabled && !node.readOnly && (
+        name.includes('recovery') || name.includes('knowledge') || bodyText.includes('recovery email') || bodyText.includes('辅助邮箱')
+    );
+});
+if (recoveryInput && recoveryEmail && !recoveryDone) {
+    if (!setNativeValue(recoveryInput, recoveryEmail)) {
+        return 'idle';
+    }
+    if (!clickNext()) {
+        return 'idle';
+    }
+    return 'recovery';
+}
+
+if (isAccountChooserPage) {
+    if (accountChoiceClicked) {
+        return 'idle';
+    }
+    const accountChoices = Array.from(document.querySelectorAll('[data-identifier], [role="link"], [role="button"], button')).filter(isVisible);
+    const accountChoice = accountChoices.find((node) => {
+        const text = [
+            node.getAttribute('data-identifier') || '',
+            node.innerText || '',
+            node.textContent || '',
+        ].join(' ').toLowerCase();
+        return text.includes(email.toLowerCase());
+    });
+    const useAnotherAccount = accountChoices.find((node) => {
+        const text = getButtonText(node);
+        return text.includes('useanotheraccount') || text.includes('使用其他账号') || text.includes('使用其他帐号');
+    });
+    const target = accountChoice || useAnotherAccount;
+    if (target) {
+        target.click();
+        return 'account-choice';
+    }
+    return 'manual';
+}
+
+if (bodyText.includes('verify') || bodyText.includes('验证') || bodyText.includes('2-step') || bodyText.includes('两步')) {
+    return 'manual';
+}
+
+return 'idle';
+        """,
+        email,
+        password,
+        recovery_email,
+        recovery_done,
+        email_next_clicked,
+        password_next_clicked,
+        account_choice_clicked,
+        consent_clicked,
+    ))
+
+
+def _fill_email_and_submit(session: DrissionBrowserSession, email: str, timeout=15):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        page = session.refresh_page()
+        try:
+            filled = page.run_js(
+                """
 const email = arguments[0];
 
 function isVisible(node) {
@@ -222,9 +709,14 @@ if ((input.value || '').trim() !== email || !input.checkValidity()) {
 
 input.blur();
 return 'filled';
-            """,
-            email,
-        )
+                """,
+                email,
+            )
+        except Exception as error:
+            if _is_transient_page_error(error):
+                time.sleep(0.8)
+                continue
+            raise
 
         if filled == 'not-ready':
             time.sleep(0.5)
@@ -237,8 +729,10 @@ return 'filled';
 
         if filled == 'filled':
             time.sleep(0.8)
-            clicked = page.run_js(
-                r"""
+            page = session.refresh_page()
+            try:
+                clicked = page.run_js(
+                    r"""
 function isVisible(node) {
     if (!node) {
         return false;
@@ -273,10 +767,17 @@ if (!submitButton || submitButton.disabled) {
 
 submitButton.click();
 return true;
-                """
-            )
+                    """
+                )
+            except Exception as error:
+                if _is_transient_page_error(error):
+                    time.sleep(0.8)
+                    continue
+                raise
 
             if clicked:
+                time.sleep(1)
+                session.refresh_page()
                 print(f"[*] 已填写邮箱并点击注册: {email}")
                 return email
 
@@ -297,11 +798,11 @@ def _fill_code_and_submit(
         raise Exception("获取验证码失败")
 
     deadline = time.time() + timeout
-    page = session.page
     while time.time() < deadline:
         if stop_event and stop_event.is_set():
             raise RuntimeError("任务已停止")
 
+        page = session.refresh_page()
         try:
             filled = page.run_js(
                 """
@@ -429,7 +930,9 @@ return merged === code ? 'filled' : 'box-mismatch';
                 """,
                 code,
             )
-        except PageDisconnectedError:
+        except Exception as error:
+            if not _is_transient_page_error(error):
+                raise
             # 点击确认邮箱后如果刚好发生跳转，旧页面句柄会断开；此时切到新页继续判断即可。
             page = session.refresh_page()
             if _has_profile_form(page):
@@ -452,6 +955,7 @@ return merged === code ? 'filled' : 'box-mismatch';
 
         if filled == 'filled':
             time.sleep(1.2)
+            page = session.refresh_page()
             try:
                 clicked = page.run_js(
                     r"""
@@ -518,7 +1022,9 @@ confirmButton.click();
 return 'clicked';
                     """
                 )
-            except PageDisconnectedError:
+            except Exception as error:
+                if not _is_transient_page_error(error):
+                    raise
                 page = session.refresh_page()
                 if _has_profile_form(page):
                     print("[*] 确认邮箱后页面跳转成功，已进入最终注册页。")
@@ -550,7 +1056,10 @@ return 'clicked';
 
 def _get_turnstile_token(page):
     """在最终注册页解 Turnstile（真人化点击 + iframe 内坐标 spoof）。"""
-    page.run_js("try { turnstile.reset() } catch(e) { }")
+    try:
+        page.run_js("try { turnstile.reset() } catch(e) { }")
+    except Exception:
+        pass
 
     for _ in range(15):
         try:
@@ -611,11 +1120,12 @@ def _fill_profile_and_submit(session: DrissionBrowserSession, timeout: int = 120
 
     deadline = time.time() + timeout
     turnstile_token = ""
-    page = session.page
 
     while time.time() < deadline:
-        filled = page.run_js(
-            """
+        page = session.refresh_page()
+        try:
+            filled = page.run_js(
+                """
 const givenName = arguments[0];
 const familyName = arguments[1];
 const password = arguments[2];
@@ -698,11 +1208,16 @@ return [
     String(familyInput.value || '').trim() === String(familyName || '').trim(),
     String(passwordInput.value || '') === String(password || ''),
 ].every(Boolean) ? 'filled' : 'verify-failed';
-            """,
-            given_name,
-            family_name,
-            password,
-        )
+                """,
+                given_name,
+                family_name,
+                password,
+            )
+        except Exception as error:
+            if _is_transient_page_error(error):
+                time.sleep(0.8)
+                continue
+            raise
 
         if filled == 'not-ready':
             time.sleep(0.5)
@@ -713,8 +1228,10 @@ return [
             time.sleep(0.5)
             continue
 
-        values_ok = page.run_js(
-            """
+        page = session.refresh_page()
+        try:
+            values_ok = page.run_js(
+                """
 const expectedGiven = arguments[0];
 const expectedFamily = arguments[1];
 const expectedPassword = arguments[2];
@@ -748,33 +1265,47 @@ if (!givenInput || !familyInput || !passwordInput) {
 return String(givenInput.value || '').trim() === String(expectedGiven || '').trim()
     && String(familyInput.value || '').trim() === String(expectedFamily || '').trim()
     && String(passwordInput.value || '') === String(expectedPassword || '');
-            """,
-            given_name,
-            family_name,
-            password,
-        )
+                """,
+                given_name,
+                family_name,
+                password,
+            )
+        except Exception as error:
+            if _is_transient_page_error(error):
+                time.sleep(0.8)
+                continue
+            raise
         if not values_ok:
             print("[Debug] 最终注册页字段值校验失败，继续重试填写。")
             time.sleep(0.5)
             continue
 
-        turnstile_state = page.run_js(
-            """
+        page = session.refresh_page()
+        try:
+            turnstile_state = page.run_js(
+                """
 const challengeInput = document.querySelector('input[name="cf-turnstile-response"]');
 if (!challengeInput) {
     return 'not-found';
 }
 const value = String(challengeInput.value || '').trim();
 return value ? 'ready' : 'pending';
-            """
-        )
+                """
+            )
+        except Exception as error:
+            if _is_transient_page_error(error):
+                time.sleep(0.8)
+                continue
+            raise
 
         if turnstile_state == "pending" and not turnstile_token:
             print("[*] 检测到最终注册页存在 Turnstile，开始使用现有真人化点击逻辑。")
             turnstile_token = _get_turnstile_token(page)
             if turnstile_token:
-                synced = page.run_js(
-                    """
+                page = session.refresh_page()
+                try:
+                    synced = page.run_js(
+                        """
 const token = arguments[0];
 const challengeInput = document.querySelector('input[name="cf-turnstile-response"]');
 if (!challengeInput) {
@@ -789,22 +1320,29 @@ if (nativeSetter) {
 challengeInput.dispatchEvent(new Event('input', { bubbles: true }));
 challengeInput.dispatchEvent(new Event('change', { bubbles: true }));
 return String(challengeInput.value || '').trim() === String(token || '').trim();
-                    """,
-                    turnstile_token,
-                )
+                        """,
+                        turnstile_token,
+                    )
+                except Exception as error:
+                    if _is_transient_page_error(error):
+                        time.sleep(0.8)
+                        continue
+                    raise
                 if synced:
                     print("[*] Turnstile 响应已同步到最终注册表单。")
 
         time.sleep(1.2)
 
+        page = session.refresh_page()
         try:
             submit_button = page.ele('tag:button@@text()=完成注册')
         except Exception:
             submit_button = None
 
         if not submit_button:
-            clicked = page.run_js(
-                r"""
+            try:
+                clicked = page.run_js(
+                    r"""
 const challengeInput = document.querySelector('input[name="cf-turnstile-response"]');
 if (challengeInput && !String(challengeInput.value || '').trim()) {
     return false;
@@ -820,20 +1358,31 @@ if (!submitButton || submitButton.disabled || submitButton.getAttribute('aria-di
 submitButton.focus();
 submitButton.click();
 return true;
-                """
-            )
+                    """
+                )
+            except Exception as error:
+                if _is_transient_page_error(error):
+                    time.sleep(0.8)
+                    continue
+                raise
         else:
-            challenge_value = page.run_js(
-                """
+            try:
+                challenge_value = page.run_js(
+                    """
 const challengeInput = document.querySelector('input[name="cf-turnstile-response"]');
 return challengeInput ? String(challengeInput.value || '').trim() : 'not-found';
-                """
-            )
-            if challenge_value not in ('not-found', ''):
-                submit_button.click()
-                clicked = True
-            else:
-                clicked = False
+                    """
+                )
+                if challenge_value not in ('not-found', ''):
+                    submit_button.click()
+                    clicked = True
+                else:
+                    clicked = False
+            except Exception as error:
+                if _is_transient_page_error(error):
+                    time.sleep(0.8)
+                    continue
+                raise
 
         if clicked:
             print(f"[*] 已填写注册资料并点击完成注册: {given_name} {family_name} / {password}")

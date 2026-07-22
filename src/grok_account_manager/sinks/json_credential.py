@@ -24,13 +24,13 @@ class JsonCredentialSink:
         if "full_credential" in result:
             self._pending.append(result["full_credential"])
         else:
-            self._pending.append(
-                build_cockpit_grok_credential(
-                    email=result["email"],
-                    access_token=result["credential"],
-                    profile=result.get("profile"),
-                )
+            credential = build_cockpit_grok_credential(
+                email=result["email"],
+                access_token=result["credential"],
+                profile=result.get("profile"),
             )
+            credential["sso_token"] = result["credential"]
+            self._pending.append(credential)
 
     def flush(self) -> None:
         if not self._pending:
