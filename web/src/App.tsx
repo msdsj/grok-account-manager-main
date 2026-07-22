@@ -31,6 +31,7 @@ type JobStatus =
 
 type EmailSource = "duckmail" | "outlook" | "gmail" | "google";
 type ActiveView = "overview" | "register" | "accounts" | "relay" | "logs";
+type ExportFormat = "json" | "cpa";
 
 interface JobEvent {
   id: string;
@@ -183,7 +184,7 @@ export function App() {
   const [googleData, setGoogleData] = useState("");
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
-  const [exporting, setExporting] = useState(false);
+  const [exporting, setExporting] = useState<ExportFormat | null>(null);
   const [selectedAccounts, setSelectedAccounts] = useState<Set<string>>(new Set());
   const [hideEmails, setHideEmails] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -371,14 +372,15 @@ export function App() {
     });
   }
 
-  async function exportSelectedAccounts() {
+  async function exportSelectedAccounts(format: ExportFormat) {
     if (selectedAccounts.size === 0) return;
     const exportKeys = selectedRows.map((account) => account.exportKey);
     if (exportKeys.length === 0) return;
-    setExporting(true);
+    setExporting(format);
     setError(null);
     try {
-      const response = await fetch("/api/accounts/export", {
+      const endpoint = format === "cpa" ? "/api/accounts/export-cpa" : "/api/accounts/export";
+      const response = await fetch(endpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ exportKeys }),
@@ -386,7 +388,7 @@ export function App() {
       const contentType = response.headers.get("Content-Type") || "";
       if (!response.ok) {
         if (response.status === 404) {
-          throw new Error("导出接口不存在，请重启后端 grok-account-manager-web 后再试");
+          throw new Error(`${format === "cpa" ? "CPA " : ""}导出接口不存在，请重启后端后再试`);
         }
         if (contentType.includes("application/json")) {
           const data = (await response.json()) as { error?: string };
@@ -400,7 +402,9 @@ export function App() {
       const filenameMatch = contentDisposition.match(/filename="([^"]+)"/);
       const filename =
         filenameMatch?.[1] ||
-        `msdsj-grok-credentials-${new Date().toISOString().replace(/[:.]/g, "-")}.json`;
+        (format === "cpa"
+          ? `xai-cpa-credentials-${new Date().toISOString().replace(/[:.]/g, "-")}.zip`
+          : `msdsj-grok-credentials-${new Date().toISOString().replace(/[:.]/g, "-")}.json`);
       const url = URL.createObjectURL(blob);
       const link = document.createElement("a");
       link.href = url;
@@ -412,7 +416,7 @@ export function App() {
     } catch (exportError) {
       setError(String(exportError));
     } finally {
-      setExporting(false);
+      setExporting(null);
     }
   }
 
@@ -754,9 +758,13 @@ export function App() {
           <span>{loading ? "加载中" : selectedCount > 0 ? `已选择 ${selectedCount} / ${accountsWithKeys.length}` : `${accountsWithKeys.length} 个账号`}</span>
         </div>
         <div className="panel-actions">
-          <button className="export-btn" type="button" disabled={selectedCount === 0 || exporting} onClick={() => void exportSelectedAccounts()}>
-            {exporting ? <Loader2 size={16} className="spin" /> : <Download size={16} />}
+          <button className="export-btn" type="button" disabled={selectedCount === 0 || exporting !== null} onClick={() => void exportSelectedAccounts("json")}>
+            {exporting === "json" ? <Loader2 size={16} className="spin" /> : <Download size={16} />}
             导出 JSON
+          </button>
+          <button className="export-btn cpa-export-btn" type="button" disabled={selectedCount === 0 || exporting !== null} onClick={() => void exportSelectedAccounts("cpa")}>
+            {exporting === "cpa" ? <Loader2 size={16} className="spin" /> : <KeyRound size={16} />}
+            导出 CPA
           </button>
           <button className="small-icon-btn" type="button" onClick={() => void refresh()} aria-label="刷新账号列表" title="刷新账号列表">
             <RefreshCw size={16} />

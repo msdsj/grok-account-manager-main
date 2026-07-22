@@ -25,6 +25,7 @@ from ..core.browser import (
     warn_runtime_compatibility,
 )
 from ..sinks.json_credential import JsonCredentialSink
+from ..sinks.cpa_credential import build_cpa_download
 from ..sinks.txt_file import TxtFileSink
 from .relay import RELAY_MANAGER
 
@@ -674,6 +675,12 @@ class WebHandler(BaseHTTPRequestHandler):
                     filename=f"msdsj-grok-credentials-{time.strftime('%Y%m%d-%H%M%S')}.json",
                 )
                 return
+            if parsed.path == "/api/accounts/export-cpa":
+                body = _read_json_body(self)
+                accounts = export_credentials(body.get("exportKeys") or [])
+                raw, filename, content_type = build_cpa_download(accounts)
+                self._send_download(raw, filename=filename, content_type=content_type)
+                return
             if parsed.path == "/api/accounts/refresh-quota":
                 body = _read_json_body(self)
                 account_id = str(body.get("accountId") or "").strip()
@@ -781,12 +788,28 @@ class WebHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
-    def _send_download_json(self, payload: list[dict], filename: str, status: int = 200) -> None:
+    def _send_download_json(self, payload, filename: str, status: int = 200) -> None:
         raw = json.dumps(payload, ensure_ascii=False, indent=2, default=_json_default).encode("utf-8")
+        self._send_download(
+            raw,
+            filename=filename,
+            content_type="application/json; charset=utf-8",
+            status=status,
+        )
+
+    def _send_download(
+        self,
+        raw: bytes,
+        filename: str,
+        content_type: str,
+        status: int = 200,
+    ) -> None:
         self.send_response(status)
         self._send_cors_headers()
-        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
         self.wfile.write(raw)

@@ -659,6 +659,42 @@ if (host.includes('accounts.google.') || host === 'google.com' || host.endsWith(
         path.includes('/challenge/pwd') ||
         path.includes('/challenge/password')
     );
+    const isWorkspaceSpeedbumpPage = (
+        path.includes('/signin/speedbump') ||
+        path.includes('/v3/signin/speedbump') ||
+        (
+            (
+                bodyText.includes('your school') ||
+                bodyText.includes('your organization') ||
+                bodyCompact.includes('所在学校的内部规定') ||
+                bodyCompact.includes('所在组织的内部规定') ||
+                bodyCompact.includes('学校或家长') ||
+                bodyCompact.includes('组织的政策')
+            ) && (
+                bodyCompact.includes('我了解') ||
+                bodyCompact.includes('iunderstand') ||
+                bodyCompact.includes('gotit')
+            )
+        )
+    );
+
+    if (isWorkspaceSpeedbumpPage) {
+        const label = clickButton('google-workspace-speedbump', [
+            '我了解',
+            'iunderstand',
+            'understand',
+            'gotit',
+            'acknowledge',
+            'accept',
+            'continue',
+            'ok',
+            '知道了',
+            '明白了',
+            '接受',
+            '继续'
+        ]);
+        return label ? `google-speedbump-click:${label}` : 'idle';
+    }
     const isConsentPage = !isAccountChooserPage && !isIdentifierPage && !isPasswordPage && (
         path.includes('/signin/oauth') ||
         path.includes('/oauth/consent') ||

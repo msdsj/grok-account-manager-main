@@ -253,6 +253,12 @@ button:disabled, input:disabled, textarea:disabled { cursor: not-allowed; opacit
 }
 .export-btn:hover:not(:disabled) { background: #7dd3fc; transform: translateY(-1px); }
 
+.cpa-export-btn {
+  color: #dcfce7; background: rgba(34,197,94,.13); border-color: rgba(74,222,128,.35);
+  box-shadow: none;
+}
+.cpa-export-btn:hover:not(:disabled) { color: #f0fdf4; background: rgba(34,197,94,.22); border-color: rgba(74,222,128,.55); }
+
 .small-icon-btn { width: 34px; height: 34px; flex: 0 0 auto; }
 
 .system-chip, .status-pill, .token-badge {

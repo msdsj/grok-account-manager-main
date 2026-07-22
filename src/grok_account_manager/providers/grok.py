@@ -168,6 +168,8 @@ def _is_transient_page_error(error: Exception) -> bool:
         or "页面已被刷新" in text
         or "页面已刷新" in text
         or "page has been refreshed" in text.lower()
+        or "js结果解析错误" in text
+        or "javascript result" in text.lower() and "pars" in text.lower()
         or "context" in text.lower() and "destroy" in text.lower()
         or name in {"ContextLostError", "ElementLostError"}
     )
@@ -270,6 +272,7 @@ def _register_with_google_account(
     password_next_clicked = False
     account_choice_clicked = False
     consent_clicked = False
+    speedbump_clicked = False
     last_google_path = ""
 
     while time.time() < deadline:
@@ -281,23 +284,16 @@ def _register_with_google_account(
             print(f"[*] Google 账号授权完成: {email}")
             return email
 
-        url = str(getattr(page, "url", "") or "")
         try:
-            state = page.run_js(
-                """
-return {
-    href: location.href,
-    title: document.title || '',
-    text: (document.body?.innerText || '').slice(0, 2000),
-};
-                """
-            )
+            # Only the URL is needed here. Returning a JS object while Google is
+            # navigating can leave DrissionPage with a remote objectId that it
+            # cannot deserialize ("js结果解析错误").
+            href = str(getattr(page, "url", "") or "")
         except Exception as error:
             if _is_transient_page_error(error):
                 time.sleep(1)
                 continue
             raise
-        href = str((state or {}).get("href") or url)
 
         if "accounts.google." in href or "google.com" in href:
             google_path = href.split("?", 1)[0].lower()
@@ -310,6 +306,8 @@ return {
                     password_next_clicked = False
                 if "oauth" in google_path or "consent" in google_path:
                     consent_clicked = False
+                if "speedbump" in google_path:
+                    speedbump_clicked = False
                 last_google_path = google_path
 
             try:
@@ -323,6 +321,7 @@ return {
                     password_next_clicked=password_next_clicked,
                     account_choice_clicked=account_choice_clicked,
                     consent_clicked=consent_clicked,
+                    speedbump_clicked=speedbump_clicked,
                 )
             except Exception as error:
                 if _is_transient_page_error(error):
@@ -348,6 +347,9 @@ return {
             elif action == "consent":
                 consent_clicked = True
                 print("[*] 已点击 Google 授权继续")
+            elif action == "speedbump":
+                speedbump_clicked = True
+                print("[*] 已确认 Google Workspace 教育/企业账号提示")
             elif action == "missing-password":
                 raise RuntimeError("Google 账号池里的密码为空")
             elif action == "blocked":
@@ -387,6 +389,7 @@ def _handle_google_login_step(
     password_next_clicked: bool,
     account_choice_clicked: bool,
     consent_clicked: bool,
+    speedbump_clicked: bool,
 ) -> str:
     return str(page.run_js(
         r"""
@@ -398,6 +401,7 @@ const emailNextClicked = Boolean(arguments[4]);
 const passwordNextClicked = Boolean(arguments[5]);
 const accountChoiceClicked = Boolean(arguments[6]);
 const consentClicked = Boolean(arguments[7]);
+const speedbumpClicked = Boolean(arguments[8]);
 const bodyText = (document.body?.innerText || '').toLowerCase();
 const bodyCompact = bodyText.replace(/\s+/g, '');
 const pagePath = location.pathname.toLowerCase();
@@ -506,6 +510,46 @@ const isPasswordPage = (
     pagePath.includes('/challenge/pwd') ||
     pagePath.includes('/challenge/password')
 );
+const isWorkspaceSpeedbumpPage = (
+    pagePath.includes('/signin/speedbump') ||
+    pagePath.includes('/v3/signin/speedbump') ||
+    (
+        (
+            bodyText.includes("your school") ||
+            bodyText.includes("your organization") ||
+            bodyCompact.includes('所在学校的内部规定') ||
+            bodyCompact.includes('所在组织的内部规定') ||
+            bodyCompact.includes('学校或家长') ||
+            bodyCompact.includes('组织的政策')
+        ) && (
+            bodyCompact.includes('我了解') ||
+            bodyCompact.includes('iunderstand') ||
+            bodyCompact.includes('gotit')
+        )
+    )
+);
+if (isWorkspaceSpeedbumpPage) {
+    if (speedbumpClicked) {
+        return 'idle';
+    }
+    if (clickButtonByKeywords([
+        '我了解',
+        'iunderstand',
+        'understand',
+        'gotit',
+        'acknowledge',
+        'accept',
+        'continue',
+        'ok',
+        '知道了',
+        '明白了',
+        '接受',
+        '继续',
+    ], false)) {
+        return 'speedbump';
+    }
+    return 'idle';
+}
 const isConsentPage = !isAccountChooserPage && (
     !isIdentifierPage &&
     !isPasswordPage &&
@@ -644,6 +688,7 @@ return 'idle';
         password_next_clicked,
         account_choice_clicked,
         consent_clicked,
+        speedbump_clicked,
     ))
 
 
