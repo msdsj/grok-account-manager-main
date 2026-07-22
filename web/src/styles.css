@@ -259,6 +259,8 @@ button:disabled, input:disabled, textarea:disabled { cursor: not-allowed; opacit
 }
 .cpa-export-btn:hover:not(:disabled) { color: #f0fdf4; background: rgba(34,197,94,.22); border-color: rgba(74,222,128,.55); }
 
+.account-test-btn { height: 34px; padding: 0 13px; font-size: 12px; }
+
 .small-icon-btn { width: 34px; height: 34px; flex: 0 0 auto; }
 
 .system-chip, .status-pill, .token-badge {
@@ -273,6 +275,8 @@ button:disabled, input:disabled, textarea:disabled { cursor: not-allowed; opacit
 .system-chip.success, .status-pill.success, .token-badge.ok { border-color: rgba(52,211,153,.3); background: rgba(52,211,153,.1); color: #34d399; }
 .system-chip.warning, .status-pill.warning { border-color: rgba(251,191,36,.3); background: rgba(251,191,36,.08); color: #fbbf24; }
 .system-chip.neutral, .status-pill.neutral { border-color: rgba(255,255,255,.08); background: rgba(255,255,255,.04); color: #64748b; }
+.token-badge.neutral { border: 1px solid rgba(255,255,255,.08); background: rgba(255,255,255,.04); color: #64748b; }
+.token-badge.premium { border: 1px solid rgba(56,189,248,.35); background: rgba(56,189,248,.11); color: #7dd3fc; }
 
 .job-card { margin-top: 16px; padding: 16px; background: rgba(255,255,255,.02); }
 
@@ -348,6 +352,23 @@ button:disabled, input:disabled, textarea:disabled { cursor: not-allowed; opacit
 
 .log-panel, .accounts-panel, .relay-panel { overflow: hidden; }
 
+.failed-accounts-block {
+  margin: 0 16px 16px;
+  border: 1px solid rgba(248,113,113,.16);
+  border-radius: 8px;
+  background: rgba(248,113,113,.04);
+  overflow: hidden;
+}
+
+.sub-panel-head {
+  min-height: 42px;
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 10px 12px;
+  border-bottom: 1px solid rgba(255,255,255,.06);
+}
+.sub-panel-head strong { color: #fecaca; font-size: 13px; }
+.sub-panel-head span { color: #f87171; font-size: 12px; font-weight: 800; }
+
 .relay-body { display: grid; gap: 14px; padding: 16px; }
 .relay-config-grid {
   display: grid;
@@ -418,8 +439,10 @@ button:disabled, input:disabled, textarea:disabled { cursor: not-allowed; opacit
 .log-row.error p        { color: #fca5a5; }
 
 .accounts-table-wrap { overflow: auto; }
+.accounts-table-wrap.compact { max-height: 260px; }
 
-.accounts-table { width: 100%; min-width: 900px; border-collapse: separate; border-spacing: 0; }
+.accounts-table { width: 100%; min-width: 980px; border-collapse: separate; border-spacing: 0; }
+.failed-table { min-width: 760px; }
 
 .accounts-table th,
 .accounts-table td {
@@ -446,6 +469,18 @@ button:disabled, input:disabled, textarea:disabled { cursor: not-allowed; opacit
 .email-cell span   { color: #f87171; font-size: 12px; }
 
 .token-badge.missing { border: 1px solid rgba(248,113,113,.25); background: rgba(248,113,113,.08); color: #f87171; }
+
+.test-summary-row {
+  min-height: 40px;
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 0 16px 12px;
+  color: #94a3b8; font-size: 12px; font-weight: 700;
+}
+.test-summary-row span {
+  display: inline-flex; align-items: center; min-height: 26px; padding: 4px 9px;
+  border: 1px solid rgba(255,255,255,.08); border-radius: 999px;
+  background: rgba(255,255,255,.035);
+}
 
 code {
   display: inline-flex; max-width: 220px; padding: 3px 7px;

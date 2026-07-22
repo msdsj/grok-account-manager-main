@@ -38,42 +38,55 @@ class GrokProvider:
     mail_source: MailboxSource | None = None
 
     def run_round(self, session: DrissionBrowserSession) -> RegistrationResult:
+        self.current_email = ""
+        self.current_stage = "starting"
         if self.stop_event and self.stop_event.is_set():
             raise RuntimeError("任务已在开始前停止")
 
         mail_source = self.mail_source or DuckMailSource()
+        self.current_stage = "create_mailbox"
         mailbox = mail_source.create_mailbox()
+        self.current_email = str(getattr(mailbox, "email", "") or "")
         registration_mode = getattr(mail_source, "registration_mode", "email")
 
+        self.current_stage = "open_signup"
         session.open_url(self.signup_url)
 
         if registration_mode == "google":
+            self.current_stage = "google_register"
             email = _register_with_google_account(session, mailbox, self.stop_event)
+            self.current_email = email
             profile = {
                 "email": email,
                 "auth_provider": "google",
             }
         else:
+            self.current_stage = "click_email_signup"
             _click_email_signup_button(session)
 
             if self.stop_event and self.stop_event.is_set():
                 raise RuntimeError("任务已停止")
 
+            self.current_stage = "fill_email"
             email = _fill_email_and_submit(session, mailbox.email)
+            self.current_email = email
 
             if self.stop_event and self.stop_event.is_set():
                 raise RuntimeError("任务已停止")
 
+            self.current_stage = "wait_email_code"
             _fill_code_and_submit(session, email, mailbox, self.stop_event)
 
             if self.stop_event and self.stop_event.is_set():
                 raise RuntimeError("任务已停止")
 
+            self.current_stage = "fill_profile"
             profile = _fill_profile_and_submit(session)
 
         if self.stop_event and self.stop_event.is_set():
             raise RuntimeError("任务已停止")
 
+        self.current_stage = "wait_sso_cookie"
         sso_value = wait_for_cookie(session, self.success_cookie_name)
 
         result: RegistrationResult = {
@@ -90,6 +103,7 @@ class GrokProvider:
             oauth_tokens = None
             if self.enable_oauth_exchange:
                 try:
+                    self.current_stage = "oauth_exchange"
                     oauth_password = profile.get("password")
                     oauth_recovery_email = None
                     if registration_mode == "google":
@@ -116,6 +130,7 @@ class GrokProvider:
                 if self.stop_event and self.stop_event.is_set():
                     raise RuntimeError("任务已停止")
 
+                self.current_stage = "fetch_credential"
                 if oauth_tokens:
                     print(f"[Grok] 成功获取 OAuth tokens，现在获取完整凭证...")
                     full_credential = fetch_complete_credential(
@@ -142,6 +157,7 @@ class GrokProvider:
             except Exception as e:
                 print(f"[Grok] 获取完整凭证失败，将由 json sink 兜底生成基础 JSON: {e}")
 
+        self.current_stage = "done"
         return result
 
 

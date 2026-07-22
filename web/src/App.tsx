@@ -43,6 +43,17 @@ interface JobEvent {
   email?: string;
 }
 
+interface FailedAccount {
+  id: string;
+  time: number;
+  email: string;
+  round: number;
+  worker: number;
+  stage: string;
+  reason: string;
+  timedOut: boolean;
+}
+
 interface RegistrationJob {
   id: string;
   status: JobStatus;
@@ -57,9 +68,22 @@ interface RegistrationJob {
   failed: number;
   workerErrors: number;
   active: number;
+  roundTimeoutSeconds?: number;
+  failedAccounts?: FailedAccount[];
   startedAt: number;
   finishedAt: number | null;
   events: JobEvent[];
+}
+
+interface AccountAvailability {
+  category: "grok-4.5" | "base-only" | "unavailable";
+  baseAvailable: boolean;
+  grok45Available: boolean;
+  baseModel?: string | null;
+  grok45Model?: string | null;
+  latencyMs?: number | null;
+  error?: string | null;
+  testedAt?: number | null;
 }
 
 interface AccountRecord {
@@ -77,6 +101,7 @@ interface AccountRecord {
   fileName: string;
   filePath: string;
   error?: string;
+  availability?: AccountAvailability;
   quota?: {
     frequentUsage?: number | null;
     frequentLimit?: number | null;
@@ -122,6 +147,13 @@ interface ModelProbeRecord {
   capability: "chat" | "image" | "image_edit" | "video" | "unknown";
   status: "listed" | "ok" | "error";
   message: string;
+}
+
+interface AccountTestResult extends AccountAvailability {
+  id?: string;
+  exportKey?: string;
+  email: string;
+  fileName?: string;
 }
 
 async function apiJson<T>(path: string, init?: RequestInit): Promise<T> {
@@ -185,6 +217,8 @@ export function App() {
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [exporting, setExporting] = useState<ExportFormat | null>(null);
+  const [testingAccounts, setTestingAccounts] = useState(false);
+  const [accountTestResults, setAccountTestResults] = useState<AccountTestResult[]>([]);
   const [selectedAccounts, setSelectedAccounts] = useState<Set<string>>(new Set());
   const [hideEmails, setHideEmails] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -295,6 +329,9 @@ export function App() {
   const latestEvents = useMemo(() => {
     return [...(job?.events || [])].reverse().slice(0, 80);
   }, [job?.events]);
+  const failedAccounts = useMemo(() => {
+    return [...(job?.failedAccounts || [])].reverse();
+  }, [job?.failedAccounts]);
 
   useEffect(() => {
     setSelectedAccounts((current) => {
@@ -417,6 +454,29 @@ export function App() {
       setError(String(exportError));
     } finally {
       setExporting(null);
+    }
+  }
+
+  async function testSelectedAccounts() {
+    if (selectedAccounts.size === 0) return;
+    const exportKeys = selectedRows.map((account) => account.exportKey);
+    if (exportKeys.length === 0) return;
+    setTestingAccounts(true);
+    setError(null);
+    try {
+      const response = await apiJson<{ results: AccountTestResult[]; accounts: AccountRecord[] }>(
+        "/api/accounts/test-batch",
+        {
+          method: "POST",
+          body: JSON.stringify({ exportKeys, timeout: 120 }),
+        },
+      );
+      setAccountTestResults(response.results || []);
+      setState((current) => ({ ...current, accounts: response.accounts || current.accounts }));
+    } catch (testError) {
+      setError(String(testError));
+    } finally {
+      setTestingAccounts(false);
     }
   }
 
@@ -622,10 +682,43 @@ export function App() {
             <span>失败 {job?.failed ?? 0}</span>
             <span>活跃 {job?.active ?? 0}</span>
             <span>启动异常 {job?.workerErrors ?? 0}</span>
+            <span>超时 {job?.roundTimeoutSeconds ?? 120}s</span>
             <span>注册方式 {formatEmailSourceLabel(job)}</span>
           </div>
         </div>
       </div>
+      {failedAccounts.length > 0 && (
+        <div className="failed-accounts-block">
+          <div className="sub-panel-head">
+            <strong>失败账号</strong>
+            <span>{failedAccounts.length} 条</span>
+          </div>
+          <div className="accounts-table-wrap compact">
+            <table className="accounts-table failed-table">
+              <thead>
+                <tr>
+                  <th>时间</th>
+                  <th>邮箱</th>
+                  <th>轮次</th>
+                  <th>阶段</th>
+                  <th>原因</th>
+                </tr>
+              </thead>
+              <tbody>
+                {failedAccounts.map((item) => (
+                  <tr key={item.id}>
+                    <td>{formatTime(item.time)}</td>
+                    <td>{hideEmails ? maskEmail(item.email) : item.email}</td>
+                    <td>#{item.round} / W{item.worker}</td>
+                    <td><code>{item.stage || "-"}</code></td>
+                    <td>{item.timedOut ? `超时：${item.reason}` : item.reason}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
     </section>
   );
 
@@ -766,11 +859,22 @@ export function App() {
             {exporting === "cpa" ? <Loader2 size={16} className="spin" /> : <KeyRound size={16} />}
             导出 CPA
           </button>
+          <button className="secondary-btn account-test-btn" type="button" disabled={selectedCount === 0 || testingAccounts} onClick={() => void testSelectedAccounts()}>
+            {testingAccounts ? <Loader2 size={16} className="spin" /> : <TestTube2 size={16} />}
+            批量测试
+          </button>
           <button className="small-icon-btn" type="button" onClick={() => void refresh()} aria-label="刷新账号列表" title="刷新账号列表">
             <RefreshCw size={16} />
           </button>
         </div>
       </div>
+      {accountTestResults.length > 0 && (
+        <div className="test-summary-row">
+          <span>Grok 4.5：{accountTestResults.filter((item) => item.category === "grok-4.5").length}</span>
+          <span>基础可用：{accountTestResults.filter((item) => item.category === "base-only").length}</span>
+          <span>不可用：{accountTestResults.filter((item) => item.category === "unavailable").length}</span>
+        </div>
+      )}
       <div className="accounts-table-wrap">
         <table className="accounts-table">
           <thead>
@@ -778,6 +882,7 @@ export function App() {
               <th className="select-col"><input type="checkbox" checked={allSelected} disabled={accountsWithKeys.length === 0} aria-label="选择全部账号" onChange={toggleAllAccounts} /></th>
               <th>邮箱</th>
               <th>Refresh</th>
+              <th>可用性</th>
               <th>用户</th>
               <th>套餐</th>
               <th>额度</th>
@@ -787,13 +892,14 @@ export function App() {
           </thead>
           <tbody>
             {accountsWithKeys.length === 0 ? (
-              <tr><td colSpan={8}><div className="empty-row">暂无账号</div></td></tr>
+              <tr><td colSpan={9}><div className="empty-row">暂无账号</div></td></tr>
             ) : (
               accountsWithKeys.map((account) => (
                 <tr key={account.rowKey}>
                   <td className="select-col"><input type="checkbox" checked={selectedAccounts.has(account.rowKey)} aria-label={`选择 ${maskEmail(account.email)}`} onChange={() => toggleAccount(account.rowKey)} /></td>
                   <td><div className="email-cell"><strong>{hideEmails ? maskEmail(account.email) : account.email}</strong>{account.error && <span>{account.error}</span>}</div></td>
                   <td><span className={`token-badge ${account.hasRefreshToken ? "ok" : "missing"}`}>{account.hasRefreshToken && <ShieldCheck size={13} />}{account.hasRefreshToken ? "已获取" : "缺失"}</span></td>
+                  <td><AvailabilityBadge availability={account.availability} /></td>
                   <td>{account.displayName || account.userId || "-"}</td>
                   <td>{account.planType || "-"}</td>
                   <td><QuotaCell quota={account.quota} /></td>
@@ -950,6 +1056,31 @@ function formatEmailSourceLabel(job: RegistrationJob | null): string {
     default:
       return "DuckMail";
   }
+}
+
+function AvailabilityBadge({ availability }: { availability?: AccountAvailability }) {
+  if (!availability) {
+    return <span className="token-badge neutral">未测试</span>;
+  }
+  if (availability.category === "grok-4.5") {
+    return (
+      <span className="token-badge premium" title={availability.grok45Model || "Grok 4.5"}>
+        Grok 4.5
+      </span>
+    );
+  }
+  if (availability.category === "base-only") {
+    return (
+      <span className="token-badge ok" title={availability.baseModel || "基础 Grok"}>
+        基础可用
+      </span>
+    );
+  }
+  return (
+    <span className="token-badge missing" title={availability.error || "不可用"}>
+      不可用
+    </span>
+  );
 }
 
 function QuotaCell({ quota }: { quota: AccountRecord["quota"] }) {

@@ -7,6 +7,7 @@ import json
 import mimetypes
 import os
 from pathlib import Path
+import queue
 import threading
 import time
 import traceback
@@ -27,13 +28,16 @@ from ..core.browser import (
 from ..sinks.json_credential import JsonCredentialSink
 from ..sinks.cpa_credential import build_cpa_download
 from ..sinks.txt_file import TxtFileSink
+from ..grok.account_tester import test_grok_account
 from .relay import RELAY_MANAGER
 
 OUTPUT_DIR = PROJECT_ROOT / "output"
 CREDENTIALS_DIR = OUTPUT_DIR / "credentials"
 TXT_OUTPUT = OUTPUT_DIR / "sso.txt"
+ACCOUNT_TEST_RESULTS_PATH = OUTPUT_DIR / "account-test-results.json"
 WEB_DIST_DIR = PROJECT_ROOT / "web" / "dist"
 DEFAULT_MAX_CONCURRENCY = 20
+ROUND_TIMEOUT_SECONDS = 120
 _ACCOUNTS_CACHE_LOCK = threading.RLock()
 _ACCOUNTS_CACHE_SIGNATURE: tuple[tuple[str, int, int], ...] | None = None
 _ACCOUNTS_CACHE_DATA: list[dict] = []
@@ -63,6 +67,14 @@ def _safe_int(value, default: int, minimum: int, maximum: int) -> int:
     except (TypeError, ValueError):
         parsed = default
     return max(minimum, min(maximum, parsed))
+
+
+class _CombinedStopEvent:
+    def __init__(self, *events: threading.Event) -> None:
+        self._events = events
+
+    def is_set(self) -> bool:
+        return any(event.is_set() for event in self._events)
 
 
 def _format_created_at(value) -> str:
@@ -126,6 +138,48 @@ def _account_from_credential(credential: dict, file_path: Path, item_index: int 
     }
 
 
+def _load_account_test_results() -> dict[str, dict]:
+    try:
+        data = json.loads(ACCOUNT_TEST_RESULTS_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(data, list):
+        return {}
+    results: dict[str, dict] = {}
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        export_key = str(item.get("exportKey") or "").strip()
+        if export_key:
+            results[export_key] = item
+    return results
+
+
+def _save_account_test_results(results: list[dict]) -> None:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    ACCOUNT_TEST_RESULTS_PATH.write_text(
+        json.dumps(results, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _merge_account_test_result(account: dict, test_results: dict[str, dict]) -> dict:
+    result = test_results.get(str(account.get("exportKey") or ""))
+    if not result:
+        return account
+    account["availability"] = {
+        "category": result.get("category") or "unavailable",
+        "baseAvailable": bool(result.get("baseAvailable")),
+        "grok45Available": bool(result.get("grok45Available")),
+        "baseModel": result.get("baseModel"),
+        "grok45Model": result.get("grok45Model"),
+        "latencyMs": result.get("latencyMs"),
+        "error": result.get("error"),
+        "testedAt": result.get("testedAt"),
+    }
+    return account
+
+
 def list_accounts() -> list[dict]:
     global _ACCOUNTS_CACHE_SIGNATURE, _ACCOUNTS_CACHE_DATA
 
@@ -138,20 +192,28 @@ def list_accounts() -> list[dict]:
         except OSError:
             continue
 
+    test_result_sig = ("account-test-results.json", 0, 0)
+    try:
+        stat = ACCOUNT_TEST_RESULTS_PATH.stat()
+        test_result_sig = ("account-test-results.json", stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        pass
+
     files.sort(key=lambda item: item[1], reverse=True)
-    signature = tuple((file_path.name, modified_at, size) for file_path, modified_at, size in files)
+    signature = tuple((file_path.name, modified_at, size) for file_path, modified_at, size in files) + (test_result_sig,)
     with _ACCOUNTS_CACHE_LOCK:
         if signature == _ACCOUNTS_CACHE_SIGNATURE:
             return [dict(account) for account in _ACCOUNTS_CACHE_DATA]
 
     accounts: list[dict] = []
+    test_results = _load_account_test_results()
     for file_path, _, _ in files:
         try:
             data = json.loads(file_path.read_text(encoding="utf-8"))
             items = data if isinstance(data, list) else [data]
             for index, item in enumerate(items):
                 if isinstance(item, dict):
-                    accounts.append(_account_from_credential(item, file_path, index))
+                    accounts.append(_merge_account_test_result(_account_from_credential(item, file_path, index), test_results))
         except Exception as error:
             accounts.append(
                 {
@@ -175,6 +237,42 @@ def list_accounts() -> list[dict]:
         _ACCOUNTS_CACHE_SIGNATURE = signature
         _ACCOUNTS_CACHE_DATA = [dict(account) for account in accounts]
     return accounts
+
+
+def _selected_credential_refs(export_keys: list[str]) -> list[tuple[Path, int, dict, list, bool]]:
+    selected_by_file: dict[str, set[int]] = {}
+    for key in export_keys:
+        raw_key = str(key or "").strip()
+        if ":" not in raw_key:
+            continue
+        file_name, index_text = raw_key.rsplit(":", 1)
+        safe_file_name = Path(file_name).name
+        if safe_file_name != file_name:
+            continue
+        try:
+            item_index = int(index_text)
+        except ValueError:
+            continue
+        if item_index < 0:
+            continue
+        selected_by_file.setdefault(safe_file_name, set()).add(item_index)
+
+    refs: list[tuple[Path, int, dict, list, bool]] = []
+    CREDENTIALS_DIR.mkdir(parents=True, exist_ok=True)
+    for file_name, indexes in selected_by_file.items():
+        file_path = (CREDENTIALS_DIR / file_name).resolve()
+        if CREDENTIALS_DIR.resolve() != file_path.parent or not file_path.exists():
+            continue
+        try:
+            data = json.loads(file_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        is_list = isinstance(data, list)
+        items = data if is_list else [data]
+        for index, item in enumerate(items):
+            if index in indexes and isinstance(item, dict):
+                refs.append((file_path, index, item, items, is_list))
+    return refs
 
 
 def export_credentials(export_keys: list[str]) -> list[dict]:
@@ -220,6 +318,40 @@ def export_credentials(export_keys: list[str]) -> list[dict]:
     if not exported:
         raise ValueError("没有找到可导出的账号 JSON")
     return exported
+
+
+def test_selected_accounts(export_keys: list[str], timeout: int = 120) -> dict:
+    global _ACCOUNTS_CACHE_SIGNATURE
+    refs = _selected_credential_refs(export_keys)
+    if not refs:
+        raise ValueError("请选择要测试的账号")
+
+    previous_results = _load_account_test_results()
+    merged_results = {key: dict(value) for key, value in previous_results.items()}
+    results: list[dict] = []
+    for file_path, index, credential, items, is_list in refs:
+        export_key = _account_export_key(file_path, index)
+        result, updated = test_grok_account(dict(credential), timeout=timeout)
+        result["exportKey"] = export_key
+        result["id"] = str(credential.get("id") or "").strip() or file_path.stem
+        result["fileName"] = file_path.name
+        results.append(result)
+        merged_results[export_key] = result
+
+        if updated != credential:
+            items[index] = updated
+            out = items if is_list else items[0]
+            file_path.write_text(
+                json.dumps(out, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+
+    _save_account_test_results(
+        sorted(merged_results.values(), key=lambda item: int(item.get("testedAt") or 0), reverse=True)
+    )
+    with _ACCOUNTS_CACHE_LOCK:
+        _ACCOUNTS_CACHE_SIGNATURE = None
+    return {"results": results, "accounts": list_accounts()}
 
 
 def export_all_credentials() -> list[dict]:
@@ -299,6 +431,8 @@ class RegistrationJobManager:
                 "failed": 0,
                 "workerErrors": 0,
                 "active": 0,
+                "roundTimeoutSeconds": ROUND_TIMEOUT_SECONDS,
+                "failedAccounts": [],
                 "startedAt": _now_ms(),
                 "finishedAt": None,
                 "events": [],
@@ -402,6 +536,34 @@ class RegistrationJobManager:
             if self._job is not None:
                 self._job["workerErrors"] += 1
 
+    def _record_failed_account(
+        self,
+        *,
+        email: str,
+        round_index: int,
+        worker_index: int,
+        stage: str,
+        reason: str,
+        timed_out: bool = False,
+    ) -> None:
+        with self._lock:
+            if self._job is None:
+                return
+            failures = self._job.setdefault("failedAccounts", [])
+            failures.append(
+                {
+                    "id": uuid.uuid4().hex,
+                    "time": _now_ms(),
+                    "email": email or "unknown",
+                    "round": round_index,
+                    "worker": worker_index,
+                    "stage": stage or "unknown",
+                    "reason": reason,
+                    "timedOut": bool(timed_out),
+                }
+            )
+            del failures[:-500]
+
     def _persist_result(self, provider_name: str, result: dict) -> None:
         txt_sink = TxtFileSink(TXT_OUTPUT)
         json_sink = JsonCredentialSink(str(CREDENTIALS_DIR))
@@ -409,20 +571,51 @@ class RegistrationJobManager:
         json_sink.push(provider_name, result)
         json_sink.flush()
 
-    def _run_worker(self, worker_index: int, oauth_exchange: bool) -> None:
+    def _create_provider(self, oauth_exchange: bool, stop_event) -> GrokProvider:
         provider = GrokProvider()
         provider.enable_oauth_exchange = oauth_exchange
-        provider.stop_event = self._stop_event
+        provider.stop_event = stop_event
         provider.mail_source = self._mail_source
+        return provider
+
+    def _start_worker_session(self, worker_index: int, chrome_lang: str = "zh-CN") -> DrissionBrowserSession:
         session = DrissionBrowserSession(
-            build_chromium_options(provider.chrome_lang, headless=False, window_index=worker_index)
+            build_chromium_options(chrome_lang, headless=False, window_index=worker_index)
         )
         self._register_session(session)
+        session.start()
+        return session
 
+    def _run_round_with_timeout(
+        self,
+        provider: GrokProvider,
+        session: DrissionBrowserSession,
+        timeout_seconds: int,
+    ) -> tuple[str, dict | BaseException | None]:
+        result_queue: queue.Queue[tuple[str, dict | BaseException | None]] = queue.Queue(maxsize=1)
+
+        def _target() -> None:
+            try:
+                result_queue.put(("ok", provider.run_round(session)))
+            except BaseException as error:
+                result_queue.put(("error", error))
+
+        thread = threading.Thread(target=_target, daemon=True)
+        thread.start()
+        thread.join(timeout=timeout_seconds)
+        if thread.is_alive():
+            return "timeout", None
+        try:
+            return result_queue.get_nowait()
+        except queue.Empty:
+            return "error", RuntimeError("注册线程结束但没有返回结果")
+
+    def _run_worker(self, worker_index: int, oauth_exchange: bool) -> None:
+        session: DrissionBrowserSession | None = None
         try:
             if self._stop_event.is_set():
                 return
-            session.start()
+            session = self._start_worker_session(worker_index)
             if self._stop_event.is_set():
                 session.stop()
                 self._unregister_session(session)
@@ -454,8 +647,52 @@ class RegistrationJobManager:
                 )
                 ok = False
                 cancelled = False
+                round_stop_event = threading.Event()
+                provider = self._create_provider(
+                    oauth_exchange,
+                    _CombinedStopEvent(self._stop_event, round_stop_event),
+                )
                 try:
-                    result = provider.run_round(session)
+                    if session is None:
+                        session = self._start_worker_session(worker_index, provider.chrome_lang)
+                        self._event("info", f"Worker {worker_index} 浏览器已重新启动", worker=worker_index)
+                    status, payload = self._run_round_with_timeout(
+                        provider,
+                        session,
+                        ROUND_TIMEOUT_SECONDS,
+                    )
+                    if status == "timeout":
+                        round_stop_event.set()
+                        email = str(getattr(provider, "current_email", "") or "")
+                        stage = str(getattr(provider, "current_stage", "") or "timeout")
+                        reason = f"注册超过 {ROUND_TIMEOUT_SECONDS} 秒，已跳过该账号"
+                        self._record_failed_account(
+                            email=email,
+                            round_index=round_index,
+                            worker_index=worker_index,
+                            stage=stage,
+                            reason=reason,
+                            timed_out=True,
+                        )
+                        self._event(
+                            "error",
+                            f"第 {round_index} 轮超时：{reason}",
+                            worker=worker_index,
+                            round=round_index,
+                            email=email,
+                            stage=stage,
+                        )
+                        try:
+                            session.stop()
+                        except Exception:
+                            pass
+                        self._unregister_session(session)
+                        session = None
+                        continue
+                    if status == "error":
+                        error = payload if isinstance(payload, BaseException) else RuntimeError(str(payload))
+                        raise error
+                    result = payload if isinstance(payload, dict) else {}
                     if self._stop_event.is_set():
                         cancelled = True
                         self._event(
@@ -485,11 +722,22 @@ class RegistrationJobManager:
                             round=round_index,
                         )
                     else:
+                        email = str(getattr(provider, "current_email", "") or "")
+                        stage = str(getattr(provider, "current_stage", "") or "runtime_error")
+                        self._record_failed_account(
+                            email=email,
+                            round_index=round_index,
+                            worker_index=worker_index,
+                            stage=stage,
+                            reason=str(error),
+                        )
                         self._event(
                             "error",
                             f"第 {round_index} 轮失败：{error}",
                             worker=worker_index,
                             round=round_index,
+                            email=email,
+                            stage=stage,
                         )
                         traceback.print_exc()
                 except Exception as error:
@@ -502,11 +750,22 @@ class RegistrationJobManager:
                             round=round_index,
                         )
                     else:
+                        email = str(getattr(provider, "current_email", "") or "")
+                        stage = str(getattr(provider, "current_stage", "") or error.__class__.__name__)
+                        self._record_failed_account(
+                            email=email,
+                            round_index=round_index,
+                            worker_index=worker_index,
+                            stage=stage,
+                            reason=str(error),
+                        )
                         self._event(
                             "error",
                             f"第 {round_index} 轮失败：{error}",
                             worker=worker_index,
                             round=round_index,
+                            email=email,
+                            stage=stage,
                         )
                         traceback.print_exc()
                 finally:
@@ -518,16 +777,24 @@ class RegistrationJobManager:
                     if not has_more:
                         break
                     try:
+                        if session is None:
+                            continue
                         session.restart()
                     except Exception as error:
                         self._event("warning", f"Worker {worker_index} 浏览器重启失败：{error}", worker=worker_index)
-                        break
+                        try:
+                            session.stop()
+                        except Exception:
+                            pass
+                        self._unregister_session(session)
+                        session = None
         finally:
-            try:
-                session.stop()
-            except Exception:
-                pass
-            self._unregister_session(session)
+            if session is not None:
+                try:
+                    session.stop()
+                except Exception:
+                    pass
+                self._unregister_session(session)
             self._event("info", f"Worker {worker_index} 已退出", worker=worker_index)
 
     def _run_job(self, job_id: str) -> None:
@@ -688,6 +955,12 @@ class WebHandler(BaseHTTPRequestHandler):
                     self._send_json({"error": "accountId 必填"}, status=400)
                     return
                 result = refresh_account_quota(account_id)
+                self._send_json(result)
+                return
+            if parsed.path == "/api/accounts/test-batch":
+                body = _read_json_body(self)
+                timeout = _safe_int(body.get("timeout"), default=120, minimum=5, maximum=120)
+                result = test_selected_accounts(body.get("exportKeys") or [], timeout=timeout)
                 self._send_json(result)
                 return
             if parsed.path == "/api/relay/config":
