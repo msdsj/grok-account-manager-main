@@ -275,6 +275,7 @@ export function App() {
   const [googleData, setGoogleData] = useState("");
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
+  const [retrying, setRetrying] = useState(false);
   const [exporting, setExporting] = useState<ExportFormat | null>(null);
   const [testingAccounts, setTestingAccounts] = useState(false);
   const [refreshingSelected, setRefreshingSelected] = useState(false);
@@ -501,6 +502,23 @@ export function App() {
     }
   }
 
+  async function retryRegistration() {
+    if (retrying || isRunning) return;
+    setRetrying(true);
+    setError(null);
+    try {
+      const response = await apiJson<{ job: RegistrationJob }>("/api/register/retry", {
+        method: "POST",
+        body: "{}",
+      });
+      setState((current) => ({ ...current, job: response.job }));
+    } catch (retryError) {
+      setError(String(retryError));
+    } finally {
+      setRetrying(false);
+    }
+  }
+
   async function stopRegistration() {
     setSubmitting(true);
     setError(null);
@@ -602,7 +620,7 @@ export function App() {
         "/api/accounts/test-batch",
         {
           method: "POST",
-          body: JSON.stringify({ exportKeys, timeout: 120 }),
+          body: JSON.stringify({ exportKeys, timeout: 180 }),
         },
       );
       setAccountTestResults(response.results || []);
@@ -677,7 +695,7 @@ export function App() {
             role: message.role,
             content: message.content,
           })),
-          timeout: 120,
+          timeout: 180,
         }),
       });
       const content = response.message?.content || "模型已响应，但没有返回文本内容";
@@ -719,7 +737,7 @@ export function App() {
           prompt,
           n: imageCount,
           size: imageSize,
-          timeout: 120,
+          timeout: 180,
         }),
       });
       if (response.model && response.model !== imageModel) {
@@ -938,7 +956,7 @@ export function App() {
             <span>失败 {job?.failed ?? 0}</span>
             <span>活跃 {job?.active ?? 0}</span>
             <span>启动异常 {job?.workerErrors ?? 0}</span>
-            <span>超时 {job?.roundTimeoutSeconds ?? 120}s</span>
+            <span>超时 {job?.roundTimeoutSeconds ?? 180}s</span>
             <span>注册方式 {formatEmailSourceLabel(job)}</span>
           </div>
         </div>
@@ -948,6 +966,16 @@ export function App() {
           <div className="sub-panel-head">
             <strong>失败账号</strong>
             <span>{failedAccounts.length} 条</span>
+            <button
+              className="secondary-btn"
+              type="button"
+              disabled={retrying || isRunning}
+              onClick={() => void retryRegistration()}
+              title="使用上次注册配置，重新注册一个账号"
+            >
+              {retrying ? <Loader2 size={14} className="spin" /> : <RefreshCw size={14} />}
+              重新注册一个
+            </button>
           </div>
           <div className="accounts-table-wrap compact">
             <table className="accounts-table failed-table">
@@ -958,6 +986,7 @@ export function App() {
                   <th>轮次</th>
                   <th>阶段</th>
                   <th>原因</th>
+                  <th>操作</th>
                 </tr>
               </thead>
               <tbody>
@@ -968,6 +997,18 @@ export function App() {
                     <td>#{item.round} / W{item.worker}</td>
                     <td><code>{item.stage || "-"}</code></td>
                     <td>{item.timedOut ? `超时：${item.reason}` : item.reason}</td>
+                    <td>
+                      <button
+                        className="small-icon-btn"
+                        type="button"
+                        disabled={retrying || isRunning}
+                        onClick={() => void retryRegistration()}
+                        title="重新注册（使用上次配置注册一个新账号）"
+                        aria-label="重新注册"
+                      >
+                        {retrying ? <Loader2 size={14} className="spin" /> : <RefreshCw size={14} />}
+                      </button>
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -1035,6 +1076,7 @@ export function App() {
             <tr>
               <th className="select-col"><input type="checkbox" checked={allSelected} disabled={accountsWithKeys.length === 0} aria-label="选择全部账号" onChange={toggleAllAccounts} /></th>
               <th>账号</th>
+              <th>注册时间</th>
               <th>CLI 4.5</th>
               <th>Chat 4.20</th>
               <th>生图</th>
@@ -1044,12 +1086,13 @@ export function App() {
           </thead>
           <tbody>
             {accountsWithKeys.length === 0 ? (
-              <tr><td colSpan={7}><div className="empty-row">暂无账号</div></td></tr>
+              <tr><td colSpan={8}><div className="empty-row">暂无账号</div></td></tr>
             ) : (
               accountsWithKeys.map((account) => (
                 <tr key={account.rowKey}>
                   <td className="select-col"><input type="checkbox" checked={selectedAccounts.has(account.rowKey)} aria-label={`选择 ${maskEmail(account.email)}`} onChange={() => toggleAccount(account.rowKey)} /></td>
                   <td><div className="email-cell"><strong>{hideEmails ? maskEmail(account.email) : account.email}</strong><span>{account.fileName}</span></div></td>
+                  <td>{account.createdAtLabel || "-"}</td>
                   <td><CapabilityCell ok={hasCli45Capability(account.availability)} tested={Boolean(account.availability)} label="CLI 4.5" /></td>
                   <td><CapabilityCell ok={hasChatCapability(account.availability)} tested={Boolean(account.availability)} label="Chat" /></td>
                   <td><CapabilityCell ok={hasImageCapability(account.availability)} tested={Boolean(account.availability)} label="生图" /></td>

@@ -411,7 +411,7 @@ return '';
         return None
 
 
-def wait_for_cookie(session: DrissionBrowserSession, cookie_name: str, timeout: int = 120) -> str:
+def wait_for_cookie(session: DrissionBrowserSession, cookie_name: str, timeout: int = 180) -> str:
     """注册完成后等待指定 cookie 出现并返回其值。"""
     deadline = time.time() + timeout
     last_seen_names: set[str] = set()

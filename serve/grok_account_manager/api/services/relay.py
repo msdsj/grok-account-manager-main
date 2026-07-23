@@ -312,7 +312,7 @@ class RelayManager:
             f"{cfg.base_url}/admin/api/batch/refresh",
             headers=_admin_headers(cfg),
             json={"tokens": clean_tokens},
-            timeout=120,
+            timeout=180,
         )
         _raise_response_error(response)
         return response.json()
@@ -337,7 +337,7 @@ class RelayManager:
         _raise_response_error(response)
         return response.json()
 
-    def send_chat_completion(self, *, model: str, messages: list[dict], timeout: int = 120) -> dict:
+    def send_chat_completion(self, *, model: str, messages: list[dict], timeout: int = 180) -> dict:
         if not self.is_running():
             self.start()
         cfg = self._config
@@ -363,7 +363,7 @@ class RelayManager:
             "raw": payload,
         }
 
-    def generate_image(self, *, model: str, prompt: str, n: int, size: str, timeout: int = 120) -> dict:
+    def generate_image(self, *, model: str, prompt: str, n: int, size: str, timeout: int = 180) -> dict:
         if not self.is_running():
             self.start()
         cfg = self._config
@@ -394,7 +394,7 @@ class RelayManager:
         query: str = "",
         headers: dict[str, str] | None = None,
         body: bytes = b"",
-        timeout: int = 120,
+        timeout: int = 180,
     ) -> requests.Response:
         if not self.is_running():
             self.start()

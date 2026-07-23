@@ -192,24 +192,105 @@ def _is_transient_page_error(error: Exception) -> bool:
 
 
 def _click_email_signup_button(session: DrissionBrowserSession, timeout=10):
-    """页面打开后，自动点击"使用邮箱注册"按钮。"""
+    """页面打开后，自动点击邮箱注册入口；如果已经进入邮箱页则直接继续。"""
     deadline = time.time() + timeout
+    last_state = ""
+    cloudflare_seen = False
     while time.time() < deadline:
         page = session.refresh_page()
         try:
-            clicked = page.run_js(r"""
-const candidates = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+            state = page.run_js(r"""
+function isVisible(node) {
+    if (!node) {
+        return false;
+    }
+    const style = window.getComputedStyle(node);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
+        return false;
+    }
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+}
+
+const emailInput = Array.from(document.querySelectorAll(
+    'input[data-testid="email"], input[name="email"], input[type="email"], input[autocomplete="email"]'
+)).find((node) => isVisible(node) && !node.disabled && !node.readOnly);
+if (emailInput) {
+    return { status: 'ready', url: location.href };
+}
+
+function textOf(node) {
+    return [
+        node.innerText || '',
+        node.textContent || '',
+        node.getAttribute('aria-label') || '',
+        node.getAttribute('title') || '',
+        node.getAttribute('data-testid') || '',
+        node.getAttribute('data-test-id') || '',
+        node.id || '',
+        node.className || '',
+    ].join(' ').replace(/\s+/g, '').toLowerCase();
+}
+
+const candidates = Array.from(document.querySelectorAll('button, a, [role="button"]')).filter((node) => {
+    return isVisible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true';
+});
+const buttonTexts = candidates.slice(0, 8).map((node) => (
+    node.innerText || node.textContent || node.getAttribute('aria-label') || node.getAttribute('title') || ''
+).trim()).filter(Boolean);
+const title = document.title || '';
+const bodyText = (document.body?.innerText || '').replace(/\s+/g, ' ').trim();
+const hasChallengeFrame = Boolean(document.querySelector(
+    'iframe[src*="challenges.cloudflare.com"], input[name="cf-turnstile-response"], .cf-turnstile'
+));
+const pageText = [
+    title,
+    bodyText,
+    buttonTexts.join(' '),
+].join(' ').replace(/\s+/g, '').toLowerCase();
+const cloudflareChallenge = (
+    pageText.includes('cloudflare') ||
+    pageText.includes('clicktoreveal') ||
+    pageText.includes('checkingifyouarehuman') ||
+    pageText.includes('justamoment') ||
+    pageText.includes('验证您是真人') ||
+    pageText.includes('正在检查') ||
+    hasChallengeFrame
+);
+if (cloudflareChallenge) {
+    return {
+        status: 'cloudflare',
+        url: location.href,
+        title,
+        readyState: document.readyState || '',
+        buttons: buttonTexts,
+        bodySnippet: bodyText.slice(0, 260),
+        hasChallengeFrame,
+    };
+}
 const target = candidates.find((node) => {
-    const text = (node.innerText || node.textContent || '').replace(/\s+/g, '');
-    return text.includes('使用邮箱注册');
+    const text = textOf(node);
+    if (text.includes('google') || text.includes('谷歌')) {
+        return false;
+    }
+    const hasEmail = text.includes('email') || text.includes('邮箱') || text.includes('邮件') || text.includes('電子郵件');
+    const hasSignup = text.includes('注册') || text.includes('註冊') || text.includes('signup') || text.includes('signin') || text.includes('login') || text.includes('continue') || text.includes('使用') || text.includes('继续') || text.includes('繼續');
+    return hasEmail && hasSignup;
 });
 
 if (!target) {
-    return false;
+    return {
+        status: 'missing',
+        url: location.href,
+        title,
+        readyState: document.readyState || '',
+        buttons: buttonTexts,
+        bodySnippet: bodyText.slice(0, 260),
+        hasChallengeFrame,
+    };
 }
-
 target.click();
-return true;
+return { status: 'clicked', url: location.href };
         """)
         except Exception as error:
             if _is_transient_page_error(error):
@@ -217,14 +298,42 @@ return true;
                 continue
             raise
 
-        if clicked:
+        if isinstance(state, dict):
+            status = str(state.get("status") or "")
+            last_state = (
+                f"title={state.get('title') or ''}; "
+                f"url={state.get('url') or ''}; "
+                f"readyState={state.get('readyState') or ''}; "
+                f"hasChallengeFrame={bool(state.get('hasChallengeFrame'))}; "
+                f"buttons={state.get('buttons') or []}; "
+                f"body={state.get('bodySnippet') or ''}"
+            )
+        else:
+            status = str(state or "")
+            last_state = status
+
+        if status == "ready":
+            return True
+
+        if status == "cloudflare":
+            cloudflare_seen = True
+            last_state = f"Cloudflare 验证页: {last_state}"
+            time.sleep(1)
+            continue
+
+        if status == "clicked":
             time.sleep(1)
             session.refresh_page()
             return True
 
         time.sleep(0.5)
 
-    raise Exception('未找到"使用邮箱注册"按钮')
+    if cloudflare_seen:
+        raise Exception(
+            f"检测到 Cloudflare 验证页（{last_state or '页面未返回可诊断信息'}）；"
+            "当前页面被 x.ai 安全策略拦截，请在可见浏览器中手动处理后再继续。"
+        )
+    raise Exception(f'未找到邮箱注册入口（{last_state or "页面未返回可诊断信息"}）')
 
 
 def _click_google_signup_button(session: DrissionBrowserSession, timeout=15):
@@ -384,10 +493,17 @@ def _has_xai_session_ready(page) -> bool:
             r"""
 const host = location.hostname;
 const path = location.pathname.toLowerCase();
-const text = (document.body?.innerText || '').replace(/\s+/g, '');
+const text = (document.body?.innerText || '').replace(/\s+/g, '').toLowerCase();
 const onXai = host.endsWith('x.ai') || host.endsWith('grok.com');
 const onAuthChoice = path.includes('sign-up') || path.includes('sign-in') || path.includes('login') || path.includes('signup');
-const hasChoiceButtons = text.includes('使用邮箱注册') || text.toLowerCase().includes('google');
+const hasChoiceButtons = (
+    text.includes('使用邮箱注册') ||
+    text.includes('邮箱注册') ||
+    text.includes('continuewithemail') ||
+    text.includes('signupwithemail') ||
+    text.includes('email') ||
+    text.includes('google')
+);
 return onXai && !(onAuthChoice && hasChoiceButtons);
             """
         ))
@@ -1173,7 +1289,7 @@ def _build_profile() -> dict[str, str]:
     return {"given_name": given_name, "family_name": family_name, "password": password}
 
 
-def _fill_profile_and_submit(session: DrissionBrowserSession, timeout: int = 120) -> dict[str, str]:
+def _fill_profile_and_submit(session: DrissionBrowserSession, timeout: int = 180) -> dict[str, str]:
     profile = _build_profile()
     given_name = profile["given_name"]
     family_name = profile["family_name"]

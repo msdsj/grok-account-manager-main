@@ -34,12 +34,12 @@ GROK_CLI_VERSION = "0.2.93"
 GROK_UPSTREAM_USER_AGENT = "sub2api-grok/1.0"
 
 
-def test_grok_account(credential: dict[str, Any], timeout: int = 120) -> tuple[dict[str, Any], dict[str, Any]]:
+def test_grok_account(credential: dict[str, Any], timeout: int = 180) -> tuple[dict[str, Any], dict[str, Any]]:
     """Probe one account with its own xAI OAuth token.
 
     Returns a public result and a possibly refreshed credential copy.
     """
-    timeout = max(5, min(120, int(timeout or 120)))
+    timeout = max(5, min(180, int(timeout or 180)))
     updated = dict(credential)
     email = _text(updated.get("email")) or "unknown"
     result: dict[str, Any] = {
@@ -195,10 +195,10 @@ def send_grok_chat(
     *,
     model: str,
     messages: list[dict[str, Any]],
-    timeout: int = 120,
+    timeout: int = 180,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Send one non-stream Grok chat probe using the selected local account."""
-    timeout = max(5, min(120, int(timeout or 120)))
+    timeout = max(5, min(180, int(timeout or 180)))
     updated = prepare_grok_credential_for_test(credential, timeout=timeout, force_refresh=False)
     model = _text(model) or "grok-4.20-auto"
     base_url = _responses_base_url(updated)
@@ -229,10 +229,10 @@ def generate_grok_image(
     prompt: str,
     n: int = 1,
     size: str = "",
-    timeout: int = 120,
+    timeout: int = 180,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Run one Grok Imagine generation using the selected local account."""
-    timeout = max(5, min(120, int(timeout or 120)))
+    timeout = max(5, min(180, int(timeout or 180)))
     updated = prepare_grok_credential_for_test(credential, timeout=timeout, force_refresh=False)
     model = _normalize_image_model(_text(model) or "grok-imagine-image")
     prompt = _text(prompt)

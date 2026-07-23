@@ -85,7 +85,7 @@ def refresh_quota(body: RefreshQuotaRequest) -> dict:
 
 @router.post("/api/accounts/test-batch")
 def test_accounts(body: TestBatchRequest) -> dict:
-    timeout = safe_int(body.timeout, default=120, minimum=5, maximum=120)
+    timeout = safe_int(body.timeout, default=180, minimum=5, maximum=180)
     try:
         return test_selected_accounts(body.exportKeys, timeout=timeout)
     except Exception as error:
@@ -94,7 +94,7 @@ def test_accounts(body: TestBatchRequest) -> dict:
 
 @router.post("/api/accounts/chat-test")
 def test_chat(body: AccountChatTestRequest) -> dict:
-    timeout = safe_int(body.timeout, default=120, minimum=5, maximum=120)
+    timeout = safe_int(body.timeout, default=180, minimum=5, maximum=180)
     try:
         return test_account_chat(
             export_key=body.exportKey,
@@ -108,7 +108,7 @@ def test_chat(body: AccountChatTestRequest) -> dict:
 
 @router.post("/api/accounts/image-test")
 def test_image(body: AccountImageTestRequest) -> dict:
-    timeout = safe_int(body.timeout, default=120, minimum=5, maximum=120)
+    timeout = safe_int(body.timeout, default=180, minimum=5, maximum=180)
     count = safe_int(body.n, default=1, minimum=1, maximum=4)
     try:
         return test_account_image(

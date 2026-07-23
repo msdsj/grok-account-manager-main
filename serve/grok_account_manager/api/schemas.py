@@ -32,14 +32,14 @@ class RefreshQuotaRequest(BaseModel):
 
 class TestBatchRequest(BaseModel):
     exportKeys: list[str] = Field(default_factory=list)
-    timeout: int = 120
+    timeout: int = 180
 
 
 class AccountChatTestRequest(BaseModel):
     exportKey: str = ""
     model: str = "grok-4.5"
     messages: list[dict[str, Any]] = Field(default_factory=list)
-    timeout: int = 120
+    timeout: int = 180
 
 
 class AccountImageTestRequest(BaseModel):
@@ -48,7 +48,7 @@ class AccountImageTestRequest(BaseModel):
     prompt: str = ""
     n: int = 1
     size: str = "1024x1024"
-    timeout: int = 120
+    timeout: int = 180
 
 
 class RelayConfigRequest(BaseModel):

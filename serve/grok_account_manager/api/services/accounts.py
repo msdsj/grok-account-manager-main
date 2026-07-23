@@ -397,7 +397,7 @@ def _sync_project_pool_to_relay() -> dict:
         raise ValueError(f"同步账号池到 grok2api 失败：{error}") from error
 
 
-def test_selected_accounts(export_keys: list[str], timeout: int = 120) -> dict:
+def test_selected_accounts(export_keys: list[str], timeout: int = 180) -> dict:
     list_accounts()
     refs = account_db.get_credential_refs(export_keys)
     if not refs:
@@ -429,7 +429,7 @@ def test_selected_accounts(export_keys: list[str], timeout: int = 120) -> dict:
     return {"results": results, "accounts": list_accounts()}
 
 
-def test_account_chat(export_key: str, model: str, messages: list[dict], timeout: int = 120) -> dict:
+def test_account_chat(export_key: str, model: str, messages: list[dict], timeout: int = 180) -> dict:
     list_accounts()
     refs = account_db.get_credential_refs([export_key])
     if not refs:
@@ -504,7 +504,7 @@ def test_account_chat(export_key: str, model: str, messages: list[dict], timeout
     }
 
 
-def test_account_image(export_key: str, model: str, prompt: str, n: int, size: str, timeout: int = 120) -> dict:
+def test_account_image(export_key: str, model: str, prompt: str, n: int, size: str, timeout: int = 180) -> dict:
     list_accounts()
     refs = account_db.get_credential_refs([export_key])
     if not refs:

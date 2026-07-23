@@ -14,6 +14,24 @@ if TYPE_CHECKING:
 CREDENTIALS_FILENAME = "grok_credentials.json"
 
 
+def _load_existing_credentials(filepath: Path) -> list[dict]:
+    if not filepath.exists():
+        return []
+    raw = filepath.read_text(encoding="utf-8").strip()
+    if not raw:
+        filepath.write_text("[]", encoding="utf-8")
+        return []
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        filepath.write_text("[]", encoding="utf-8")
+        return []
+    if not isinstance(data, list):
+        filepath.write_text("[]", encoding="utf-8")
+        return []
+    return [item for item in data if isinstance(item, dict)]
+
+
 class JsonCredentialSink:
     def __init__(self, output_dir: str = "output/credentials"):
         self.output_dir = Path(output_dir)
@@ -38,11 +56,7 @@ class JsonCredentialSink:
         filepath = self.output_dir / CREDENTIALS_FILENAME
         pending = list(self._pending)
         try:
-            existing: list[dict] = []
-            if filepath.exists():
-                data = json.loads(filepath.read_text(encoding="utf-8"))
-                if isinstance(data, list):
-                    existing = data
+            existing = _load_existing_credentials(filepath)
             start_index = len(existing)
             existing.extend(pending)
             filepath.write_text(

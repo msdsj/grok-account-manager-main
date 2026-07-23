@@ -41,12 +41,30 @@ class RegistrationJobManager:
         self._job: dict | None = None
         self._sessions: set[DrissionBrowserSession] = set()
         self._mail_source = None
+        self._last_config: dict = {}
 
     def snapshot(self) -> dict | None:
         with self._lock:
             if self._job is None:
                 return None
             return json.loads(json.dumps(self._job, default=json_default))
+
+    def retry(self) -> dict:
+        """Start a single-round registration using the last saved config."""
+        with self._lock:
+            if not self._last_config:
+                raise RuntimeError("没有可用的上次注册配置，请先运行一次注册任务")
+        cfg = self._last_config
+        return self.start(
+            total=1,
+            concurrency=1,
+            oauth_exchange=cfg.get("oauth_exchange", True),
+            email_source=cfg.get("email_source", "duckmail"),
+            outlook_data=cfg.get("outlook_data", ""),
+            outlook_accounts_file=cfg.get("outlook_accounts_file", ""),
+            google_data=cfg.get("google_data", ""),
+            google_accounts_file=cfg.get("google_accounts_file", ""),
+        )
 
     def start(
         self,
@@ -81,6 +99,14 @@ class RegistrationJobManager:
             if self._job and self._job.get("status") in {"running", "stopping"}:
                 raise RuntimeError("已有注册任务正在运行")
 
+            self._last_config = {
+                "oauth_exchange": bool(oauth_exchange),
+                "email_source": email_source,
+                "outlook_data": outlook_data,
+                "outlook_accounts_file": outlook_accounts_file,
+                "google_data": google_data,
+                "google_accounts_file": google_accounts_file,
+            }
             self._stop_event = threading.Event()
             self._mail_source = mail_source
             self._job = {
@@ -506,4 +532,3 @@ class RegistrationJobManager:
 
 
 JOB_MANAGER = RegistrationJobManager()
-

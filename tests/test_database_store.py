@@ -72,6 +72,27 @@ class DatabaseStoreTests(unittest.TestCase):
         exported = account_db.export_credentials(["grok_credentials.json:0"])
         self.assertEqual(exported[0]["refresh_token"], "sink-refresh")
 
+    def test_json_sink_initializes_empty_credentials_file(self) -> None:
+        credentials_dir = Path(self._tmpdir.name) / "credentials"
+        credentials_dir.mkdir(parents=True, exist_ok=True)
+        credentials_path = credentials_dir / "grok_credentials.json"
+        credentials_path.write_text("", encoding="utf-8")
+        credential = {
+            "id": "acc-3",
+            "email": "empty-file@example.com",
+            "access_token": "empty-token",
+            "refresh_token": "empty-refresh",
+            "auth_mode": "oauth",
+        }
+
+        sink = JsonCredentialSink(str(credentials_dir))
+        sink.push("grok", {"full_credential": credential})
+        sink.flush()
+
+        self.assertEqual(credentials_path.read_text(encoding="utf-8").strip().startswith("["), True)
+        exported = account_db.export_credentials(["grok_credentials.json:0"])
+        self.assertEqual(exported[0]["email"], "empty-file@example.com")
+
 
 if __name__ == "__main__":
     unittest.main()
