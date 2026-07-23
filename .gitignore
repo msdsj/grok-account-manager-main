@@ -22,3 +22,7 @@ mail_accounts*.txt
 .vscode/
 .DS_Store
 *.grok_credentials.json
+
+# 本地 Agent/IDE 辅助文件
+.agents/
+skills-lock.json

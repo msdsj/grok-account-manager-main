@@ -36,19 +36,36 @@ class JsonCredentialSink:
         if not self._pending:
             return
         filepath = self.output_dir / CREDENTIALS_FILENAME
+        pending = list(self._pending)
         try:
             existing: list[dict] = []
             if filepath.exists():
                 data = json.loads(filepath.read_text(encoding="utf-8"))
                 if isinstance(data, list):
                     existing = data
-            existing.extend(self._pending)
+            start_index = len(existing)
+            existing.extend(pending)
             filepath.write_text(
                 json.dumps(existing, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
-            print(f"[JsonCredentialSink] 已写入 {len(self._pending)} 条凭证到 {filepath}（共 {len(existing)} 条）")
+            self._persist_pending_to_database(filepath, pending, start_index)
+            print(f"[JsonCredentialSink] 已写入 {len(pending)} 条凭证到 {filepath}（共 {len(existing)} 条）")
         except Exception as e:
             print(f"[JsonCredentialSink] 保存凭证失败: {e}")
         finally:
             self._pending.clear()
+
+    def _persist_pending_to_database(self, filepath: Path, pending: list[dict], start_index: int) -> None:
+        try:
+            from ..api.services import database as account_db
+            from ..api.services.accounts import account_from_credential
+
+            for offset, credential in enumerate(pending):
+                if not isinstance(credential, dict):
+                    continue
+                item_index = start_index + offset
+                account = account_from_credential(credential, filepath, item_index)
+                account_db.upsert_account(account, credential, filepath, item_index)
+        except Exception as error:
+            print(f"[JsonCredentialSink] 写入账号数据库失败: {error}")

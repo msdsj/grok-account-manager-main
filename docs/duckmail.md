@@ -24,8 +24,8 @@ DUCKMAIL_DOMAIN=@msdsj.cyou
 uv run grok-account-manager grok --count 1 --sink json
 ```
 
-DuckMail 实现位于 `src/grok_account_manager/mail/duckmail.py`，邮箱源装配位于
-`src/grok_account_manager/mail/sources.py`。
+DuckMail 实现位于 `serve/grok_account_manager/mail/duckmail.py`，邮箱源装配位于
+`serve/grok_account_manager/mail/sources.py`。
 
 ## 安全
 

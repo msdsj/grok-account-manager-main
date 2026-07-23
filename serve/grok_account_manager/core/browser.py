@@ -10,7 +10,7 @@ from pathlib import Path
 from DrissionPage import Chromium, ChromiumOptions
 from DrissionPage.errors import PageDisconnectedError
 
-# 项目根目录（三层上：src/grok_account_manager/core/browser.py → 项目根）
+# 项目根目录（三层上：serve/grok_account_manager/core/browser.py → 项目根）
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 TURNSTILE_EXTENSION_PATH = str(PROJECT_ROOT / "extensions" / "turnstile_patch")
 

@@ -1,0 +1,16 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: grok-account-manager-postgres
+    restart: unless-stopped
+    ports:
+      - "54329:5432"
+    environment:
+      POSTGRES_DB: grok_account_manager
+      POSTGRES_USER: grok
+      POSTGRES_PASSWORD: grok
+    volumes:
+      - grok_account_manager_pgdata:/var/lib/postgresql/data
+
+volumes:
+  grok_account_manager_pgdata:

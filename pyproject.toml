@@ -8,20 +8,23 @@ license = { file = "LICENSE" }
 requires-python = ">=3.12,<3.14"
 dependencies = [
     "DrissionPage==4.1.0.9",
+    "fastapi>=0.115",
     "requests>=2.31",
     "python-dotenv>=1.0",
+    "uvicorn[standard]>=0.30",
 ]
 
 [project.scripts]
 grok-account-manager = "grok_account_manager.cli:main"
-grok-account-manager-web = "grok_account_manager.webapp.server:main"
+grok-account-manager-api = "grok_account_manager.api.main:main"
+grok-account-manager-web = "grok_account_manager.api.main:main"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/grok_account_manager"]
+packages = ["serve/grok_account_manager"]
 
 [tool.uv]
 package = true

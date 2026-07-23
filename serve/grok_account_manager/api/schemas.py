@@ -1,0 +1,70 @@
+"""Request models used by the local API."""
+
+from __future__ import annotations
+
+from typing import Any
+
+from pydantic import BaseModel, Field
+
+
+class RegisterRequest(BaseModel):
+    total: int = 1
+    concurrency: int = 1
+    oauthExchange: bool = True
+    emailSource: str = "duckmail"
+    outlookData: str = ""
+    outlookAccountsFile: str = ""
+    googleData: str = ""
+    googleAccountsFile: str = ""
+
+
+class ExportRequest(BaseModel):
+    exportKeys: list[str] = Field(default_factory=list)
+
+
+class DeleteAccountsRequest(BaseModel):
+    exportKeys: list[str] = Field(default_factory=list)
+
+
+class RefreshQuotaRequest(BaseModel):
+    accountId: str = ""
+
+
+class TestBatchRequest(BaseModel):
+    exportKeys: list[str] = Field(default_factory=list)
+    timeout: int = 120
+
+
+class AccountChatTestRequest(BaseModel):
+    exportKey: str = ""
+    model: str = "grok-4.5"
+    messages: list[dict[str, Any]] = Field(default_factory=list)
+    timeout: int = 120
+
+
+class AccountImageTestRequest(BaseModel):
+    exportKey: str = ""
+    model: str = "grok-imagine-image-lite"
+    prompt: str = ""
+    n: int = 1
+    size: str = "1024x1024"
+    timeout: int = 120
+
+
+class RelayConfigRequest(BaseModel):
+    grok2apiPath: str | None = None
+    host: str | None = None
+    port: int | None = None
+    apiKey: str | None = None
+    adminKey: str | None = None
+
+    def to_patch(self) -> dict[str, Any]:
+        return self.model_dump(exclude_none=True)
+
+
+class RelaySyncRequest(BaseModel):
+    exportKeys: list[str] = Field(default_factory=list)
+
+
+class RelayModelsRequest(BaseModel):
+    probeChat: bool = True

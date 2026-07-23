@@ -90,6 +90,27 @@ def _split_by_dashes(line: str) -> list[str]:
     return parts
 
 
+def _split_account_fields(line: str) -> list[str]:
+    """Split one account row.
+
+    Supported formats:
+    - email----password----clientId----refreshToken
+    - email|password|recoveryEmail
+
+    The dash format remains the first choice because refresh tokens can contain
+    pipe-like text in rare copied exports, while the new pipe format is mainly
+    for Google/Gmail account pools.
+    """
+    line = str(line or "").strip()
+    if not line:
+        return []
+    if re.search(r"-{4,}", line):
+        return [part.strip() for part in _split_by_dashes(line)]
+    if "|" in line:
+        return [part.strip() for part in line.split("|")]
+    return [line]
+
+
 def _normalize_folder_name(name: str) -> str:
     return re.sub(r"\s+", " ", str(name or "").strip()).lower()
 
@@ -220,7 +241,7 @@ def parse_outlook_accounts(data: str) -> list[OutlookAccount]:
         entry = entry.strip()
         if not entry:
             return
-        parts = [part.strip() for part in _split_by_dashes(entry)]
+        parts = _split_account_fields(entry)
         if len(parts) != 4 or not parts[0] or not parts[2] or not parts[3]:
             return
         accounts.append(
@@ -253,7 +274,7 @@ def parse_google_accounts(data: str) -> list[GoogleAccount]:
         entry = entry.strip()
         if not entry:
             return
-        parts = [part.strip() for part in _split_by_dashes(entry)]
+        parts = _split_account_fields(entry)
         if len(parts) < 2 or not parts[0] or not parts[1]:
             return
         accounts.append(

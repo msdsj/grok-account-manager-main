@@ -8,12 +8,26 @@ MSDSJ 的 Grok 账号注册与凭证管理工具。项目提供 Python 自动化
 
 ![MSDSJ Grok 注册机控制台](docs/images/dashboard.png)
 
+## 项目地址与交流群
+
+GitHub：<https://github.com/msdsj/grok-account-manager-main>
+
+如果这个项目帮到你，欢迎帮忙点一个 Star。使用中遇到账号池、Grok CLI 4.5、Chat 对话或图片生成问题，可以加入 QQ 交流群反馈。
+
+群号：`972295238`
+
+![QQ 交流群二维码](web/public/community-qr.png)
+
+## 更新日志
+
+完整版本记录见 [CHANGELOG.md](CHANGELOG.md)。当前版本重点更新 FastAPI 后端重构、账号数据库、Grok CLI 4.5 测试、Chat/图片测试、本地中转和新版控制台界面。
+
 ## 功能
 
 - Grok 邮箱注册自动化，注册资料姓名和密码每轮随机生成。
-- 邮箱源支持 DuckMail 和 Outlook IMAP，Outlook 格式兼容 `邮箱----密码----clientId----refreshToken`。
-- 输出 cockpit-tools 可导入的 GrokAccount JSON 数组。
-- React 控制台支持注册任务、并发、日志、账号列表和 JSON 导出。
+- 邮箱源支持 DuckMail、Outlook、Gmail/Google 账号池，`----` 和 `|` 两种分隔格式都兼容。
+- 输出 cockpit-tools 可导入的 GrokAccount JSON 数组，并同步写入本地账号数据库。
+- React 控制台使用侧边栏路由，支持注册任务、账号列表、Grok CLI 4.5 测试、Chat 对话测试、图片生成测试和本地中转。
 - 可选 `sub2api` sink，把注册结果写入独立部署的 Sub2API 管理 API。
 
 ## 环境要求
@@ -53,10 +67,11 @@ uv run python -m grok_account_manager grok --count 1 --sink json
 
 ## Outlook 邮箱源
 
-把 Outlook 账号池保存为本地文件，例如 `outlook_accounts.txt`。该文件已被 `.gitignore` 忽略。
+把 Outlook 账号池保存为本地文件，例如 `outlook_accounts.txt`。该文件已被 `.gitignore` 忽略。账号字段支持 `----` 或 `|` 两种分隔符。
 
 ```text
 email@example.com----password----clientId----refreshToken
+email@example.com|password|clientId|refreshToken
 ```
 
 运行：
@@ -75,12 +90,29 @@ GROK_ACCOUNT_MANAGER_EMAIL_SOURCE=outlook
 OUTLOOK_ACCOUNTS_FILE=outlook_accounts.txt
 ```
 
-## Web 控制台
+Google/Gmail 账号池同样支持两种格式：
 
-开发模式需要两个终端：
+```text
+email@gmail.com----password----recovery@example.com
+email@gmail.com|password|recovery@example.com
+```
+
+## 本地数据库
+
+账号完整凭证、导出索引和测试结果会写入本地 SQLite：
 
 ```bash
-uv run grok-account-manager-web
+GROK_ACCOUNT_MANAGER_DB_PATH=output/grok-account-manager.db
+```
+
+`docker-compose.yml` 预留了本地 Postgres 服务，后续如果要切到 Postgres，需要再安装对应 Python 驱动并迁移数据库层；当前默认 SQLite 不需要额外容器即可使用。
+
+## 本地控制台
+
+后端现在是单一 FastAPI 服务，注册机 API、中转站管理 API 和 OpenAI 兼容代理都由它提供。开发模式运行两个进程：一个后端、一个前端。
+
+```bash
+uv run grok-account-manager-api
 ```
 
 ```bash
@@ -89,20 +121,23 @@ npm install
 npm run dev
 ```
 
-打开 `http://127.0.0.1:5173`。生产模式可先构建前端：
+打开 `http://127.0.0.1:5173`。前端开发服务器会把 `/api`、`/v1` 和 `/admin/api` 代理到 FastAPI 后端。
+
+生产模式可先构建前端：
 
 ```bash
 cd web
 npm run build
 cd ..
-uv run grok-account-manager-web
+uv run grok-account-manager-api
 ```
 
-然后打开 `http://127.0.0.1:8765`。
+然后打开 `http://127.0.0.1:8765`。旧命令 `uv run grok-account-manager-web` 仍然可用，内部指向同一个 FastAPI 入口。
 
 ## 输出文件
 
 - `output/credentials/grok_credentials.json`：GrokAccount JSON 数组。
+- `output/grok-account-manager.db`：本地账号数据库。
 - `output/sso.txt`：使用 `txt` sink 时写入的 SSO 兜底文本。
 - `output/sso-failed.txt`：Sub2API 写入失败时的兜底文本。
 
@@ -136,7 +171,12 @@ uv run grok-account-manager grok --count 1 --sink sub2api
 ## 项目结构
 
 ```text
-src/grok_account_manager/
+serve/grok_account_manager/
+  api/
+    app.py                # FastAPI 应用工厂、CORS、SPA 静态入口
+    main.py               # 后端启动命令
+    routers/              # 注册、账号、中转站、代理 API 路由
+    services/             # 任务调度、账号数据库、中转站进程管理
   cli.py                  # CLI 参数解析和轮次调度
   core/browser.py         # Chromium 启停、扩展加载、cookie 等待
   mail/duckmail.py        # DuckMail 接码
@@ -145,9 +185,9 @@ src/grok_account_manager/
   grok/oauth_exchange.py  # xAI OAuth PKCE loopback
   providers/grok.py       # Grok 注册页面自动化
   sinks/                  # JSON/TXT/Sub2API 输出
-  webapp/server.py        # 本地 API 和静态页面服务
 extensions/turnstile_patch/
 web/src/
+  routes.tsx              # 侧边栏页面路由配置
 scripts/
 docs/
 ```
@@ -155,7 +195,7 @@ docs/
 ## 验证
 
 ```bash
-python3 -X pycache_prefix=/private/tmp/grok-account-manager-pyc -m compileall src
+python3 -X pycache_prefix=/private/tmp/grok-account-manager-pyc -m compileall serve tests
 cd web && npm run build
 ```
 

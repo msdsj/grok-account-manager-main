@@ -14,7 +14,9 @@ def main() -> int:
     root_dir = Path(sys.argv[1]).resolve()
     pid_file = Path(sys.argv[2]).resolve()
     log_file = Path(sys.argv[3]).resolve()
-    command = root_dir / ".venv" / "bin" / "grok-account-manager-web"
+    command = root_dir / ".venv" / "bin" / "grok-account-manager-api"
+    if not command.exists():
+        command = root_dir / ".venv" / "bin" / "grok-account-manager-web"
 
     if not command.exists():
         print(f"missing command: {command}", file=sys.stderr)
@@ -39,4 +41,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

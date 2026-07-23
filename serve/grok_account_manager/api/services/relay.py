@@ -20,7 +20,7 @@ from urllib.parse import urlsplit
 
 import requests
 
-from ..core.browser import PROJECT_ROOT
+from ...core.browser import PROJECT_ROOT
 
 
 OUTPUT_DIR = PROJECT_ROOT / "output"
@@ -28,7 +28,13 @@ CONFIG_PATH = OUTPUT_DIR / "relay-config.json"
 LOG_PATH = OUTPUT_DIR / "grok2api-relay.log"
 DATA_DIR = OUTPUT_DIR / "grok2api-data"
 LOG_DIR = OUTPUT_DIR / "grok2api-logs"
-DEFAULT_GROK2API_PATH = PROJECT_ROOT.parent.parent / "未命名文件夹" / "grok2api"
+_LEGACY_GROK2API_PATH = PROJECT_ROOT.parent.parent / "未命名文件夹" / "grok2api"
+_SIBLING_GROK2API_PATH = PROJECT_ROOT.parent / "grok2api"
+DEFAULT_GROK2API_PATH = Path(
+    os.environ.get("GROK2API_PATH")
+    or os.environ.get("GROK_ACCOUNT_MANAGER_GROK2API_PATH")
+    or (_LEGACY_GROK2API_PATH if _LEGACY_GROK2API_PATH.exists() else _SIBLING_GROK2API_PATH)
+)
 SSO_TXT_PATH = OUTPUT_DIR / "sso.txt"
 
 CHAT_MODEL_MARKERS = (
@@ -212,12 +218,9 @@ class RelayManager:
         _raise_response_error(response)
         return response.json()
 
-    def sync_accounts(self, credentials: list[dict]) -> dict:
+    def sync_accounts(self, credentials: list[dict], *, refresh_existing: bool = False) -> dict:
         cfg = self._config
-        tokens = [_credential_to_token(item) for item in credentials]
-        if not any(tokens):
-            tokens = _read_sso_txt_tokens()
-        tokens = [token for token in dict.fromkeys(tokens) if token]
+        tokens = _credentials_to_tokens(credentials)
         if not tokens:
             raise ValueError("没有找到可同步的 sso/access_token")
         if not self.is_running():
@@ -229,7 +232,100 @@ class RelayManager:
             timeout=30,
         )
         _raise_response_error(response)
-        return {"requested": len(tokens), "result": response.json()}
+        result = response.json()
+        refresh_result = None
+        skipped = _safe_int(result.get("skipped") if isinstance(result, dict) else 0, 0)
+        if refresh_existing and skipped:
+            refresh_result = self.refresh_tokens(tokens)
+        self.force_sync()
+        payload = {"requested": len(tokens), "result": result}
+        if refresh_result is not None:
+            payload["refresh"] = refresh_result
+        return payload
+
+    def replace_accounts(self, credentials: list[dict], *, pool: str = "basic", prune_unlisted: bool = True) -> dict:
+        """Replace the relay runtime pool with the current project account tokens."""
+        cfg = self._config
+        tokens = _credentials_to_tokens(credentials)
+        if not tokens:
+            raise ValueError("没有找到可同步的 sso/access_token")
+        if not self.is_running():
+            self.start()
+
+        token_items = [{"token": token, "tags": ["grok-account-manager"]} for token in tokens]
+        response = requests.post(
+            f"{cfg.base_url}/admin/api/tokens",
+            headers=_admin_headers(cfg),
+            json={pool: token_items},
+            timeout=60,
+        )
+        _raise_response_error(response)
+        replace_result = response.json()
+
+        prune_result = None
+        if prune_unlisted:
+            active_tokens = self.list_tokens().get("tokens", [])
+            stale_tokens = [
+                str(item.get("token") or "").strip()
+                for item in active_tokens
+                if isinstance(item, dict) and str(item.get("token") or "").strip() not in tokens
+            ]
+            if stale_tokens:
+                prune_result = self.delete_tokens(stale_tokens)
+
+        self.force_sync()
+        payload = {"requested": len(tokens), "result": replace_result}
+        if prune_result is not None:
+            payload["prune"] = prune_result
+        return payload
+
+    def list_tokens(self) -> dict:
+        cfg = self._config
+        response = requests.get(
+            f"{cfg.base_url}/admin/api/tokens",
+            headers=_admin_headers(cfg),
+            timeout=20,
+        )
+        _raise_response_error(response)
+        return response.json()
+
+    def delete_tokens(self, tokens: list[str]) -> dict:
+        cfg = self._config
+        clean_tokens = [str(token or "").strip() for token in tokens if str(token or "").strip()]
+        if not clean_tokens:
+            return {"deleted": 0}
+        response = requests.delete(
+            f"{cfg.base_url}/admin/api/tokens",
+            headers=_admin_headers(cfg),
+            json=clean_tokens,
+            timeout=60,
+        )
+        _raise_response_error(response)
+        return response.json()
+
+    def refresh_tokens(self, tokens: list[str]) -> dict:
+        cfg = self._config
+        clean_tokens = [str(token or "").strip() for token in tokens if str(token or "").strip()]
+        if not clean_tokens:
+            return {"summary": {"total": 0, "ok": 0, "fail": 0}}
+        response = requests.post(
+            f"{cfg.base_url}/admin/api/batch/refresh",
+            headers=_admin_headers(cfg),
+            json={"tokens": clean_tokens},
+            timeout=120,
+        )
+        _raise_response_error(response)
+        return response.json()
+
+    def force_sync(self) -> dict:
+        cfg = self._config
+        response = requests.post(
+            f"{cfg.base_url}/admin/api/sync",
+            headers=_admin_headers(cfg),
+            timeout=20,
+        )
+        _raise_response_error(response)
+        return response.json()
 
     def list_models(self) -> dict:
         cfg = self._config
@@ -240,6 +336,55 @@ class RelayManager:
         )
         _raise_response_error(response)
         return response.json()
+
+    def send_chat_completion(self, *, model: str, messages: list[dict], timeout: int = 120) -> dict:
+        if not self.is_running():
+            self.start()
+        cfg = self._config
+        response = requests.post(
+            f"{cfg.base_url}/v1/chat/completions",
+            headers=_api_headers(cfg),
+            json={
+                "model": model,
+                "stream": False,
+                "messages": messages,
+            },
+            timeout=timeout,
+        )
+        _raise_response_error(response)
+        payload = response.json()
+        text = _extract_chat_text(payload) if isinstance(payload, dict) else ""
+        return {
+            "model": model,
+            "message": {
+                "role": "assistant",
+                "content": text or "模型已响应，但没有返回文本内容",
+            },
+            "raw": payload,
+        }
+
+    def generate_image(self, *, model: str, prompt: str, n: int, size: str, timeout: int = 120) -> dict:
+        if not self.is_running():
+            self.start()
+        cfg = self._config
+        response = requests.post(
+            f"{cfg.base_url}/v1/images/generations",
+            headers=_api_headers(cfg),
+            json={
+                "model": model,
+                "prompt": prompt,
+                "n": n,
+                "size": size or "1024x1024",
+                "response_format": "url",
+            },
+            timeout=timeout,
+        )
+        _raise_response_error(response)
+        payload = response.json()
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, list) or not data:
+            raise RuntimeError("grok2api 图片接口没有返回图片数据")
+        return {"model": model, "data": data, "raw": payload}
 
     def proxy_request(
         self,
@@ -278,19 +423,22 @@ class RelayManager:
             models = []
         results = []
         for model in models:
-            model_id = str((model or {}).get("id") or "")
+            model_info = model if isinstance(model, dict) else {}
+            model_id = str(model_info.get("id") or "")
             if not model_id:
                 continue
-            capability = _guess_capability(model_id)
+            capability = _model_capability(model_info, model_id)
             result = {
                 "id": model_id,
-                "name": (model or {}).get("name") or model_id,
+                "name": model_info.get("name") or model_id,
                 "capability": capability,
                 "status": "listed",
                 "message": "已在 /v1/models 返回",
             }
             if probe_chat and capability == "chat":
                 result.update(self._probe_chat_model(model_id))
+            elif capability in {"image", "image_edit", "video"}:
+                result["message"] = "已识别媒体模型，未执行消耗额度的生成测试"
             results.append(result)
         return {"models": results, "count": len(results)}
 
@@ -401,6 +549,13 @@ def _credential_to_token(item: dict) -> str:
     return ""
 
 
+def _credentials_to_tokens(credentials: list[dict]) -> list[str]:
+    tokens = [_credential_to_token(item) for item in credentials]
+    if not any(tokens):
+        tokens = _read_sso_txt_tokens()
+    return [token for token in dict.fromkeys(tokens) if token]
+
+
 def _read_sso_txt_tokens() -> list[str]:
     try:
         lines = SSO_TXT_PATH.read_text(encoding="utf-8").splitlines()
@@ -473,6 +628,13 @@ def _tail(path: Path, max_chars: int = 3000) -> str:
     return text[-max_chars:]
 
 
+def _model_capability(model_info: dict[str, Any], model_id: str) -> str:
+    raw = str(model_info.get("capability") or model_info.get("type") or "").strip().lower()
+    if raw in {"chat", "image", "image_edit", "video"}:
+        return raw
+    return _guess_capability(model_id)
+
+
 def _guess_capability(model_id: str) -> str:
     lower = model_id.lower()
     if "image-edit" in lower:
@@ -482,6 +644,8 @@ def _guess_capability(model_id: str) -> str:
     if "video" in lower:
         return "video"
     if any(marker in lower for marker in CHAT_MODEL_MARKERS):
+        return "chat"
+    if lower.startswith("grok-"):
         return "chat"
     return "unknown"
 
