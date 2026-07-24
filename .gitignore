@@ -10,6 +10,11 @@ output/*
 web/dist/
 web/node_modules/
 
+# 数据库文件（双重保护）
+*.db
+*.sqlite
+*.sqlite3
+
 # 本地配置（含 DuckMail / Sub2API 密钥）
 .env
 .env.*
