@@ -257,7 +257,7 @@ def exchange_sso_for_oauth_tokens(
                 stop_event=stop_event,
             )
             if not tokens:
-                return None
+                raise RuntimeError("OAuth device 授权未完成，未返回 token")
 
             tokens["token_endpoint"] = token_endpoint
             if not tokens.get("refresh_token"):
@@ -269,7 +269,7 @@ def exchange_sso_for_oauth_tokens(
         return None
     except Exception as e:
         print(f"[OAuth Exchange] Device Flow 失败: {e}")
-        return None
+        raise
 
 
 def _poll_device_token_once(
@@ -370,11 +370,10 @@ def _drive_device_authorization_and_poll(
                     f"({consecutive_transport_errors}/{MAX_CONSECUTIVE_POLL_TRANSPORT_ERRORS}): {payload}"
                 )
                 if consecutive_transport_errors >= MAX_CONSECUTIVE_POLL_TRANSPORT_ERRORS:
-                    return None
+                    raise RuntimeError(f"token 轮询连续传输失败，最后错误：{payload}")
                 next_poll_at = now + interval
             else:
-                print(f"[OAuth Exchange] {payload}")
-                return None
+                raise RuntimeError(str(payload))
 
         if now - last_status_at >= 5:
             remaining = max(0, int(deadline - now))
@@ -401,6 +400,8 @@ def _drive_device_authorization_and_poll(
                 email_code = code_getter()
             elif email and dev_token:
                 email_code = get_oai_code(dev_token, email)
+            if not email_code:
+                raise RuntimeError("授权登录要求邮箱验证码，但邮箱源没有返回验证码")
             continue
 
         if action == "needs-human-turnstile":
@@ -416,11 +417,13 @@ def _drive_device_authorization_and_poll(
             continue
 
         if action == "device-invalid-action":
-            print(
+            raise RuntimeError(
                 "[OAuth Exchange] xAI 拒绝了授权提交 (Invalid action)。"
                 "本轮不会重复提交或生成新标签页。"
             )
-            return None
+
+        if action == "blocked":
+            raise RuntimeError("授权页被阻止或出现异常活动提示")
 
         if action == "device-consent-ready":
             if not consent_click_sent:
@@ -437,8 +440,7 @@ def _drive_device_authorization_and_poll(
             elif time.monotonic() - consent_click_at >= 20:
                 current_url = _page_status(session, oauth_page)
                 if "/oauth2/device/consent" in current_url.lower():
-                    print("[OAuth Exchange] 点击授权按钮后页面 20 秒仍未跳转，本轮停止以避免重复提交")
-                    return None
+                    raise RuntimeError("点击授权按钮后页面 20 秒仍未跳转")
             time.sleep(1)
             continue
 
@@ -457,8 +459,7 @@ def _drive_device_authorization_and_poll(
 
         time.sleep(0.5)
 
-    print("[OAuth Exchange] device 授权超时")
-    return None
+    raise RuntimeError("device 授权超时")
 
 
 def _drive_device_authorization_page(

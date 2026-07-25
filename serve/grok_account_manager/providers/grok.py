@@ -95,36 +95,60 @@ class GrokProvider:
             "profile": profile
         }
 
-        # JSON 导出始终生成 cockpit-tools 可导入结构；OAuth refresh_token 只是可选增强。
+        if self.enable_oauth_exchange and not (self.fetch_full_credential and GROK_API_AVAILABLE):
+            raise RuntimeError("已勾选获取 refresh_token，但 OAuth 凭证模块不可用")
+
+        # JSON 导出始终生成 cockpit-tools 可导入结构；未启用 OAuth 时使用 sso cookie。
+        # 启用 OAuth 时，refresh_token 是硬要求，避免把 null RT 账号当成成功账号保存。
         if self.fetch_full_credential and GROK_API_AVAILABLE:
             if self.stop_event and self.stop_event.is_set():
                 raise RuntimeError("任务已停止")
 
             oauth_tokens = None
             if self.enable_oauth_exchange:
-                try:
-                    self.current_stage = "oauth_exchange"
-                    oauth_password = profile.get("password")
-                    oauth_recovery_email = None
-                    if registration_mode == "google":
-                        oauth_password = str(getattr(mailbox, "password", "") or "").strip() or None
-                        oauth_recovery_email = str(getattr(mailbox, "recovery_email", "") or "").strip() or None
-                    print("[Grok] 尝试通过 xAI Device Flow 换取 OAuth tokens...")
-                    oauth_tokens = exchange_sso_for_oauth_tokens(
-                        session,
-                        email=email,
-                        password=oauth_password,
-                        code_getter=lambda: mailbox.wait_for_code(timeout=180, stop_event=self.stop_event),
-                        recovery_email=oauth_recovery_email,
-                        prefer_google_login=registration_mode == "google",
-                        stop_event=self.stop_event,
-                    )
-                    if oauth_tokens and oauth_tokens.get("refresh_token"):
-                        print("[Grok] 已获取 OAuth refresh_token")
-                    elif oauth_tokens:
-                        print("[Grok] OAuth token 响应没有 refresh_token，导出结果可能无法自动续期")
-                except Exception as e:
-                    print(f"[Grok] OAuth exchange 失败，回退到 sso cookie: {e}")
+                self.current_stage = "oauth_exchange"
+                oauth_password = profile.get("password")
+                oauth_recovery_email = None
+                if registration_mode == "google":
+                    oauth_password = str(getattr(mailbox, "password", "") or "").strip() or None
+                    oauth_recovery_email = str(getattr(mailbox, "recovery_email", "") or "").strip() or None
+
+                oauth_error = "未知错误"
+                max_oauth_attempts = 2
+                for attempt in range(1, max_oauth_attempts + 1):
+                    if self.stop_event and self.stop_event.is_set():
+                        raise RuntimeError("任务已停止")
+                    try:
+                        print(f"[Grok] 尝试通过 xAI Device Flow 换取 OAuth tokens... ({attempt}/{max_oauth_attempts})")
+                        candidate_tokens = exchange_sso_for_oauth_tokens(
+                            session,
+                            email=email,
+                            password=oauth_password,
+                            code_getter=lambda: mailbox.wait_for_code(timeout=180, stop_event=self.stop_event),
+                            recovery_email=oauth_recovery_email,
+                            prefer_google_login=registration_mode == "google",
+                            stop_event=self.stop_event,
+                        )
+                        if candidate_tokens and candidate_tokens.get("access_token") and candidate_tokens.get("refresh_token"):
+                            oauth_tokens = candidate_tokens
+                            print("[Grok] 已获取 OAuth refresh_token")
+                            break
+                        if candidate_tokens and not candidate_tokens.get("access_token"):
+                            oauth_error = "OAuth token 响应没有 access_token"
+                        elif candidate_tokens and not candidate_tokens.get("refresh_token"):
+                            oauth_error = "OAuth token 响应没有 refresh_token"
+                        else:
+                            oauth_error = "OAuth exchange 未返回 token"
+                        print(f"[Grok] {oauth_error}")
+                    except Exception as e:
+                        oauth_error = str(e)
+                        print(f"[Grok] OAuth exchange 失败: {e}")
+                    if attempt < max_oauth_attempts:
+                        print("[Grok] 准备重试 OAuth exchange...")
+                        time.sleep(2)
+
+                if not oauth_tokens:
+                    raise RuntimeError(f"已勾选获取 refresh_token，但未成功获取：{oauth_error}")
 
             try:
                 if self.stop_event and self.stop_event.is_set():
@@ -140,10 +164,7 @@ class GrokProvider:
                         oauth_tokens=oauth_tokens,
                     )
                 else:
-                    if self.enable_oauth_exchange:
-                        print(f"[Grok] OAuth token 换取失败，回退到使用 sso cookie")
-                    else:
-                        print(f"[Grok] 跳过 OAuth exchange，使用 sso cookie 生成 JSON 凭证")
+                    print(f"[Grok] 跳过 OAuth exchange，使用 sso cookie 生成 JSON 凭证")
                     full_credential = fetch_complete_credential(
                         email=email,
                         sso_token=sso_value,
@@ -152,9 +173,13 @@ class GrokProvider:
                 # grok2api's reverse transport authenticates with the browser
                 # sso cookie, so keep it even when OAuth exchange also succeeds.
                 full_credential["sso_token"] = sso_value
+                if self.enable_oauth_exchange and not full_credential.get("refresh_token"):
+                    raise RuntimeError("完整 JSON 凭证缺少 refresh_token")
                 result["full_credential"] = full_credential
                 print(f"[Grok] 成功生成 JSON 凭证 (user_id: {full_credential.get('user_id', 'N/A')})")
             except Exception as e:
+                if self.enable_oauth_exchange:
+                    raise RuntimeError(f"已获取 refresh_token，但生成完整 JSON 凭证失败：{e}") from e
                 print(f"[Grok] 获取完整凭证失败，将由 json sink 兜底生成基础 JSON: {e}")
 
         self.current_stage = "done"
