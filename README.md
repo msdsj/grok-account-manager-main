@@ -12,12 +12,7 @@ MSDSJ 的 Grok 账号注册与凭证管理工具。项目提供 Python 自动化
 
 GitHub：<https://github.com/msdsj/grok-account-manager-main>
 
-如果这个项目帮到你，欢迎帮忙点一个 Star。使用中遇到账号池、Grok CLI 4.5、Chat 对话或图片生成问题，可以加入 QQ 交流群反馈。
-
-群号：`972295238`
-
-![QQ 交流群二维码](web/public/community-qr.png)
-
+如果这个项目帮到你，欢迎帮忙点一个 Star。使用中遇到账号池、Grok CLI 4.5、Chat 对话或图片生成问题。
 ## 更新日志
 
 完整版本记录见 [CHANGELOG.md](CHANGELOG.md)。当前版本重点更新 FastAPI 后端重构、账号数据库、Grok CLI 4.5 测试、Chat/图片测试、本地中转和新版控制台界面。
@@ -67,11 +62,12 @@ uv run python -m grok_account_manager grok --count 1 --sink json
 
 ## Outlook 邮箱源
 
-把 Outlook 账号池保存为本地文件，例如 `outlook_accounts.txt`。该文件已被 `.gitignore` 忽略。账号字段支持 `----` 或 `|` 两种分隔符。
+把 Outlook 账号池保存为本地文件，例如 `outlook_accounts.txt`。该文件已被 `.gitignore` 忽略。账号字段支持 `----` 或 `|` 两种分隔符。第五段可选，用于指定 Microsoft 邮件读取方式：`auto`、`imap` 或 `graph`；不填时默认 `auto`，会先尝试 IMAP，再尝试 Microsoft Graph。
 
 ```text
 email@example.com----password----clientId----refreshToken
-email@example.com|password|clientId|refreshToken
+email@example.com----password----clientId----refreshToken----graph
+email@example.com|password|clientId|refreshToken|auto
 ```
 
 运行：

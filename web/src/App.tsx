@@ -916,7 +916,7 @@ export function App() {
           {emailSource === "outlook" && (
             <label className="textarea-field">
               <span>Outlook 账号池</span>
-              <textarea value={outlookData} disabled={isRunning} placeholder="email----password----clientId----refreshToken 或 email|password|clientId|refreshToken" spellCheck={false} onChange={(event) => setOutlookData(event.target.value)} />
+              <textarea value={outlookData} disabled={isRunning} placeholder="email----password----clientId----refreshToken----auto/imap/graph 或 email|password|clientId|refreshToken|auto" spellCheck={false} onChange={(event) => setOutlookData(event.target.value)} />
               <small>{outlookAccountCount > 0 ? `已识别 ${outlookAccountCount} 个邮箱` : "未识别到有效账号"}</small>
             </label>
           )}
@@ -1716,7 +1716,10 @@ function countOutlookAccounts(data: string): number {
   const raw = String(data || "").trim();
   if (!raw) return 0;
   const entries = raw.includes("\n") ? raw.split(/\r?\n/) : raw.split(/\s+/);
-  return entries.filter((entry) => splitAccountFields(entry).length === 4).length;
+  return entries.filter((entry) => {
+    const parts = splitAccountFields(entry);
+    return (parts.length === 4 || parts.length === 5) && Boolean(parts[0]?.trim()) && Boolean(parts[2]?.trim()) && Boolean(parts[3]?.trim());
+  }).length;
 }
 
 function countGoogleAccounts(data: string): number {
