@@ -14,3 +14,8 @@ WEB_DIST_DIR: Path = PROJECT_ROOT / "web" / "dist"
 
 DEFAULT_MAX_CONCURRENCY = 20
 ROUND_TIMEOUT_SECONDS = 180
+
+# 同一个 worker 完成一轮注册、重启浏览器之后，到抢下一轮之前的随机等待区间（秒）。
+# 拉开注册请求的节奏，避免同一来源在短时间内密集发起注册被风控按"过于规律"识别。
+ROUND_PACING_MIN_SECONDS = 4.0
+ROUND_PACING_MAX_SECONDS = 11.0

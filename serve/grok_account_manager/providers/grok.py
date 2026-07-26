@@ -36,24 +36,29 @@ class GrokProvider:
     enable_oauth_exchange = False  # cockpit-tools 的 Grok OAuth 需要人工授权，默认不阻塞注册
     stop_event = None  # threading.Event，用于响应停止信号
     mail_source: MailboxSource | None = None
+    event_callback = None
 
     def run_round(self, session: DrissionBrowserSession) -> RegistrationResult:
         self.current_email = ""
-        self.current_stage = "starting"
+        self._set_stage("starting", "准备开始注册")
         if self.stop_event and self.stop_event.is_set():
             raise RuntimeError("任务已在开始前停止")
 
         mail_source = self.mail_source or DuckMailSource()
-        self.current_stage = "create_mailbox"
-        mailbox = mail_source.create_mailbox()
+        self._set_stage("create_mailbox", "正在创建/领取邮箱")
+        try:
+            mailbox = mail_source.create_mailbox(log_callback=self._log)
+        except TypeError:
+            mailbox = mail_source.create_mailbox()
         self.current_email = str(getattr(mailbox, "email", "") or "")
         registration_mode = getattr(mail_source, "registration_mode", "email")
+        self._log("info", f"本轮使用邮箱：{self.current_email}")
 
-        self.current_stage = "open_signup"
+        self._set_stage("open_signup", "正在打开 Grok 注册页")
         session.open_url(self.signup_url)
 
         if registration_mode == "google":
-            self.current_stage = "google_register"
+            self._set_stage("google_register", "正在使用 Google 账号注册")
             email = _register_with_google_account(session, mailbox, self.stop_event)
             self.current_email = email
             profile = {
@@ -61,33 +66,35 @@ class GrokProvider:
                 "auth_provider": "google",
             }
         else:
-            self.current_stage = "click_email_signup"
-            _click_email_signup_button(session)
+            self._set_stage("click_email_signup", "正在点击邮箱注册入口")
+            _click_email_signup_button(session, stop_event=self.stop_event)
 
             if self.stop_event and self.stop_event.is_set():
                 raise RuntimeError("任务已停止")
 
-            self.current_stage = "fill_email"
-            email = _fill_email_and_submit(session, mailbox.email)
+            self._set_stage("fill_email", "正在填写邮箱并发送验证码")
+            email = _fill_email_and_submit(session, mailbox.email, stop_event=self.stop_event)
             self.current_email = email
+            self._log("info", f"Grok 已向 {email} 发送验证码，开始读取邮箱")
 
             if self.stop_event and self.stop_event.is_set():
                 raise RuntimeError("任务已停止")
 
-            self.current_stage = "wait_email_code"
+            self._set_stage("wait_email_code", "正在等待邮箱验证码")
             _fill_code_and_submit(session, email, mailbox, self.stop_event)
+            self._log("success", "验证码已写入页面，准备填写资料")
 
             if self.stop_event and self.stop_event.is_set():
                 raise RuntimeError("任务已停止")
 
-            self.current_stage = "fill_profile"
-            profile = _fill_profile_and_submit(session)
+            self._set_stage("fill_profile", "正在填写账号资料")
+            profile = _fill_profile_and_submit(session, stop_event=self.stop_event)
 
         if self.stop_event and self.stop_event.is_set():
             raise RuntimeError("任务已停止")
 
-        self.current_stage = "wait_sso_cookie"
-        sso_value = wait_for_cookie(session, self.success_cookie_name)
+        self._set_stage("wait_sso_cookie", "正在等待登录凭证 cookie")
+        sso_value = wait_for_cookie(session, self.success_cookie_name, stop_event=self.stop_event)
 
         result: RegistrationResult = {
             "email": email,
@@ -106,7 +113,7 @@ class GrokProvider:
 
             oauth_tokens = None
             if self.enable_oauth_exchange:
-                self.current_stage = "oauth_exchange"
+                self._set_stage("oauth_exchange", "正在换取 OAuth refresh_token")
                 oauth_password = profile.get("password")
                 oauth_recovery_email = None
                 if registration_mode == "google":
@@ -154,7 +161,7 @@ class GrokProvider:
                 if self.stop_event and self.stop_event.is_set():
                     raise RuntimeError("任务已停止")
 
-                self.current_stage = "fetch_credential"
+                self._set_stage("fetch_credential", "正在生成完整 JSON 凭证")
                 if oauth_tokens:
                     print(f"[Grok] 成功获取 OAuth tokens，现在获取完整凭证...")
                     full_credential = fetch_complete_credential(
@@ -182,8 +189,22 @@ class GrokProvider:
                     raise RuntimeError(f"已获取 refresh_token，但生成完整 JSON 凭证失败：{e}") from e
                 print(f"[Grok] 获取完整凭证失败，将由 json sink 兜底生成基础 JSON: {e}")
 
-        self.current_stage = "done"
+        self._set_stage("done", "本轮注册完成")
         return result
+
+    def _set_stage(self, stage: str, message: str | None = None) -> None:
+        self.current_stage = stage
+        if message:
+            self._log("info", f"阶段 {stage}：{message}", stage=stage)
+
+    def _log(self, level: str, message: str, **extra) -> None:
+        callback = self.event_callback
+        if callback is None:
+            return
+        try:
+            callback(level, message, **extra)
+        except Exception:
+            pass
 
 
 def _has_profile_form(page) -> bool:
@@ -216,12 +237,14 @@ def _is_transient_page_error(error: Exception) -> bool:
     )
 
 
-def _click_email_signup_button(session: DrissionBrowserSession, timeout=10):
+def _click_email_signup_button(session: DrissionBrowserSession, timeout=10, stop_event=None):
     """页面打开后，自动点击邮箱注册入口；如果已经进入邮箱页则直接继续。"""
     deadline = time.time() + timeout
     last_state = ""
     cloudflare_seen = False
     while time.time() < deadline:
+        if stop_event and stop_event.is_set():
+            raise RuntimeError("任务已停止")
         page = session.refresh_page()
         try:
             state = page.run_js(r"""
@@ -361,10 +384,12 @@ return { status: 'clicked', url: location.href };
     raise Exception(f'未找到邮箱注册入口（{last_state or "页面未返回可诊断信息"}）')
 
 
-def _click_google_signup_button(session: DrissionBrowserSession, timeout=15):
+def _click_google_signup_button(session: DrissionBrowserSession, timeout=15, stop_event=None):
     """页面打开后，自动点击 Google 账号注册按钮。"""
     deadline = time.time() + timeout
     while time.time() < deadline:
+        if stop_event and stop_event.is_set():
+            raise RuntimeError("任务已停止")
         page = session.refresh_page()
         try:
             clicked = page.run_js(r"""
@@ -414,7 +439,7 @@ def _register_with_google_account(
     if not email or not password:
         raise RuntimeError("Google 账号注册需要邮箱和密码")
 
-    _click_google_signup_button(session)
+    _click_google_signup_button(session, stop_event=stop_event)
     page = session.refresh_page()
     deadline = time.time() + timeout
     recovery_done = False
@@ -849,9 +874,11 @@ return 'idle';
     ))
 
 
-def _fill_email_and_submit(session: DrissionBrowserSession, email: str, timeout=15):
+def _fill_email_and_submit(session: DrissionBrowserSession, email: str, timeout=15, stop_event=None):
     deadline = time.time() + timeout
     while time.time() < deadline:
+        if stop_event and stop_event.is_set():
+            raise RuntimeError("任务已停止")
         page = session.refresh_page()
         try:
             filled = page.run_js(
@@ -1256,7 +1283,7 @@ return 'clicked';
     raise Exception("未找到验证码输入框或确认邮箱按钮")
 
 
-def _get_turnstile_token(page):
+def _get_turnstile_token(page, stop_event=None):
     """在最终注册页解 Turnstile（真人化点击 + iframe 内坐标 spoof）。"""
     try:
         page.run_js("try { turnstile.reset() } catch(e) { }")
@@ -1264,6 +1291,8 @@ def _get_turnstile_token(page):
         pass
 
     for _ in range(15):
+        if stop_event and stop_event.is_set():
+            raise RuntimeError("任务已停止")
         try:
             turnstile_response = page.run_js("try { return turnstile.getResponse() } catch(e) { return null }")
             if turnstile_response:
@@ -1314,7 +1343,7 @@ def _build_profile() -> dict[str, str]:
     return {"given_name": given_name, "family_name": family_name, "password": password}
 
 
-def _fill_profile_and_submit(session: DrissionBrowserSession, timeout: int = 180) -> dict[str, str]:
+def _fill_profile_and_submit(session: DrissionBrowserSession, timeout: int = 180, stop_event=None) -> dict[str, str]:
     profile = _build_profile()
     given_name = profile["given_name"]
     family_name = profile["family_name"]
@@ -1324,6 +1353,8 @@ def _fill_profile_and_submit(session: DrissionBrowserSession, timeout: int = 180
     turnstile_token = ""
 
     while time.time() < deadline:
+        if stop_event and stop_event.is_set():
+            raise RuntimeError("任务已停止")
         page = session.refresh_page()
         try:
             filled = page.run_js(
@@ -1502,7 +1533,7 @@ return value ? 'ready' : 'pending';
 
         if turnstile_state == "pending" and not turnstile_token:
             print("[*] 检测到最终注册页存在 Turnstile，开始使用现有真人化点击逻辑。")
-            turnstile_token = _get_turnstile_token(page)
+            turnstile_token = _get_turnstile_token(page, stop_event=stop_event)
             if turnstile_token:
                 page = session.refresh_page()
                 try:

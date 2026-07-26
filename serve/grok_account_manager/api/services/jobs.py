@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import os
 import queue
+import random
 import threading
+import time
 import traceback
 import uuid
 
@@ -17,11 +19,20 @@ from ...sinks.txt_file import TxtFileSink
 from ..config import (
     CREDENTIALS_DIR,
     DEFAULT_MAX_CONCURRENCY,
+    ROUND_PACING_MAX_SECONDS,
+    ROUND_PACING_MIN_SECONDS,
     ROUND_TIMEOUT_SECONDS,
     TXT_OUTPUT,
 )
 from ..utils import json_default, now_ms, safe_int
 from .accounts import invalidate_accounts_cache
+
+
+def _fingerprint_summary(session: DrissionBrowserSession) -> str:
+    identity = getattr(session, "identity", None)
+    if identity is None:
+        return ""
+    return f"（指纹：{identity.gpu_renderer}，{identity.hardware_concurrency} 核，{identity.device_memory}GB 内存）"
 
 
 class CombinedStopEvent:
@@ -78,6 +89,7 @@ class RegistrationJobManager:
         google_accounts_file: str = "",
     ) -> dict:
         total = safe_int(total, default=1, minimum=1, maximum=10_000)
+        requested_total = total
         requested_concurrency = safe_int(concurrency, default=1, minimum=1, maximum=20)
         max_concurrency = safe_int(
             os.environ.get("GROK_ACCOUNT_MANAGER_MAX_CONCURRENCY"),
@@ -94,6 +106,15 @@ class RegistrationJobManager:
             google_data=google_data,
             google_file=google_accounts_file,
         )
+
+        # Outlook/Google 邮箱池里的每个账号只能注册一次；如果请求的总数超过池子大小，
+        # 循环取号会导致同一个邮箱被拿去"注册"第二次，这个账号大概率直接失败。
+        # 这里直接把总数限制到池子大小，而不是静默地绕回去复用同一个邮箱。
+        pool_count = int(getattr(mail_source, "count", 0) or 0)
+        pool_capped = bool(pool_count) and total > pool_count
+        if pool_capped:
+            total = pool_count
+            concurrency = min(concurrency, total)
 
         with self._lock:
             if self._job and self._job.get("status") in {"running", "stopping"}:
@@ -138,6 +159,12 @@ class RegistrationJobManager:
                 self._event_locked(
                     "warning",
                     f"为降低本机压力，并发已从 {requested_concurrency} 限制为 {concurrency}",
+                )
+            if pool_capped:
+                self._event_locked(
+                    "warning",
+                    f"邮箱池只有 {pool_count} 个可用账号，总数已从 {requested_total} 限制为 {pool_count}，"
+                    f"避免同一个邮箱被重复用来注册导致必然失败",
                 )
 
             self._thread = threading.Thread(
@@ -201,6 +228,13 @@ class RegistrationJobManager:
         with self._lock:
             self._event_locked(level, message, **extra)
 
+    def _provider_event_callback(self, worker_index: int, round_index: int):
+        def _callback(level: str, message: str, **extra) -> None:
+            merged = {"worker": worker_index, "round": round_index, **extra}
+            self._event(level, message, **merged)
+
+        return _callback
+
     def _next_round(self) -> int | None:
         with self._lock:
             if self._job is None:
@@ -231,6 +265,26 @@ class RegistrationJobManager:
         with self._lock:
             if self._job is not None:
                 self._job["workerErrors"] += 1
+
+    def _pace_before_next_round(self, worker_index: int) -> None:
+        """一轮结束、下一轮开始前随机停顿一下，避免同一来源密集、匀速地发起注册请求。
+
+        节奏本身也是一种可被风控识别的特征——真人不会以固定间隔连续注册账号。
+        """
+        delay = random.uniform(ROUND_PACING_MIN_SECONDS, ROUND_PACING_MAX_SECONDS)
+        self._event(
+            "info",
+            f"Worker {worker_index} 等待 {delay:.1f}s 后开始下一轮（模拟真人节奏，降低风控概率）",
+            worker=worker_index,
+        )
+        deadline = time.monotonic() + delay
+        while True:
+            if self._stop_event.is_set():
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(0.2, remaining))
 
     def _record_failed_account(
         self,
@@ -280,8 +334,12 @@ class RegistrationJobManager:
         session = DrissionBrowserSession(
             build_chromium_options(chrome_lang, headless=False, window_index=worker_index)
         )
+        try:
+            session.start()
+        except Exception:
+            session.stop()
+            raise
         self._register_session(session)
-        session.start()
         return session
 
     def _run_round_with_timeout(
@@ -289,6 +347,8 @@ class RegistrationJobManager:
         provider: GrokProvider,
         session: DrissionBrowserSession,
         timeout_seconds: int,
+        worker_index: int,
+        round_index: int,
     ) -> tuple[str, dict | BaseException | None]:
         result_queue: queue.Queue[tuple[str, dict | BaseException | None]] = queue.Queue(maxsize=1)
 
@@ -300,7 +360,38 @@ class RegistrationJobManager:
 
         thread = threading.Thread(target=_target, daemon=True)
         thread.start()
-        thread.join(timeout=timeout_seconds)
+        deadline = time.monotonic() + timeout_seconds
+        last_stage = ""
+        last_heartbeat = 0.0
+        while thread.is_alive():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            thread.join(timeout=min(2.0, remaining))
+            stage = str(getattr(provider, "current_stage", "") or "")
+            email = str(getattr(provider, "current_email", "") or "")
+            now = time.monotonic()
+            if stage and stage != last_stage:
+                self._event(
+                    "info",
+                    f"第 {round_index} 轮当前阶段：{stage}",
+                    worker=worker_index,
+                    round=round_index,
+                    email=email,
+                    stage=stage,
+                )
+                last_stage = stage
+                last_heartbeat = now
+            elif stage and now - last_heartbeat >= 15:
+                self._event(
+                    "info",
+                    f"第 {round_index} 轮仍在 {stage}，剩余约 {max(0, int(deadline - now))} 秒",
+                    worker=worker_index,
+                    round=round_index,
+                    email=email,
+                    stage=stage,
+                )
+                last_heartbeat = now
         if thread.is_alive():
             return "timeout", None
         try:
@@ -327,7 +418,11 @@ class RegistrationJobManager:
             return
 
         try:
-            self._event("info", f"Worker {worker_index} 浏览器已启动", worker=worker_index)
+            self._event(
+                "info",
+                f"Worker {worker_index} 浏览器已启动{_fingerprint_summary(session)}",
+                worker=worker_index,
+            )
             while True:
                 if self._stop_event.is_set():
                     self._event("info", f"Worker {worker_index} 收到停止信号，退出", worker=worker_index)
@@ -350,14 +445,21 @@ class RegistrationJobManager:
                     oauth_exchange,
                     CombinedStopEvent(self._stop_event, round_stop_event),
                 )
+                provider.event_callback = self._provider_event_callback(worker_index, round_index)
                 try:
                     if session is None:
                         session = self._start_worker_session(worker_index, provider.chrome_lang)
-                        self._event("info", f"Worker {worker_index} 浏览器已重新启动", worker=worker_index)
+                        self._event(
+                            "info",
+                            f"Worker {worker_index} 浏览器已重新启动{_fingerprint_summary(session)}",
+                            worker=worker_index,
+                        )
                     status, payload = self._run_round_with_timeout(
                         provider,
                         session,
                         ROUND_TIMEOUT_SECONDS,
+                        worker_index,
+                        round_index,
                     )
                     if status == "timeout":
                         round_stop_event.set()
@@ -478,6 +580,12 @@ class RegistrationJobManager:
                         if session is None:
                             continue
                         session.restart()
+                        self._event(
+                            "info",
+                            f"Worker {worker_index} 已为下一轮重新生成指纹{_fingerprint_summary(session)}",
+                            worker=worker_index,
+                        )
+                        self._pace_before_next_round(worker_index)
                     except Exception as error:
                         self._event("warning", f"Worker {worker_index} 浏览器重启失败：{error}", worker=worker_index)
                         try:

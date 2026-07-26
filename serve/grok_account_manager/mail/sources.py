@@ -12,7 +12,7 @@ import re
 import threading
 import time
 from pathlib import Path
-from typing import Protocol
+from typing import Callable, Protocol
 
 import requests
 
@@ -62,10 +62,13 @@ class VerificationMailbox(Protocol):
         ...
 
 
+LogCallback = Callable[..., None]
+
+
 class MailboxSource(Protocol):
     name: str
 
-    def create_mailbox(self) -> VerificationMailbox:
+    def create_mailbox(self, log_callback=None) -> VerificationMailbox:
         ...
 
 
@@ -123,6 +126,47 @@ def _normalize_outlook_mode(mode: str | None) -> str:
     if normalized in {"imap", "graph", "auto"}:
         return normalized
     return "auto"
+
+
+def _mail_log(log_callback: LogCallback | None, level: str, message: str, **extra) -> None:
+    print(message)
+    if log_callback is None:
+        return
+    try:
+        log_callback(level, message, **extra)
+    except Exception:
+        pass
+
+
+def _microsoft_oauth_error_message(label: str, status_code: int, data: dict) -> str:
+    error = str(data.get("error") or "").strip()
+    description = str(data.get("error_description") or data.get("raw") or data).strip()
+    aadsts = ""
+    match = re.search(r"\b(AADSTS\d+)\b", description)
+    if match:
+        aadsts = match.group(1)
+        description = description[match.end():].lstrip(": ").strip()
+    description = re.split(r"\s+(?:Trace ID|Correlation ID|Timestamp):", description, maxsplit=1)[0].strip()
+    parts = [part for part in (error, aadsts) if part]
+    code = "/".join(parts) if parts else f"HTTP {status_code}"
+    if description:
+        return f"{label} token 刷新失败 {status_code} {code}: {description}"
+    return f"{label} token 刷新失败 {status_code} {code}"
+
+
+def _is_terminal_microsoft_token_error(error: Exception | str | None) -> bool:
+    text = str(error or "").lower()
+    terminal_markers = (
+        "invalid_grant",
+        "aadsts7000012",
+        "aadsts70000",
+        "aadsts700082",
+        "aadsts700084",
+        "refresh token has expired",
+        "refresh token is invalid",
+        "grant was obtained for a different tenant",
+    )
+    return any(marker in text for marker in terminal_markers)
 
 
 def _normalize_folder_name(name: str) -> str:
@@ -401,16 +445,15 @@ class DuckMailMailbox:
         return cls(email=email, token=token)
 
     def wait_for_code(self, timeout: int = 180, interval: int = 3, stop_event=None) -> str | None:
-        # DuckMail 原函数内部已有 180s 轮询；保留原行为以降低改动风险。
         if stop_event and stop_event.is_set():
             raise RuntimeError("任务已停止")
-        return get_oai_code(self._token, self.email)
+        return get_oai_code(self._token, self.email, stop_event=stop_event)
 
 
 class DuckMailSource:
     name = "duckmail"
 
-    def create_mailbox(self) -> DuckMailMailbox:
+    def create_mailbox(self, log_callback=None) -> DuckMailMailbox:
         return DuckMailMailbox.create()
 
 
@@ -428,33 +471,58 @@ class OutlookAccountPool:
     def count(self) -> int:
         return len(self._accounts)
 
-    def create_mailbox(self) -> "OutlookMailbox":
+    def create_mailbox(self, log_callback=None) -> "OutlookMailbox":
         with self._lock:
             account = self._accounts[self._next % len(self._accounts)]
             self._next += 1
-        mailbox = OutlookMailbox(account)
+        mailbox = OutlookMailbox(account, log_callback=log_callback)
         mailbox.prepare()
         return mailbox
 
 
 class OutlookMailbox:
-    def __init__(self, account: OutlookAccount) -> None:
+    def __init__(self, account: OutlookAccount, log_callback: LogCallback | None = None) -> None:
         self.account = account
         self.email = account.email
+        self._log_callback = log_callback
         self._folder_counts: dict[str, int] = {}
 
     def prepare(self) -> None:
-        print(f"[*] 使用 Outlook 邮箱: {self.email}（认证模式: {_normalize_outlook_mode(self.account.mode)}）")
+        _mail_log(
+            self._log_callback,
+            "info",
+            f"[*] 使用 Outlook 邮箱: {self.email}（认证模式: {_normalize_outlook_mode(self.account.mode)}）",
+            email=self.email,
+            stage="create_mailbox",
+        )
         try:
             self._folder_counts = _load_outlook_folder_counts(self.account)
             inbox_count = self._folder_counts.get("INBOX", self._folder_counts.get(OUTLOOK_GRAPH_INBOX_KEY, 0))
-            print(f"[*] Outlook 发送前邮件数: {inbox_count}")
+            _mail_log(
+                self._log_callback,
+                "info",
+                f"[*] Outlook 发送前邮件数: {inbox_count}",
+                email=self.email,
+                stage="create_mailbox",
+            )
             if self._folder_counts:
                 summary = ", ".join(f"{folder}={count}" for folder, count in self._folder_counts.items())
-                print(f"[*] Outlook 监控文件夹: {summary}")
+                _mail_log(
+                    self._log_callback,
+                    "info",
+                    f"[*] Outlook 监控文件夹: {summary}",
+                    email=self.email,
+                    stage="create_mailbox",
+                )
         except Exception as error:
             self._folder_counts = {}
-            print(f"[警告] 获取 Outlook 邮件数失败，改用 0 作为基线: {error}")
+            _mail_log(
+                self._log_callback,
+                "warning",
+                f"[警告] 获取 Outlook 邮件数失败，改用 0 作为基线: {error}",
+                email=self.email,
+                stage="create_mailbox",
+            )
 
     def wait_for_code(self, timeout: int = 180, interval: int = 5, stop_event=None) -> str | None:
         return wait_for_outlook_code(
@@ -463,6 +531,7 @@ class OutlookMailbox:
             timeout=timeout,
             interval=interval,
             stop_event=stop_event,
+            log_callback=self._log_callback,
         )
 
 
@@ -482,7 +551,7 @@ class GoogleAccountPool:
     def count(self) -> int:
         return len(self._accounts)
 
-    def create_mailbox(self) -> "GoogleMailbox":
+    def create_mailbox(self, log_callback=None) -> "GoogleMailbox":
         with self._lock:
             account = self._accounts[self._next % len(self._accounts)]
             self._next += 1
@@ -588,7 +657,9 @@ def _refresh_microsoft_access_token(
         except Exception:
             data = {"raw": response.text}
         if response.status_code != 200:
-            last_error = f"{label} token 刷新失败 {response.status_code}: {str(data)[:300]}"
+            last_error = _microsoft_oauth_error_message(label, response.status_code, data)
+            if _is_terminal_microsoft_token_error(last_error):
+                raise RuntimeError(last_error)
             continue
         token = str(data.get("access_token") or "").strip()
         if not token:
@@ -657,13 +728,14 @@ def wait_for_outlook_code(
     timeout: int,
     interval: int,
     stop_event=None,
+    log_callback: LogCallback | None = None,
 ) -> str | None:
     mode = _normalize_outlook_mode(account.mode)
     if mode == "graph":
-        return _wait_for_outlook_graph_code(account, before_counts, timeout, interval, stop_event)
+        return _wait_for_outlook_graph_code(account, before_counts, timeout, interval, stop_event, log_callback)
     if mode == "imap":
-        return _wait_for_outlook_imap_code(account, before_counts, timeout, interval, stop_event)
-    return _wait_for_outlook_auto_code(account, before_counts, timeout, interval, stop_event)
+        return _wait_for_outlook_imap_code(account, before_counts, timeout, interval, stop_event, log_callback)
+    return _wait_for_outlook_auto_code(account, before_counts, timeout, interval, stop_event, log_callback)
 
 
 def _wait_for_outlook_auto_code(
@@ -672,8 +744,15 @@ def _wait_for_outlook_auto_code(
     timeout: int,
     interval: int,
     stop_event=None,
+    log_callback: LogCallback | None = None,
 ) -> str | None:
-    print(f"[*] Outlook 自动模式等待验证码（IMAP + Graph）: {account.email}")
+    _mail_log(
+        log_callback,
+        "info",
+        f"[*] Outlook 自动模式等待验证码（IMAP + Graph）: {account.email}",
+        email=account.email,
+        stage="wait_email_code",
+    )
     deadline = time.time() + timeout
     folder_counts = dict(before_counts or {})
     if not folder_counts:
@@ -681,42 +760,90 @@ def _wait_for_outlook_auto_code(
 
     imap_access_token: str | None = None
     graph_access_token: str | None = None
+    imap_terminal_error = False
+    graph_terminal_error = False
+    token_errors: list[str] = []
+    attempt = 0
 
     while time.time() < deadline:
         if stop_event and stop_event.is_set():
             raise RuntimeError("任务已停止")
+        attempt += 1
+        if attempt == 1 or attempt % 3 == 0:
+            remaining = max(0, int(deadline - time.time()))
+            _mail_log(
+                log_callback,
+                "info",
+                f"[*] 仍在等待 Outlook 验证码：{account.email}，剩余约 {remaining}s",
+                email=account.email,
+                stage="wait_email_code",
+            )
 
-        if imap_access_token is None:
+        if imap_access_token is None and not imap_terminal_error:
             try:
                 imap_access_token = refresh_outlook_token(account)
             except Exception as error:
-                print(f"[警告] Outlook IMAP token 刷新失败，将尝试 Graph: {error}")
+                if _is_terminal_microsoft_token_error(error):
+                    imap_terminal_error = True
+                    token_errors.append(str(error))
+                _mail_log(
+                    log_callback,
+                    "warning",
+                    f"[警告] Outlook IMAP token 刷新失败，将尝试 Graph: {error}",
+                    email=account.email,
+                    stage="wait_email_code",
+                )
 
         if imap_access_token:
             try:
-                code = _scan_outlook_imap_once(account, imap_access_token, folder_counts)
+                code = _scan_outlook_imap_once(account, imap_access_token, folder_counts, log_callback)
                 if code:
                     return code
             except Exception as error:
-                print(f"[警告] Outlook IMAP 读取失败，将尝试 Graph: {error}")
+                _mail_log(
+                    log_callback,
+                    "warning",
+                    f"[警告] Outlook IMAP 读取失败，将尝试 Graph: {error}",
+                    email=account.email,
+                    stage="wait_email_code",
+                )
                 try:
                     imap_access_token = refresh_outlook_token(account)
                 except Exception:
                     imap_access_token = None
 
-        if graph_access_token is None:
+        if graph_access_token is None and not graph_terminal_error:
             try:
                 graph_access_token = refresh_outlook_graph_token(account)
             except Exception as error:
-                print(f"[警告] Outlook Graph token 刷新失败: {error}")
+                if _is_terminal_microsoft_token_error(error):
+                    graph_terminal_error = True
+                    token_errors.append(str(error))
+                _mail_log(
+                    log_callback,
+                    "warning",
+                    f"[警告] Outlook Graph token 刷新失败: {error}",
+                    email=account.email,
+                    stage="wait_email_code",
+                )
+
+        if imap_terminal_error and graph_terminal_error:
+            detail = "；".join(token_errors[-2:])
+            raise RuntimeError(f"Outlook refresh_token 无效或租户不匹配，无法读取邮箱：{detail}")
 
         if graph_access_token:
             try:
-                code = _scan_outlook_graph_once(graph_access_token, folder_counts)
+                code = _scan_outlook_graph_once(graph_access_token, folder_counts, account.email, log_callback)
                 if code:
                     return code
             except Exception as error:
-                print(f"[警告] Outlook Graph 读取失败，稍后重试: {error}")
+                _mail_log(
+                    log_callback,
+                    "warning",
+                    f"[警告] Outlook Graph 读取失败，稍后重试: {error}",
+                    email=account.email,
+                    stage="wait_email_code",
+                )
                 try:
                     graph_access_token = refresh_outlook_graph_token(account)
                 except Exception:
@@ -724,7 +851,13 @@ def _wait_for_outlook_auto_code(
 
         time.sleep(interval)
 
-    print("[Error] Outlook 自动模式轮询超时，未获取到验证码")
+    _mail_log(
+        log_callback,
+        "error",
+        "[Error] Outlook 自动模式轮询超时，未获取到验证码",
+        email=account.email,
+        stage="wait_email_code",
+    )
     return None
 
 
@@ -734,32 +867,38 @@ def _wait_for_outlook_imap_code(
     timeout: int,
     interval: int,
     stop_event=None,
+    log_callback: LogCallback | None = None,
 ) -> str | None:
-    print(f"[*] Outlook IMAP 等待验证码: {account.email}")
+    _mail_log(log_callback, "info", f"[*] Outlook IMAP 等待验证码: {account.email}", email=account.email, stage="wait_email_code")
     deadline = time.time() + timeout
     folder_counts = dict(before_counts or {})
     if not folder_counts:
         folder_counts = {"INBOX": 0}
     access_token = refresh_outlook_token(account)
+    attempt = 0
 
     while time.time() < deadline:
         if stop_event and stop_event.is_set():
             raise RuntimeError("任务已停止")
+        attempt += 1
+        if attempt == 1 or attempt % 3 == 0:
+            remaining = max(0, int(deadline - time.time()))
+            _mail_log(log_callback, "info", f"[*] Outlook IMAP 仍在轮询，剩余约 {remaining}s", email=account.email, stage="wait_email_code")
 
         try:
-            code = _scan_outlook_imap_once(account, access_token, folder_counts)
+            code = _scan_outlook_imap_once(account, access_token, folder_counts, log_callback)
             if code:
                 return code
             time.sleep(interval)
         except Exception as error:
-            print(f"[警告] Outlook IMAP 读取失败，稍后重试: {error}")
+            _mail_log(log_callback, "warning", f"[警告] Outlook IMAP 读取失败，稍后重试: {error}", email=account.email, stage="wait_email_code")
             try:
                 access_token = refresh_outlook_token(account)
             except Exception:
                 pass
             time.sleep(interval)
 
-    print("[Error] Outlook IMAP 轮询超时，未获取到验证码")
+    _mail_log(log_callback, "error", "[Error] Outlook IMAP 轮询超时，未获取到验证码", email=account.email, stage="wait_email_code")
     return None
 
 
@@ -769,32 +908,38 @@ def _wait_for_outlook_graph_code(
     timeout: int,
     interval: int,
     stop_event=None,
+    log_callback: LogCallback | None = None,
 ) -> str | None:
-    print(f"[*] Outlook Graph 等待验证码: {account.email}")
+    _mail_log(log_callback, "info", f"[*] Outlook Graph 等待验证码: {account.email}", email=account.email, stage="wait_email_code")
     deadline = time.time() + timeout
     folder_counts = dict(before_counts or {})
     if not folder_counts:
         folder_counts = {OUTLOOK_GRAPH_INBOX_KEY: 0}
     access_token = refresh_outlook_graph_token(account)
+    attempt = 0
 
     while time.time() < deadline:
         if stop_event and stop_event.is_set():
             raise RuntimeError("任务已停止")
+        attempt += 1
+        if attempt == 1 or attempt % 3 == 0:
+            remaining = max(0, int(deadline - time.time()))
+            _mail_log(log_callback, "info", f"[*] Outlook Graph 仍在轮询，剩余约 {remaining}s", email=account.email, stage="wait_email_code")
 
         try:
-            code = _scan_outlook_graph_once(access_token, folder_counts)
+            code = _scan_outlook_graph_once(access_token, folder_counts, account.email, log_callback)
             if code:
                 return code
             time.sleep(interval)
         except Exception as error:
-            print(f"[警告] Outlook Graph 读取失败，稍后重试: {error}")
+            _mail_log(log_callback, "warning", f"[警告] Outlook Graph 读取失败，稍后重试: {error}", email=account.email, stage="wait_email_code")
             try:
                 access_token = refresh_outlook_graph_token(account)
             except Exception:
                 pass
             time.sleep(interval)
 
-    print("[Error] Outlook Graph 轮询超时，未获取到验证码")
+    _mail_log(log_callback, "error", "[Error] Outlook Graph 轮询超时，未获取到验证码", email=account.email, stage="wait_email_code")
     return None
 
 
@@ -807,6 +952,7 @@ def _scan_outlook_imap_once(
     account: OutlookAccount,
     access_token: str,
     folder_counts: dict[str, int],
+    log_callback: LogCallback | None = None,
 ) -> str | None:
     client: imaplib.IMAP4_SSL | None = None
     try:
@@ -826,7 +972,13 @@ def _scan_outlook_imap_once(
             if start > total:
                 continue
 
-            print(f"[*] Outlook 文件夹更新: {folder} {before_count} -> {total}")
+            _mail_log(
+                log_callback,
+                "info",
+                f"[*] Outlook 文件夹更新: {folder} {before_count} -> {total}",
+                email=account.email,
+                stage="wait_email_code",
+            )
 
             for seq in range(total, start - 1, -1):
                 subject, text, html = _fetch_message_content(client, seq)
@@ -834,7 +986,13 @@ def _scan_outlook_imap_once(
                 if code:
                     code = _normalize_verification_code(code)
                     folder_counts[folder] = max(folder_counts.get(folder, 0), total)
-                    print(f"[*] Outlook IMAP 获取到验证码: {code}（文件夹: {folder}）")
+                    _mail_log(
+                        log_callback,
+                        "success",
+                        f"[*] Outlook IMAP 获取到验证码: {code}（文件夹: {folder}）",
+                        email=account.email,
+                        stage="wait_email_code",
+                    )
                     return code
         return None
     finally:
@@ -845,7 +1003,12 @@ def _scan_outlook_imap_once(
                 pass
 
 
-def _scan_outlook_graph_once(access_token: str, folder_counts: dict[str, int]) -> str | None:
+def _scan_outlook_graph_once(
+    access_token: str,
+    folder_counts: dict[str, int],
+    email: str = "",
+    log_callback: LogCallback | None = None,
+) -> str | None:
     before_count = folder_counts.get(OUTLOOK_GRAPH_INBOX_KEY, folder_counts.get("INBOX", 0))
     total = _get_outlook_graph_inbox_count_with_token(access_token)
     if total <= 0:
@@ -858,7 +1021,13 @@ def _scan_outlook_graph_once(access_token: str, folder_counts: dict[str, int]) -
     limit = max(1, total - start_count)
     limit = min(limit, OUTLOOK_GRAPH_SCAN_DEPTH)
 
-    print(f"[*] Outlook Graph 收件箱更新: {start_count} -> {total}")
+    _mail_log(
+        log_callback,
+        "info",
+        f"[*] Outlook Graph 收件箱更新: {start_count} -> {total}",
+        email=email,
+        stage="wait_email_code",
+    )
 
     data = _outlook_graph_get(
         access_token,
@@ -881,7 +1050,13 @@ def _scan_outlook_graph_once(access_token: str, folder_counts: dict[str, int]) -
         if code:
             code = _normalize_verification_code(code)
             folder_counts[OUTLOOK_GRAPH_INBOX_KEY] = max(folder_counts.get(OUTLOOK_GRAPH_INBOX_KEY, 0), total)
-            print(f"[*] Outlook Graph 获取到验证码: {code}")
+            _mail_log(
+                log_callback,
+                "success",
+                f"[*] Outlook Graph 获取到验证码: {code}",
+                email=email,
+                stage="wait_email_code",
+            )
             return code
     return None
 

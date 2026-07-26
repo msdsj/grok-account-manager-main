@@ -128,12 +128,30 @@ def _is_verification_email(subject, sender):
     return any(k in text for k in keywords)
 
 
-def get_oai_code(token, email, include_seen=False):
+def _interruptible_sleep(seconds: float, stop_event=None) -> bool:
+    """休眠最多 seconds 秒；若期间停止信号被设置则提前返回 True。"""
+    if not stop_event:
+        time.sleep(seconds)
+        return False
+    deadline = time.time() + seconds
+    while True:
+        if stop_event.is_set():
+            return True
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return False
+        time.sleep(min(0.2, remaining))
+
+
+def get_oai_code(token, email, include_seen=False, stop_event=None):
     try:
         headers = {"Authorization": f"Bearer {token}"}
         deadline = time.time() + 180  # 最多轮询 180 秒
 
         while time.time() < deadline:
+            if stop_event and stop_event.is_set():
+                print("[*] 收到停止信号，取消验证码轮询")
+                return None
             r = requests.get(f"{BASE_URL}/messages", headers=headers, timeout=30)
             r.raise_for_status()
             messages = r.json().get("hydra:member", [])
@@ -177,7 +195,10 @@ def get_oai_code(token, email, include_seen=False):
                     except Exception:
                         pass
                     return code
-            time.sleep(3)
+
+            if _interruptible_sleep(3, stop_event):
+                print("[*] 收到停止信号，取消验证码轮询")
+                return None
 
         print("[Error] 轮询超时，未获取到验证码")
         return None

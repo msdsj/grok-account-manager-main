@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sys
+import tempfile
 import time
 from pathlib import Path
 
 from DrissionPage import Chromium, ChromiumOptions
 from DrissionPage.errors import PageDisconnectedError
+
+from . import fingerprint as fingerprint_mod
 
 # 项目根目录（三层上：serve/grok_account_manager/core/browser.py → 项目根）
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -146,6 +150,9 @@ def build_chromium_options(lang: str = "zh-CN", headless: bool = False, window_i
         "--disable-default-apps",
         "--disable-sync",
         "--metrics-recording-only",
+        # Blink 在被 CDP 驱动时默认把 navigator.webdriver 置为 true，这是最常见的
+        # 反爬信号之一；这个 flag 从根上关掉它，而不是靠页面里再打补丁去掩盖。
+        "--disable-blink-features=AutomationControlled",
         f"--disable-features={','.join(disabled_features)}",
     ]:
         co.set_argument(argument)
@@ -181,8 +188,56 @@ class DrissionBrowserSession:
         self._options = options
         self._browser: Chromium | None = None
         self._page = None
+        self._profile_dir: Path | None = None
+        self._cache_dir: Path | None = None
+        self._fingerprint_ext_dir: Path | None = None
+        self.identity: fingerprint_mod.BrowserIdentity | None = None
+        self._closed_intentionally = False
+
+    def _prepare_fresh_profile(self) -> None:
+        self._cleanup_profile()
+        profile_dir = Path(tempfile.mkdtemp(prefix="grok-chrome-profile-"))
+        cache_dir = Path(tempfile.mkdtemp(prefix="grok-chrome-cache-"))
+        self._options.set_user_data_path(str(profile_dir))
+        self._options.set_cache_path(str(cache_dir))
+        self._profile_dir = profile_dir
+        self._cache_dir = cache_dir
+        print(f"[*] 已创建全新浏览器 profile: {profile_dir}")
+
+    def _prepare_fresh_fingerprint(self) -> None:
+        """每轮生成一套新的随机浏览器指纹身份，用同名扩展重新加载给 Chromium。"""
+        if self._fingerprint_ext_dir is not None:
+            shutil.rmtree(self._fingerprint_ext_dir, ignore_errors=True)
+            self._fingerprint_ext_dir = None
+        self.identity = fingerprint_mod.random_identity()
+        ext_dir = Path(tempfile.mkdtemp(prefix="grok-chrome-fp-"))
+        for filename, content in fingerprint_mod.build_fingerprint_extension_files(self.identity).items():
+            (ext_dir / filename).write_text(content, encoding="utf-8")
+        self._fingerprint_ext_dir = ext_dir
+        self._options.remove_extensions()
+        self._options.add_extension(TURNSTILE_EXTENSION_PATH)
+        self._options.add_extension(str(ext_dir))
+        print(
+            f"[*] 已生成本轮浏览器指纹: gpu={self.identity.gpu_renderer}, "
+            f"cpu={self.identity.hardware_concurrency}核, mem={self.identity.device_memory}GB"
+        )
+
+    def _cleanup_profile(self) -> None:
+        for path in (self._profile_dir, self._cache_dir, self._fingerprint_ext_dir):
+            if not path:
+                continue
+            try:
+                shutil.rmtree(path, ignore_errors=True)
+            except Exception as error:
+                print(f"[警告] 清理浏览器临时目录失败: {path} ({error})")
+        self._profile_dir = None
+        self._cache_dir = None
+        self._fingerprint_ext_dir = None
 
     def start(self):
+        self._closed_intentionally = False
+        self._prepare_fresh_profile()
+        self._prepare_fresh_fingerprint()
         self._browser = Chromium(self._options)
         tabs = self._browser.get_tabs()
         # DrissionPage 的 /json tab 列表把最新 tab 放在第 0 位。
@@ -197,6 +252,8 @@ class DrissionBrowserSession:
                 pass
         self._browser = None
         self._page = None
+        self._closed_intentionally = True
+        self._cleanup_profile()
 
     def restart(self):
         """每轮结束都重启整个浏览器实例，避免长时间复用造成的页面/Cookie 污染。"""
@@ -214,14 +271,22 @@ class DrissionBrowserSession:
         return self._browser
 
     def refresh_page(self):
-        """验证码确认后页面会跳转，旧 page 句柄可能断开，统一重新获取当前活动 tab。"""
+        """验证码确认后页面会跳转，旧 page 句柄可能断开，统一重新获取当前活动 tab。
+
+        `stop()` 会把 `_browser` 置空；若之后仍有循环在停止信号发出后才走到这里，
+        不能静默地把浏览器重新拉起来，否则取消操作看起来就像"没生效"。
+        """
         if self._browser is None:
+            if self._closed_intentionally:
+                raise RuntimeError("任务已停止：浏览器已关闭")
             self.start()
             return self._page
         try:
             tabs = self._browser.get_tabs()
             self._page = tabs[0] if tabs else self._browser.new_tab()
         except Exception:
+            if self._closed_intentionally:
+                raise RuntimeError("任务已停止：浏览器已关闭")
             self.restart()
         return self._page
 
@@ -411,13 +476,15 @@ return '';
         return None
 
 
-def wait_for_cookie(session: DrissionBrowserSession, cookie_name: str, timeout: int = 180) -> str:
+def wait_for_cookie(session: DrissionBrowserSession, cookie_name: str, timeout: int = 180, stop_event=None) -> str:
     """注册完成后等待指定 cookie 出现并返回其值。"""
     deadline = time.time() + timeout
     last_seen_names: set[str] = set()
     last_errors: list[str] = []
 
     while time.time() < deadline:
+        if stop_event and stop_event.is_set():
+            raise RuntimeError("任务已停止")
         try:
             session.refresh_page()
             page = session.page
