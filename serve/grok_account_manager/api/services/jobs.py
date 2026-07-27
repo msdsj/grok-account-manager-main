@@ -19,10 +19,14 @@ from ...sinks.txt_file import TxtFileSink
 from ..config import (
     CREDENTIALS_DIR,
     DEFAULT_MAX_CONCURRENCY,
+    DEFAULT_MAX_OAUTH_CONCURRENCY,
+    OAUTH_ROUND_TIMEOUT_SECONDS,
+    REGISTRATION_ROUND_TIMEOUT_SECONDS,
     ROUND_PACING_MAX_SECONDS,
     ROUND_PACING_MIN_SECONDS,
-    ROUND_TIMEOUT_SECONDS,
     TXT_OUTPUT,
+    WORKER_START_STAGGER_MAX_SECONDS,
+    WORKER_START_STAGGER_MIN_SECONDS,
 )
 from ..utils import json_default, now_ms, safe_int
 from .accounts import invalidate_accounts_cache
@@ -32,7 +36,17 @@ def _fingerprint_summary(session: DrissionBrowserSession) -> str:
     identity = getattr(session, "identity", None)
     if identity is None:
         return ""
-    return f"（指纹：{identity.gpu_renderer}，{identity.hardware_concurrency} 核，{identity.device_memory}GB 内存）"
+    return (
+        f"（指纹 ID {identity.canvas_seed:08x}：{identity.gpu_renderer}，"
+        f"{identity.hardware_concurrency} 核，{identity.device_memory}GB 内存）"
+    )
+
+
+def _result_has_refresh_token(result: dict) -> bool:
+    credential = result.get("full_credential")
+    return isinstance(credential, dict) and bool(
+        str(credential.get("refresh_token") or "").strip()
+    )
 
 
 class CombinedStopEvent:
@@ -52,6 +66,8 @@ class RegistrationJobManager:
         self._job: dict | None = None
         self._sessions: set[DrissionBrowserSession] = set()
         self._mail_source = None
+        self._oauth_semaphore: threading.BoundedSemaphore | None = None
+        self._next_job_start_not_before = 0.0
         self._last_config: dict = {}
 
     def snapshot(self) -> dict | None:
@@ -116,6 +132,17 @@ class RegistrationJobManager:
             total = pool_count
             concurrency = min(concurrency, total)
 
+        max_oauth_concurrency = safe_int(
+            os.environ.get("GROK_ACCOUNT_MANAGER_MAX_OAUTH_CONCURRENCY"),
+            default=DEFAULT_MAX_OAUTH_CONCURRENCY,
+            minimum=1,
+            maximum=20,
+        )
+        oauth_concurrency = min(concurrency, max_oauth_concurrency) if oauth_exchange else 0
+        round_timeout_seconds = (
+            OAUTH_ROUND_TIMEOUT_SECONDS if oauth_exchange else REGISTRATION_ROUND_TIMEOUT_SECONDS
+        )
+
         with self._lock:
             if self._job and self._job.get("status") in {"running", "stopping"}:
                 raise RuntimeError("已有注册任务正在运行")
@@ -130,6 +157,9 @@ class RegistrationJobManager:
             }
             self._stop_event = threading.Event()
             self._mail_source = mail_source
+            self._oauth_semaphore = (
+                threading.BoundedSemaphore(oauth_concurrency) if oauth_concurrency else None
+            )
             self._job = {
                 "id": uuid.uuid4().hex,
                 "status": "running",
@@ -146,15 +176,45 @@ class RegistrationJobManager:
                 "issued": 0,
                 "completed": 0,
                 "failed": 0,
+                "registered": 0,
+                "refreshTokenCompleted": 0,
+                "refreshTokenFailed": 0,
                 "workerErrors": 0,
                 "active": 0,
-                "roundTimeoutSeconds": ROUND_TIMEOUT_SECONDS,
+                "oauthConcurrency": oauth_concurrency,
+                "roundTimeoutSeconds": round_timeout_seconds,
                 "failedAccounts": [],
+                "registeredAccounts": [],
+                "workers": [
+                    {
+                        "worker": index + 1,
+                        "status": "waiting",
+                        "round": None,
+                        "email": "",
+                        "stage": "waiting",
+                        "message": "等待启动",
+                        "fingerprint": "",
+                        "updatedAt": now_ms(),
+                    }
+                    for index in range(concurrency)
+                ],
                 "startedAt": now_ms(),
                 "finishedAt": None,
                 "events": [],
             }
             self._event_locked("info", f"任务启动：总数 {total}，并发 {concurrency}")
+            if oauth_exchange:
+                self._event_locked(
+                    "info",
+                    f"refresh_token 阶段最多同时运行 {oauth_concurrency} 个窗口，"
+                    "其余窗口会排队以降低同出口 IP 的 OAuth 限速风险",
+                )
+            if concurrency > 1:
+                self._event_locked(
+                    "warning",
+                    "所有窗口仍共享本机网络出口；独立 profile 和指纹只能降低浏览器关联，"
+                    "不能消除同一出口 IP 带来的平台风控",
+                )
             if concurrency < requested_concurrency:
                 self._event_locked(
                     "warning",
@@ -228,12 +288,197 @@ class RegistrationJobManager:
         with self._lock:
             self._event_locked(level, message, **extra)
 
+    def _update_worker_state_locked(self, worker_index: int, **changes) -> None:
+        if self._job is None:
+            return
+        workers = self._job.setdefault("workers", [])
+        worker_state = next(
+            (item for item in workers if int(item.get("worker") or 0) == worker_index),
+            None,
+        )
+        if worker_state is None:
+            worker_state = {"worker": worker_index}
+            workers.append(worker_state)
+        worker_state.update(changes)
+        worker_state["updatedAt"] = now_ms()
+
+    def _update_worker_state(self, worker_index: int, **changes) -> None:
+        with self._lock:
+            self._update_worker_state_locked(worker_index, **changes)
+
     def _provider_event_callback(self, worker_index: int, round_index: int):
+        with self._lock:
+            expected_job_id = str((self._job or {}).get("id") or "")
+
         def _callback(level: str, message: str, **extra) -> None:
             merged = {"worker": worker_index, "round": round_index, **extra}
-            self._event(level, message, **merged)
+            with self._lock:
+                if str((self._job or {}).get("id") or "") != expected_job_id:
+                    return
+                worker_changes = {
+                    "status": "running",
+                    "round": round_index,
+                    "stage": str(extra.get("stage") or "running"),
+                    "message": message,
+                }
+                if extra.get("email"):
+                    worker_changes["email"] = str(extra["email"])
+                self._update_worker_state_locked(worker_index, **worker_changes)
+                self._event_locked(level, message, **merged)
 
         return _callback
+
+    def _registration_checkpoint_callback(self, worker_index: int, round_index: int):
+        with self._lock:
+            expected_job_id = str((self._job or {}).get("id") or "")
+            oauth_required = bool((self._job or {}).get("oauthExchange"))
+
+        def _callback(result: dict) -> None:
+            if not oauth_required:
+                self._persist_result("grok", result)
+            email = str(result.get("email") or "")
+            with self._lock:
+                if str((self._job or {}).get("id") or "") != expected_job_id:
+                    return
+                registered_accounts = self._job.setdefault("registeredAccounts", [])
+                item = next(
+                    (
+                        account
+                        for account in registered_accounts
+                        if int(account.get("round") or 0) == round_index
+                    ),
+                    None,
+                )
+                if item is None:
+                    item = {
+                        "id": uuid.uuid4().hex,
+                        "round": round_index,
+                        "worker": worker_index,
+                        "email": email,
+                        "registeredAt": now_ms(),
+                        "oauthFinalized": False,
+                    }
+                    registered_accounts.append(item)
+                    self._job["registered"] = int(self._job.get("registered") or 0) + 1
+                item.update(
+                    {
+                        "email": email,
+                        "oauthStatus": str(result.get("oauth_status") or "pending"),
+                        "oauthError": "",
+                    }
+                )
+                self._update_worker_state_locked(
+                    worker_index,
+                    status="registered",
+                    round=round_index,
+                    email=email,
+                    stage="oauth_queue" if self._job.get("oauthExchange") else "registered",
+                    message=(
+                        "账号已注册，等待 refresh_token 后再保存"
+                        if oauth_required
+                        else "账号已注册，基础凭证已保存"
+                    ),
+                )
+                self._event_locked(
+                    "success",
+                    (
+                        f"第 {round_index} 轮账号已注册，等待 refresh_token：{email}"
+                        if oauth_required
+                        else f"第 {round_index} 轮账号已注册并保存：{email}"
+                    ),
+                    worker=worker_index,
+                    round=round_index,
+                    email=email,
+                    stage="registered",
+                )
+
+        return _callback
+
+    def _finalize_registered_account(
+        self,
+        *,
+        worker_index: int,
+        round_index: int,
+        oauth_status: str,
+        oauth_error: str = "",
+    ) -> None:
+        with self._lock:
+            if self._job is None:
+                return
+            registered_accounts = self._job.setdefault("registeredAccounts", [])
+            item = next(
+                (
+                    account
+                    for account in registered_accounts
+                    if int(account.get("round") or 0) == round_index
+                ),
+                None,
+            )
+            if item is None:
+                return
+            if not item.get("oauthFinalized"):
+                if oauth_status == "ready":
+                    self._job["refreshTokenCompleted"] = (
+                        int(self._job.get("refreshTokenCompleted") or 0) + 1
+                    )
+                elif oauth_status == "failed":
+                    self._job["refreshTokenFailed"] = (
+                        int(self._job.get("refreshTokenFailed") or 0) + 1
+                    )
+            item.update(
+                {
+                    "oauthStatus": oauth_status,
+                    "oauthError": oauth_error,
+                    "oauthFinalized": oauth_status in {"ready", "failed", "not_requested"},
+                    "updatedAt": now_ms(),
+                }
+            )
+            worker_status = "success" if oauth_status in {"ready", "not_requested"} else "warning"
+            worker_message = (
+                "账号与 refresh_token 已保存"
+                if oauth_status == "ready"
+                else "refresh_token 获取失败，凭证未保存"
+                if oauth_status == "failed"
+                else "账号已保存"
+            )
+            self._update_worker_state_locked(
+                worker_index,
+                status=worker_status,
+                stage="done",
+                message=worker_message,
+            )
+
+    def _stagger_worker_start(self, worker_index: int) -> None:
+        with self._lock:
+            cross_job_delay = max(0.0, self._next_job_start_not_before - time.monotonic())
+        multiplier = max(0, worker_index - 1)
+        worker_delay = (
+            random.uniform(
+                WORKER_START_STAGGER_MIN_SECONDS * multiplier,
+                WORKER_START_STAGGER_MAX_SECONDS * multiplier,
+            )
+            if multiplier
+            else 0.0
+        )
+        delay = cross_job_delay + worker_delay
+        if delay <= 0:
+            return
+        self._update_worker_state(
+            worker_index,
+            status="waiting",
+            stage="startup_stagger",
+            message=f"错峰等待 {delay:.1f}s",
+        )
+        self._event(
+            "info",
+            f"Worker {worker_index} 错峰等待 {delay:.1f}s 后启动，避免并发请求形成固定突发",
+            worker=worker_index,
+        )
+        deadline = time.monotonic() + delay
+        while time.monotonic() < deadline:
+            if self._stop_event.is_set():
+                return
+            time.sleep(min(0.2, max(0.0, deadline - time.monotonic())))
 
     def _next_round(self) -> int | None:
         with self._lock:
@@ -314,25 +559,65 @@ class RegistrationJobManager:
             )
             del failures[:-500]
 
-    def _persist_result(self, provider_name: str, result: dict) -> None:
+    def _persist_result(self, provider_name: str, result: dict, *, write_txt: bool = True) -> None:
         with self._persist_lock:
-            txt_sink = TxtFileSink(TXT_OUTPUT)
             json_sink = JsonCredentialSink(str(CREDENTIALS_DIR))
-            txt_sink.push(provider_name, result)
+            if write_txt:
+                TxtFileSink(TXT_OUTPUT).push(provider_name, result)
             json_sink.push(provider_name, result)
             json_sink.flush()
             invalidate_accounts_cache()
 
-    def _create_provider(self, oauth_exchange: bool, stop_event) -> GrokProvider:
+    def _persist_completed_result(
+        self,
+        provider_name: str,
+        result: dict,
+        *,
+        oauth_required: bool,
+    ) -> tuple[str, str, bool]:
+        oauth_status = str(result.get("oauth_status") or "not_requested")
+        oauth_error = str(result.get("oauth_error") or "")
+        if oauth_required and (
+            oauth_status != "ready" or not _result_has_refresh_token(result)
+        ):
+            return (
+                "failed",
+                oauth_error or "未获取到 refresh_token，凭证未保存",
+                False,
+            )
+
+        self._persist_result(
+            provider_name,
+            result,
+            write_txt=oauth_required,
+        )
+        return oauth_status, oauth_error, True
+
+    def _create_provider(
+        self,
+        oauth_exchange: bool,
+        stop_event,
+        worker_index: int,
+        round_index: int,
+    ) -> GrokProvider:
         provider = GrokProvider()
         provider.enable_oauth_exchange = oauth_exchange
         provider.stop_event = stop_event
         provider.mail_source = self._mail_source
+        provider.oauth_semaphore = self._oauth_semaphore
+        provider.result_callback = self._registration_checkpoint_callback(worker_index, round_index)
         return provider
 
     def _start_worker_session(self, worker_index: int, chrome_lang: str = "zh-CN") -> DrissionBrowserSession:
+        with self._lock:
+            window_count = int((self._job or {}).get("concurrency") or 1)
         session = DrissionBrowserSession(
-            build_chromium_options(chrome_lang, headless=False, window_index=worker_index)
+            build_chromium_options(
+                chrome_lang,
+                headless=False,
+                window_index=worker_index - 1,
+                window_count=window_count,
+            )
         )
         try:
             session.start()
@@ -404,6 +689,15 @@ class RegistrationJobManager:
         try:
             if self._stop_event.is_set():
                 return
+            self._stagger_worker_start(worker_index)
+            if self._stop_event.is_set():
+                return
+            self._update_worker_state(
+                worker_index,
+                status="starting",
+                stage="browser_start",
+                message="正在启动独立浏览器",
+            )
             session = self._start_worker_session(worker_index)
             if self._stop_event.is_set():
                 session.stop()
@@ -411,6 +705,12 @@ class RegistrationJobManager:
                 return
         except Exception as error:
             self._worker_start_failed()
+            self._update_worker_state(
+                worker_index,
+                status="error",
+                stage="browser_start",
+                message=str(error),
+            )
             if self._stop_event.is_set():
                 self._event("warning", f"Worker {worker_index} 已停止启动", worker=worker_index)
             else:
@@ -418,9 +718,17 @@ class RegistrationJobManager:
             return
 
         try:
+            fingerprint_summary = _fingerprint_summary(session)
+            self._update_worker_state(
+                worker_index,
+                status="ready",
+                stage="browser_ready",
+                message="独立浏览器已启动",
+                fingerprint=fingerprint_summary.strip("（）"),
+            )
             self._event(
                 "info",
-                f"Worker {worker_index} 浏览器已启动{_fingerprint_summary(session)}",
+                f"Worker {worker_index} 浏览器已启动{fingerprint_summary}",
                 worker=worker_index,
             )
             while True:
@@ -438,12 +746,22 @@ class RegistrationJobManager:
                     worker=worker_index,
                     round=round_index,
                 )
+                self._update_worker_state(
+                    worker_index,
+                    status="running",
+                    round=round_index,
+                    email="",
+                    stage="starting",
+                    message=f"正在执行第 {round_index} 轮",
+                )
                 ok = False
                 cancelled = False
                 round_stop_event = threading.Event()
                 provider = self._create_provider(
                     oauth_exchange,
                     CombinedStopEvent(self._stop_event, round_stop_event),
+                    worker_index,
+                    round_index,
                 )
                 provider.event_callback = self._provider_event_callback(worker_index, round_index)
                 try:
@@ -454,10 +772,19 @@ class RegistrationJobManager:
                             f"Worker {worker_index} 浏览器已重新启动{_fingerprint_summary(session)}",
                             worker=worker_index,
                         )
+                    with self._lock:
+                        round_timeout_seconds = int(
+                            (self._job or {}).get(
+                                "roundTimeoutSeconds",
+                                OAUTH_ROUND_TIMEOUT_SECONDS
+                                if oauth_exchange
+                                else REGISTRATION_ROUND_TIMEOUT_SECONDS,
+                            )
+                        )
                     status, payload = self._run_round_with_timeout(
                         provider,
                         session,
-                        ROUND_TIMEOUT_SECONDS,
+                        round_timeout_seconds,
                         worker_index,
                         round_index,
                     )
@@ -465,7 +792,21 @@ class RegistrationJobManager:
                         round_stop_event.set()
                         email = str(getattr(provider, "current_email", "") or "")
                         stage = str(getattr(provider, "current_stage", "") or "timeout")
-                        reason = f"注册超过 {ROUND_TIMEOUT_SECONDS} 秒，已跳过该账号"
+                        registered = bool(getattr(provider, "registration_succeeded", False))
+                        if registered:
+                            ok = True
+                            reason = (
+                                f"账号已注册，但后续阶段超过 {round_timeout_seconds} 秒；"
+                                "未获取 refresh_token，凭证未保存"
+                            )
+                            self._finalize_registered_account(
+                                worker_index=worker_index,
+                                round_index=round_index,
+                                oauth_status="failed" if oauth_exchange else "not_requested",
+                                oauth_error=reason if oauth_exchange else "",
+                            )
+                        else:
+                            reason = f"注册超过 {round_timeout_seconds} 秒，已跳过该账号"
                         self._record_failed_account(
                             email=email,
                             round_index=round_index,
@@ -475,7 +816,7 @@ class RegistrationJobManager:
                             timed_out=True,
                         )
                         self._event(
-                            "error",
+                            "warning" if registered else "error",
                             f"第 {round_index} 轮超时：{reason}",
                             worker=worker_index,
                             round=round_index,
@@ -494,36 +835,97 @@ class RegistrationJobManager:
                         raise error
                     result = payload if isinstance(payload, dict) else {}
                     if self._stop_event.is_set():
-                        cancelled = True
+                        registered = bool(getattr(provider, "registration_succeeded", False))
+                        cancelled = not registered
+                        ok = registered
+                        if registered:
+                            (
+                                result_oauth_status,
+                                result_oauth_error,
+                                result_saved,
+                            ) = self._persist_completed_result(
+                                provider.name,
+                                result,
+                                oauth_required=oauth_exchange,
+                            )
+                            self._finalize_registered_account(
+                                worker_index=worker_index,
+                                round_index=round_index,
+                                oauth_status=result_oauth_status,
+                                oauth_error=result_oauth_error,
+                            )
                         self._event(
                             "warning",
-                            f"第 {round_index} 轮在完成后被停止",
+                            (
+                                f"第 {round_index} 轮账号{'已保存' if result_saved else '未保存'}，后续处理被停止"
+                                if registered
+                                else f"第 {round_index} 轮在完成前被停止"
+                            ),
                             worker=worker_index,
                             round=round_index,
                         )
                     else:
-                        self._persist_result(provider.name, result)
+                        oauth_status, oauth_error, result_saved = self._persist_completed_result(
+                            provider.name,
+                            result,
+                            oauth_required=oauth_exchange,
+                        )
+                        self._finalize_registered_account(
+                            worker_index=worker_index,
+                            round_index=round_index,
+                            oauth_status=oauth_status,
+                            oauth_error=oauth_error,
+                        )
                         ok = True
                         email = str(result.get("email") or "")
                         self._event(
-                            "success",
-                            f"第 {round_index} 轮注册完成：{email}",
+                            "warning" if oauth_status == "failed" else "success",
+                            (
+                                f"第 {round_index} 轮 refresh_token 获取失败，凭证未保存：{email}"
+                                if oauth_status == "failed"
+                                else f"第 {round_index} 轮注册完成：{email}"
+                            ),
                             worker=worker_index,
                             round=round_index,
                             email=email,
                         )
                 except RuntimeError as error:
+                    registered = bool(getattr(provider, "registration_succeeded", False))
+                    email = str(getattr(provider, "current_email", "") or "")
+                    stage = str(getattr(provider, "current_stage", "") or "runtime_error")
                     if "stopped" in str(error).lower() or self._stop_event.is_set():
-                        cancelled = True
+                        cancelled = not registered
+                        ok = registered
+                        if registered:
+                            self._finalize_registered_account(
+                                worker_index=worker_index,
+                                round_index=round_index,
+                                oauth_status="failed" if oauth_exchange else "not_requested",
+                                oauth_error="任务停止时 refresh_token 尚未完成" if oauth_exchange else "",
+                            )
                         self._event(
                             "warning",
-                            f"第 {round_index} 轮已被停止",
+                            (
+                                (
+                                    f"第 {round_index} 轮账号已注册但未取得 RT，凭证未保存，后续处理已停止"
+                                    if oauth_exchange
+                                    else f"第 {round_index} 轮账号已保存，后续处理已停止"
+                                )
+                                if registered
+                                else f"第 {round_index} 轮已被停止"
+                            ),
                             worker=worker_index,
                             round=round_index,
                         )
                     else:
-                        email = str(getattr(provider, "current_email", "") or "")
-                        stage = str(getattr(provider, "current_stage", "") or "runtime_error")
+                        if registered:
+                            ok = True
+                            self._finalize_registered_account(
+                                worker_index=worker_index,
+                                round_index=round_index,
+                                oauth_status="failed" if oauth_exchange else "not_requested",
+                                oauth_error=str(error) if oauth_exchange else "",
+                            )
                         self._record_failed_account(
                             email=email,
                             round_index=round_index,
@@ -532,8 +934,16 @@ class RegistrationJobManager:
                             reason=str(error),
                         )
                         self._event(
-                            "error",
-                            f"第 {round_index} 轮失败：{error}",
+                            "warning" if registered else "error",
+                            (
+                                (
+                                    f"第 {round_index} 轮账号已注册但未取得 RT，凭证未保存：{error}"
+                                    if oauth_exchange
+                                    else f"第 {round_index} 轮账号已保存，但后续处理失败：{error}"
+                                )
+                                if registered
+                                else f"第 {round_index} 轮失败：{error}"
+                            ),
                             worker=worker_index,
                             round=round_index,
                             email=email,
@@ -541,17 +951,42 @@ class RegistrationJobManager:
                         )
                         traceback.print_exc()
                 except Exception as error:
+                    registered = bool(getattr(provider, "registration_succeeded", False))
+                    email = str(getattr(provider, "current_email", "") or "")
+                    stage = str(getattr(provider, "current_stage", "") or error.__class__.__name__)
                     if self._stop_event.is_set():
-                        cancelled = True
+                        cancelled = not registered
+                        ok = registered
+                        if registered:
+                            self._finalize_registered_account(
+                                worker_index=worker_index,
+                                round_index=round_index,
+                                oauth_status="failed" if oauth_exchange else "not_requested",
+                                oauth_error="任务停止时 refresh_token 尚未完成" if oauth_exchange else "",
+                            )
                         self._event(
                             "warning",
-                            f"第 {round_index} 轮已被停止",
+                            (
+                                (
+                                    f"第 {round_index} 轮账号已注册但未取得 RT，凭证未保存，后续处理已停止"
+                                    if oauth_exchange
+                                    else f"第 {round_index} 轮账号已保存，后续处理已停止"
+                                )
+                                if registered
+                                else f"第 {round_index} 轮已被停止"
+                            ),
                             worker=worker_index,
                             round=round_index,
                         )
                     else:
-                        email = str(getattr(provider, "current_email", "") or "")
-                        stage = str(getattr(provider, "current_stage", "") or error.__class__.__name__)
+                        if registered:
+                            ok = True
+                            self._finalize_registered_account(
+                                worker_index=worker_index,
+                                round_index=round_index,
+                                oauth_status="failed" if oauth_exchange else "not_requested",
+                                oauth_error=str(error) if oauth_exchange else "",
+                            )
                         self._record_failed_account(
                             email=email,
                             round_index=round_index,
@@ -560,8 +995,16 @@ class RegistrationJobManager:
                             reason=str(error),
                         )
                         self._event(
-                            "error",
-                            f"第 {round_index} 轮失败：{error}",
+                            "warning" if registered else "error",
+                            (
+                                (
+                                    f"第 {round_index} 轮账号已注册但未取得 RT，凭证未保存：{error}"
+                                    if oauth_exchange
+                                    else f"第 {round_index} 轮账号已保存，但后续处理失败：{error}"
+                                )
+                                if registered
+                                else f"第 {round_index} 轮失败：{error}"
+                            ),
                             worker=worker_index,
                             round=round_index,
                             email=email,
@@ -580,9 +1023,17 @@ class RegistrationJobManager:
                         if session is None:
                             continue
                         session.restart()
+                        fingerprint_summary = _fingerprint_summary(session)
+                        self._update_worker_state(
+                            worker_index,
+                            status="ready",
+                            stage="browser_restarted",
+                            message="下一轮独立浏览器已就绪",
+                            fingerprint=fingerprint_summary.strip("（）"),
+                        )
                         self._event(
                             "info",
-                            f"Worker {worker_index} 已为下一轮重新生成指纹{_fingerprint_summary(session)}",
+                            f"Worker {worker_index} 已为下一轮重新生成指纹{fingerprint_summary}",
                             worker=worker_index,
                         )
                         self._pace_before_next_round(worker_index)
@@ -601,6 +1052,26 @@ class RegistrationJobManager:
                 except Exception:
                     pass
                 self._unregister_session(session)
+            with self._lock:
+                worker_state = next(
+                    (
+                        item
+                        for item in (self._job or {}).get("workers", [])
+                        if int(item.get("worker") or 0) == worker_index
+                    ),
+                    None,
+                )
+                if worker_state is None or worker_state.get("status") not in {
+                    "success",
+                    "warning",
+                    "error",
+                }:
+                    self._update_worker_state_locked(
+                        worker_index,
+                        status="stopped" if self._stop_event.is_set() else "idle",
+                        stage="exited",
+                        message="Worker 已退出",
+                    )
             self._event("info", f"Worker {worker_index} 已退出", worker=worker_index)
 
     def _run_job(self, job_id: str) -> None:
@@ -629,14 +1100,23 @@ class RegistrationJobManager:
             if self._job.get("status") == "stopping":
                 self._job["status"] = "stopped"
                 self._event_locked("warning", "任务已停止")
-            elif self._job.get("failed", 0) > 0 or self._job.get("workerErrors", 0) > 0:
+            elif (
+                self._job.get("failed", 0) > 0
+                or self._job.get("workerErrors", 0) > 0
+                or self._job.get("refreshTokenFailed", 0) > 0
+            ):
                 self._job["status"] = "completed_with_errors"
-                self._event_locked("warning", "任务完成，但存在失败轮次")
+                self._event_locked("warning", "任务完成，但存在注册失败或 refresh_token 缺失")
             else:
                 self._job["status"] = "completed"
                 self._event_locked("success", "任务已全部完成")
             self._job["finishedAt"] = now_ms()
+            self._next_job_start_not_before = time.monotonic() + random.uniform(
+                ROUND_PACING_MIN_SECONDS,
+                ROUND_PACING_MAX_SECONDS,
+            )
             self._mail_source = None
+            self._oauth_semaphore = None
 
 
 JOB_MANAGER = RegistrationJobManager()

@@ -52,6 +52,11 @@ def account_from_credential(credential: dict, file_path: Path, item_index: int =
     last_name = str(credential.get("last_name") or "").strip()
     refresh_token = str(credential.get("refresh_token") or "").strip()
     access_token = str(credential.get("access_token") or "").strip()
+    oauth_status = str(credential.get("oauth_exchange_status") or "").strip()
+    if refresh_token:
+        oauth_status = "ready"
+    elif not oauth_status:
+        oauth_status = "unknown"
     created_at = credential.get("created_at")
     account_id = str(credential.get("id") or "").strip() or file_path.stem
 
@@ -77,6 +82,8 @@ def account_from_credential(credential: dict, file_path: Path, item_index: int =
         "createdAtLabel": _format_created_at(created_at),
         "hasRefreshToken": bool(refresh_token),
         "hasAccessToken": bool(access_token),
+        "oauthStatus": oauth_status,
+        "oauthError": str(credential.get("oauth_exchange_error") or "").strip(),
         "fileName": file_path.name,
         "filePath": str(file_path),
         "quota": {

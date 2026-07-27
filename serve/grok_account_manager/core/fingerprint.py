@@ -15,21 +15,32 @@ from __future__ import annotations
 
 import json
 import secrets
+import sys
 from dataclasses import dataclass
 
-_GPU_PROFILES: list[tuple[str, str]] = [
-    ("Google Inc. (Intel)", "ANGLE (Intel, Intel(R) Iris(R) Xe Graphics (0x00009A49) Direct3D11 vs_5_0 ps_5_0, D3D11)"),
-    ("Google Inc. (Intel)", "ANGLE (Intel, Intel(R) UHD Graphics 630 (0x00003E9B) Direct3D11 vs_5_0 ps_5_0, D3D11)"),
-    ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 (0x00002504) Direct3D11 vs_5_0 ps_5_0, D3D11)"),
-    ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, NVIDIA GeForce GTX 1660 Ti (0x00002191) Direct3D11 vs_5_0 ps_5_0, D3D11)"),
-    ("Google Inc. (AMD)", "ANGLE (AMD, AMD Radeon RX 6600 (0x000073FF) Direct3D11 vs_5_0 ps_5_0, D3D11)"),
-    ("Google Inc. (Apple)", "ANGLE (Apple, ANGLE Metal Renderer: Apple M1, Unspecified Version)"),
-    ("Google Inc. (Apple)", "ANGLE (Apple, ANGLE Metal Renderer: Apple M2, Unspecified Version)"),
-    ("Google Inc. (Apple)", "ANGLE (Apple, ANGLE Metal Renderer: Apple M3, Unspecified Version)"),
-]
+_DeviceProfile = tuple[str, str, tuple[int, ...], tuple[int, ...]]
 
-_HARDWARE_CONCURRENCY: list[int] = [4, 6, 8, 12, 16]
-_DEVICE_MEMORY: list[int] = [4, 8, 16]
+_DEVICE_PROFILES_BY_PLATFORM: dict[str, list[_DeviceProfile]] = {
+    "darwin": [
+        ("Google Inc. (Apple)", "ANGLE (Apple, ANGLE Metal Renderer: Apple M1, Unspecified Version)", (8,), (8,)),
+        ("Google Inc. (Apple)", "ANGLE (Apple, ANGLE Metal Renderer: Apple M2, Unspecified Version)", (8, 10, 12), (8,)),
+        ("Google Inc. (Apple)", "ANGLE (Apple, ANGLE Metal Renderer: Apple M3, Unspecified Version)", (8, 10, 12, 14, 16), (8,)),
+        ("Google Inc. (Apple)", "ANGLE (Apple, ANGLE Metal Renderer: Apple M4, Unspecified Version)", (10, 12, 14, 16), (8,)),
+    ],
+    "win32": [
+        ("Google Inc. (Intel)", "ANGLE (Intel, Intel(R) Iris(R) Xe Graphics (0x00009A49) Direct3D11 vs_5_0 ps_5_0, D3D11)", (8, 12, 16), (4, 8)),
+        ("Google Inc. (Intel)", "ANGLE (Intel, Intel(R) UHD Graphics 630 (0x00003E9B) Direct3D11 vs_5_0 ps_5_0, D3D11)", (4, 6, 8, 12), (4, 8)),
+        ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 (0x00002504) Direct3D11 vs_5_0 ps_5_0, D3D11)", (8, 12, 16), (8,)),
+        ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, NVIDIA GeForce GTX 1660 Ti (0x00002191) Direct3D11 vs_5_0 ps_5_0, D3D11)", (8, 12, 16), (8,)),
+        ("Google Inc. (AMD)", "ANGLE (AMD, AMD Radeon RX 6600 (0x000073FF) Direct3D11 vs_5_0 ps_5_0, D3D11)", (8, 12, 16), (8,)),
+    ],
+    "linux": [
+        ("Google Inc. (Intel)", "ANGLE (Intel, Mesa Intel(R) UHD Graphics 630 (CFL GT2), OpenGL 4.6)", (4, 6, 8, 12), (4, 8)),
+        ("Google Inc. (Intel)", "ANGLE (Intel, Mesa Intel(R) Iris(R) Xe Graphics (TGL GT2), OpenGL 4.6)", (8, 12, 16), (4, 8)),
+        ("Google Inc. (AMD)", "ANGLE (AMD, AMD Radeon RX 6600 (radeonsi, navi23, LLVM 17.0.6), OpenGL 4.6)", (8, 12, 16), (8,)),
+        ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060/PCIe/SSE2, OpenGL 4.6)", (8, 12, 16), (8,)),
+    ],
+}
 
 
 @dataclass(frozen=True)
@@ -39,19 +50,26 @@ class BrowserIdentity:
     hardware_concurrency: int
     device_memory: int
     canvas_seed: int
-    webgl_seed: int
 
 
-def random_identity() -> BrowserIdentity:
+def random_identity(platform_name: str | None = None) -> BrowserIdentity:
     """生成一套本轮注册全程复用的随机指纹身份。"""
-    gpu_vendor, gpu_renderer = secrets.choice(_GPU_PROFILES)
+    platform_name = str(platform_name or sys.platform).lower()
+    if platform_name.startswith("win"):
+        platform_key = "win32"
+    elif platform_name == "darwin":
+        platform_key = "darwin"
+    else:
+        platform_key = "linux"
+    gpu_vendor, gpu_renderer, concurrency_values, memory_values = secrets.choice(
+        _DEVICE_PROFILES_BY_PLATFORM[platform_key]
+    )
     return BrowserIdentity(
         gpu_vendor=gpu_vendor,
         gpu_renderer=gpu_renderer,
-        hardware_concurrency=secrets.choice(_HARDWARE_CONCURRENCY),
-        device_memory=secrets.choice(_DEVICE_MEMORY),
+        hardware_concurrency=secrets.choice(concurrency_values),
+        device_memory=secrets.choice(memory_values),
         canvas_seed=secrets.randbelow(2**31) or 1,
-        webgl_seed=secrets.randbelow(2**31) or 1,
     )
 
 
@@ -74,39 +92,64 @@ def build_fingerprint_script(identity: BrowserIdentity) -> str:
     define(Navigator.prototype, 'deviceMemory', {identity.device_memory});
     define(Navigator.prototype, 'webdriver', undefined);
 
-    // 简单可复现的伪随机数生成器：同一轮注册内种子固定，多次取值互相一致。
-    function mulberry32(seed) {{
-        return function () {{
-            seed |= 0;
-            seed = (seed + 0x6D2B79F5) | 0;
-            var t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
-            t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-            return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-        }};
+    // 噪声只由固定种子和像素坐标决定，同一画布重复读取不会发生漂移。
+    function pixelNoise(seed, x, y) {{
+        var value = seed ^ Math.imul(x + 1, 374761393) ^ Math.imul(y + 1, 668265263);
+        value = Math.imul(value ^ (value >>> 13), 1274126177);
+        value = value ^ (value >>> 16);
+        return ((value >>> 0) % 3) - 1;
     }}
 
-    var canvasRandom = mulberry32({identity.canvas_seed});
+    function applyCanvasNoise(imageData, offsetX, offsetY) {{
+        var data = imageData.data;
+        var width = imageData.width;
+        for (var index = 0; index < data.length; index += 4) {{
+            if (data[index + 3] === 0) continue;
+            var pixel = index / 4;
+            var x = offsetX + (pixel % width);
+            var y = offsetY + Math.floor(pixel / width);
+            var noise = pixelNoise({identity.canvas_seed}, x, y);
+            data[index] = Math.min(255, Math.max(0, data[index] + noise));
+            data[index + 2] = Math.min(255, Math.max(0, data[index + 2] - noise));
+        }}
+        return imageData;
+    }}
+
     var origGetImageData = CanvasRenderingContext2D.prototype.getImageData;
     CanvasRenderingContext2D.prototype.getImageData = function () {{
         var imageData = origGetImageData.apply(this, arguments);
-        var data = imageData.data;
-        for (var i = 0; i < data.length; i += 4) {{
-            var noise = Math.floor(canvasRandom() * 3) - 1;
-            data[i] = Math.min(255, Math.max(0, data[i] + noise));
-        }}
-        return imageData;
+        return applyCanvasNoise(imageData, Number(arguments[0]) || 0, Number(arguments[1]) || 0);
     }};
+
     var origToDataURL = HTMLCanvasElement.prototype.toDataURL;
+    var origToBlob = HTMLCanvasElement.prototype.toBlob;
+    function noisyCanvas(source) {{
+        var clone = document.createElement('canvas');
+        clone.width = source.width;
+        clone.height = source.height;
+        var context = clone.getContext('2d');
+        if (!context || !clone.width || !clone.height) return source;
+        context.drawImage(source, 0, 0);
+        var imageData = origGetImageData.call(context, 0, 0, clone.width, clone.height);
+        applyCanvasNoise(imageData, 0, 0);
+        context.putImageData(imageData, 0, 0);
+        return clone;
+    }}
+
     HTMLCanvasElement.prototype.toDataURL = function () {{
         try {{
-            var ctx = this.getContext('2d');
-            if (ctx && this.width > 0 && this.height > 0) {{
-                var imageData = ctx.getImageData(0, 0, this.width, this.height);
-                ctx.putImageData(imageData, 0, 0);
-            }}
+            return origToDataURL.apply(noisyCanvas(this), arguments);
         }} catch (e) {{}}
         return origToDataURL.apply(this, arguments);
     }};
+    if (origToBlob) {{
+        HTMLCanvasElement.prototype.toBlob = function () {{
+            try {{
+                return origToBlob.apply(noisyCanvas(this), arguments);
+            }} catch (e) {{}}
+            return origToBlob.apply(this, arguments);
+        }};
+    }}
 
     function patchWebGL(proto) {{
         if (!proto) return;

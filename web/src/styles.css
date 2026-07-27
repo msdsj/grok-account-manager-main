@@ -720,6 +720,11 @@ textarea:focus-visible {
   background: rgba(255, 196, 91, 0.2);
 }
 
+.status-pill.error {
+  color: var(--red);
+  background: rgba(229, 83, 83, 0.13);
+}
+
 .status-pill.neutral,
 .system-chip.neutral,
 .token-badge.neutral {
@@ -817,6 +822,87 @@ textarea:focus-visible {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.worker-progress-block {
+  margin: 0 16px 16px;
+  border-top: 1px solid rgba(137, 157, 190, 0.2);
+}
+
+.worker-progress-block .sub-panel-head {
+  padding-inline: 0;
+  border-bottom-color: rgba(137, 157, 190, 0.16);
+}
+
+.worker-progress-block .sub-panel-head strong {
+  color: var(--ink);
+}
+
+.worker-progress-block .sub-panel-head span {
+  color: var(--muted);
+}
+
+.worker-lanes {
+  display: grid;
+}
+
+.worker-lane {
+  min-height: 72px;
+  display: grid;
+  grid-template-columns: 128px minmax(180px, 0.8fr) minmax(220px, 1fr) minmax(220px, 1fr);
+  align-items: center;
+  gap: 12px;
+  padding: 10px 0;
+  border-bottom: 1px solid rgba(137, 157, 190, 0.13);
+}
+
+.worker-lane:last-child {
+  border-bottom: 0;
+}
+
+.worker-lane-id {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.worker-lane-id > strong {
+  color: var(--ink);
+  font-size: 13px;
+}
+
+.worker-lane-account {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.worker-lane-account strong,
+.worker-lane-account span,
+.worker-lane p,
+.worker-lane code {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.worker-lane-account strong {
+  color: var(--ink-2);
+  font-size: 12px;
+}
+
+.worker-lane-account span,
+.worker-lane p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.worker-lane code {
+  display: block;
+  color: #52657f;
+  font-size: 10px;
 }
 
 .asset-board {
@@ -1710,6 +1796,10 @@ code {
   }
   .relay-config-grid label:nth-child(4),
   .relay-config-grid label:nth-child(5) { grid-column: auto; }
+  .worker-lane {
+    grid-template-columns: 118px minmax(180px, 0.8fr) minmax(220px, 1.2fr);
+  }
+  .worker-lane code { grid-column: 2 / -1; }
 }
 
 @media (max-width: 720px) {
@@ -1774,4 +1864,9 @@ code {
   .relay-tool-row .primary-btn,
   .relay-tool-row .secondary-btn { width: 100%; }
   .model-row { grid-template-columns: 1fr; }
+  .worker-lane {
+    grid-template-columns: 1fr;
+    gap: 7px;
+  }
+  .worker-lane code { grid-column: auto; }
 }

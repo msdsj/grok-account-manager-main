@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import os
 import shutil
+import socket
+import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -17,6 +20,13 @@ from . import fingerprint as fingerprint_mod
 # 项目根目录（三层上：serve/grok_account_manager/core/browser.py → 项目根）
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 TURNSTILE_EXTENSION_PATH = str(PROJECT_ROOT / "extensions" / "turnstile_patch")
+_BROWSER_START_LOCK = threading.Lock()
+
+
+def _find_free_local_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        return int(listener.getsockname()[1])
 
 
 def ensure_stable_python_runtime():
@@ -76,26 +86,76 @@ def _find_chrome_path() -> str | None:
     return None
 
 
-def _screen_size() -> tuple[int, int]:
-    return _SCREEN_SIZE_CACHE
+def _screen_bounds() -> tuple[int, int, int, int]:
+    return _SCREEN_BOUNDS_CACHE
 
 
-def _init_screen_size() -> tuple[int, int]:
+def _init_screen_bounds() -> tuple[int, int, int, int]:
+    if sys.platform == "darwin":
+        try:
+            script = (
+                'ObjC.import("AppKit"); '
+                "const f=$.NSScreen.mainScreen.visibleFrame; "
+                "[Number(f.origin.x),Number(f.origin.y),Number(f.size.width),"
+                "Number(f.size.height)].join(',');"
+            )
+            result = subprocess.run(
+                ["osascript", "-l", "JavaScript", "-e", script],
+                capture_output=True,
+                text=True,
+                timeout=4,
+                check=True,
+            )
+            x, y, width, height = (
+                int(float(part.strip())) for part in result.stdout.strip().split(",")
+            )
+            if width >= 800 and height >= 600:
+                return x, y, width, height
+        except Exception:
+            pass
+
     try:
         import tkinter as tk
         root = tk.Tk()
         root.withdraw()
         w, h = root.winfo_screenwidth(), root.winfo_screenheight()
         root.destroy()
-        return w, h
+        return 0, 0, w, h
     except Exception:
-        return 1920, 1080
+        return 0, 0, 1440, 900
 
 
-_SCREEN_SIZE_CACHE: tuple[int, int] = _init_screen_size()
+_SCREEN_BOUNDS_CACHE: tuple[int, int, int, int] = _init_screen_bounds()
 
 
-def build_chromium_options(lang: str = "zh-CN", headless: bool = False, window_index: int = 0) -> ChromiumOptions:
+def calculate_window_bounds(
+    window_index: int,
+    window_count: int = 1,
+    screen_bounds: tuple[int, int, int, int] | None = None,
+) -> tuple[int, int, int, int]:
+    """Return a visible slot on the main display for up to six concurrent windows."""
+    screen_x, screen_y, screen_width, screen_height = screen_bounds or _screen_bounds()
+    visible_count = max(1, min(6, int(window_count or 1)))
+    columns = min(3, visible_count)
+    rows = 1 if visible_count <= 3 else 2
+    slot = max(0, int(window_index)) % (columns * rows)
+    column = slot % columns
+    row = slot // columns
+    slot_width = max(480, screen_width // columns)
+    slot_height = max(360, screen_height // rows)
+    left = screen_x + column * slot_width
+    top = screen_y + row * slot_height
+    width = min(slot_width, screen_x + screen_width - left)
+    height = min(slot_height, screen_y + screen_height - top)
+    return left, top, width, height
+
+
+def build_chromium_options(
+    lang: str = "zh-CN",
+    headless: bool = False,
+    window_index: int = 0,
+    window_count: int = 1,
+) -> ChromiumOptions:
     """构造启动参数：自动端口、Turnstile 扩展、强制语言。
 
     `lang` 决定 navigator.language / Accept-Language。x.ai 按浏览器语言渲染按钮文案，
@@ -121,17 +181,15 @@ def build_chromium_options(lang: str = "zh-CN", headless: bool = False, window_i
     else:
         print("[*] 使用可见无痕浏览器模式（推荐）")
 
-    # 窗口布局：每行 3 个，自动平铺
-    sw, sh = _screen_size()
-    cols = 3
-    win_w = sw // cols
-    win_h = sh // 2
-    col = window_index % cols
-    row = window_index // cols
-    co.set_argument(f"--window-size={win_w},{win_h}")
-    co.set_argument(f"--window-position={col * win_w},{row * win_h}")
+    # 启动参数先给出位置，启动后 BrowserSession 会再通过 CDP 强制应用一次。
+    left, top, window_width, window_height = calculate_window_bounds(
+        window_index,
+        window_count,
+    )
+    co.set_argument(f"--window-size={window_width},{window_height}")
+    co.set_argument(f"--window-position={left},{top}")
+    co._grok_window_bounds = (left, top, window_width, window_height)
 
-    co.auto_port()
     co.set_timeouts(base=1)
     co.set_argument(f"--lang={lang}")
     disabled_features = [
@@ -192,7 +250,9 @@ class DrissionBrowserSession:
         self._cache_dir: Path | None = None
         self._fingerprint_ext_dir: Path | None = None
         self.identity: fingerprint_mod.BrowserIdentity | None = None
+        self.debug_port: int | None = None
         self._closed_intentionally = False
+        self._window_bounds = getattr(options, "_grok_window_bounds", None)
 
     def _prepare_fresh_profile(self) -> None:
         self._cleanup_profile()
@@ -218,7 +278,8 @@ class DrissionBrowserSession:
         self._options.add_extension(TURNSTILE_EXTENSION_PATH)
         self._options.add_extension(str(ext_dir))
         print(
-            f"[*] 已生成本轮浏览器指纹: gpu={self.identity.gpu_renderer}, "
+            f"[*] 已生成本轮浏览器指纹: id={self.identity.canvas_seed:08x}, "
+            f"gpu={self.identity.gpu_renderer}, "
             f"cpu={self.identity.hardware_concurrency}核, mem={self.identity.device_memory}GB"
         )
 
@@ -236,13 +297,48 @@ class DrissionBrowserSession:
 
     def start(self):
         self._closed_intentionally = False
-        self._prepare_fresh_profile()
-        self._prepare_fresh_fingerprint()
-        self._browser = Chromium(self._options)
+        # set_user_data_path() disables DrissionPage's auto_port flag. Allocate
+        # and bind each browser serially so concurrent workers cannot all fall
+        # back to the default 9222 endpoint and attach to one Chrome instance.
+        with _BROWSER_START_LOCK:
+            self._prepare_fresh_profile()
+            self._prepare_fresh_fingerprint()
+            self.debug_port = _find_free_local_port()
+            self._options.set_local_port(self.debug_port)
+            print(f"[*] 已为浏览器分配独立调试端口: {self.debug_port}")
+            self._browser = Chromium(self._options)
         tabs = self._browser.get_tabs()
         # DrissionPage 的 /json tab 列表把最新 tab 放在第 0 位。
         self._page = tabs[0] if tabs else self._browser.new_tab()
+        self._apply_window_bounds()
         return self
+
+    def _apply_window_bounds(self) -> None:
+        if self._page is None or not self._window_bounds:
+            return
+        left, top, width, height = self._window_bounds
+        try:
+            window_info = self._page.run_cdp("Browser.getWindowForTarget")
+            window_id = window_info["windowId"]
+            self._page.run_cdp(
+                "Browser.setWindowBounds",
+                windowId=window_id,
+                bounds={"windowState": "normal"},
+            )
+            self._page.run_cdp(
+                "Browser.setWindowBounds",
+                windowId=window_id,
+                bounds={
+                    "left": left,
+                    "top": top,
+                    "width": width,
+                    "height": height,
+                },
+            )
+            self._page.run_cdp("Page.bringToFront")
+            print(f"[*] 浏览器窗口已平铺: x={left}, y={top}, {width}x{height}")
+        except Exception as error:
+            print(f"[警告] 通过 CDP 平铺浏览器窗口失败，将保留启动参数位置: {error}")
 
     def stop(self):
         if self._browser is not None:
@@ -252,6 +348,7 @@ class DrissionBrowserSession:
                 pass
         self._browser = None
         self._page = None
+        self.debug_port = None
         self._closed_intentionally = True
         self._cleanup_profile()
 

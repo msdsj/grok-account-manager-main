@@ -1,4 +1,4 @@
-import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   CheckCircle2,
@@ -64,6 +64,17 @@ interface FailedAccount {
   timedOut: boolean;
 }
 
+interface RegistrationWorker {
+  worker: number;
+  status: string;
+  round: number | null;
+  email: string;
+  stage: string;
+  message: string;
+  fingerprint: string;
+  updatedAt: number;
+}
+
 interface RegistrationJob {
   id: string;
   status: JobStatus;
@@ -76,10 +87,15 @@ interface RegistrationJob {
   issued: number;
   completed: number;
   failed: number;
+  registered?: number;
+  refreshTokenCompleted?: number;
+  refreshTokenFailed?: number;
   workerErrors: number;
   active: number;
+  oauthConcurrency?: number;
   roundTimeoutSeconds?: number;
   failedAccounts?: FailedAccount[];
+  workers?: RegistrationWorker[];
   startedAt: number;
   finishedAt: number | null;
   events: JobEvent[];
@@ -116,6 +132,8 @@ interface AccountRecord {
   createdAtLabel: string;
   hasRefreshToken: boolean;
   hasAccessToken: boolean;
+  oauthStatus?: string;
+  oauthError?: string;
   fileName: string;
   filePath: string;
   error?: string;
@@ -264,6 +282,39 @@ function statusTone(status?: JobStatus): string {
   return "neutral";
 }
 
+function workerStatusLabel(status: string): string {
+  switch (status) {
+    case "starting":
+      return "启动中";
+    case "ready":
+      return "已就绪";
+    case "running":
+      return "注册中";
+    case "registered":
+      return "已注册";
+    case "success":
+      return "已完成";
+    case "warning":
+      return "缺少 RT";
+    case "error":
+      return "失败";
+    case "stopped":
+      return "已停止";
+    case "idle":
+      return "空闲";
+    default:
+      return "等待中";
+  }
+}
+
+function workerStatusTone(status: string): string {
+  if (status === "success" || status === "registered") return "success";
+  if (status === "warning") return "warning";
+  if (status === "error") return "error";
+  if (status === "running" || status === "starting") return "running";
+  return "neutral";
+}
+
 export function App() {
   const [state, setState] = useState<AppState>({ job: null, accounts: [] });
   const [activeView, setActiveView] = useState<ActiveView>(() => routeForPath(window.location.pathname).id);
@@ -308,6 +359,7 @@ export function App() {
   const [imageCount, setImageCount] = useState(1);
   const [imageBusy, setImageBusy] = useState(false);
   const [generatedImages, setGeneratedImages] = useState<GeneratedImage[]>([]);
+  const stateRequestSequence = useRef(0);
 
   async function refreshQuota(accountId: string) {
     setRefreshingQuota((s) => new Set(s).add(accountId));
@@ -324,10 +376,26 @@ export function App() {
     }
   }
 
-  const refresh = useCallback(async () => {
-    const next = await apiJson<AppState>("/api/state");
-    setState(next);
+  const loadLatestState = useCallback(async () => {
+    const requestSequence = ++stateRequestSequence.current;
+    try {
+      const next = await apiJson<AppState>("/api/state");
+      if (requestSequence !== stateRequestSequence.current) return false;
+      setState(next);
+      return true;
+    } catch (requestError) {
+      if (requestSequence !== stateRequestSequence.current) return false;
+      throw requestError;
+    }
   }, []);
+
+  const refresh = useCallback(async () => {
+    try {
+      if (await loadLatestState()) setError(null);
+    } catch (refreshError) {
+      setError(String(refreshError));
+    }
+  }, [loadLatestState]);
 
   const navigateTo = useCallback((view: ActiveView) => {
     const route = routeForView(view);
@@ -339,23 +407,27 @@ export function App() {
 
   useEffect(() => {
     let alive = true;
+    let timer: number | undefined;
     const load = async () => {
       try {
-        const next = await apiJson<AppState>("/api/state");
-        if (alive) setState(next);
+        const applied = await loadLatestState();
+        if (alive && applied) setError(null);
       } catch (loadError) {
         if (alive) setError(String(loadError));
       } finally {
-        if (alive) setLoading(false);
+        if (alive) {
+          setLoading(false);
+          timer = window.setTimeout(() => void load(), 2000);
+        }
       }
     };
     void load();
-    const timer = window.setInterval(() => void load(), 2000);
     return () => {
       alive = false;
-      window.clearInterval(timer);
+      stateRequestSequence.current += 1;
+      if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, []);
+  }, [loadLatestState]);
 
   useEffect(() => {
     const onPopState = () => setActiveView(routeForPath(window.location.pathname).id);
@@ -448,6 +520,9 @@ export function App() {
   const startDisabled =
     isRunning ||
     submitting ||
+    !Number.isFinite(total) ||
+    total < 1 ||
+    total > 10000 ||
     (emailSource === "outlook" && outlookAccountCount === 0) ||
     (needsGoogleAccounts && googleAccountCount === 0);
 
@@ -478,7 +553,9 @@ export function App() {
 
   async function startRegistration(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    const safeTotal = Math.max(1, Math.min(10000, Number(total) || 1));
     const safeConcurrency = Math.max(1, Math.min(12, Number(concurrency) || 1));
+    setTotal(safeTotal);
     setConcurrency(safeConcurrency);
     setSubmitting(true);
     setError(null);
@@ -486,7 +563,7 @@ export function App() {
       const response = await apiJson<{ job: RegistrationJob }>("/api/register", {
         method: "POST",
         body: JSON.stringify({
-          total,
+          total: safeTotal,
           concurrency: safeConcurrency,
           oauthExchange,
           emailSource,
@@ -494,6 +571,7 @@ export function App() {
           googleData: needsGoogleAccounts ? googleData : "",
         }),
       });
+      stateRequestSequence.current += 1;
       setState((current) => ({ ...current, job: response.job }));
     } catch (startError) {
       setError(String(startError));
@@ -511,6 +589,7 @@ export function App() {
         method: "POST",
         body: "{}",
       });
+      stateRequestSequence.current += 1;
       setState((current) => ({ ...current, job: response.job }));
     } catch (retryError) {
       setError(String(retryError));
@@ -531,6 +610,7 @@ export function App() {
         "/api/register/stop",
         { method: "POST", body: "{}" },
       );
+      stateRequestSequence.current += 1;
       setState((current) => ({ ...current, job: response.job }));
     } catch (stopError) {
       setError(String(stopError));
@@ -952,15 +1032,44 @@ export function App() {
           </div>
           <div className="job-metrics">
             <span>已发起 {job?.issued ?? 0}</span>
-            <span>成功 {job?.completed ?? 0}</span>
-            <span>失败 {job?.failed ?? 0}</span>
+            <span>已注册 {job?.registered ?? job?.completed ?? 0}</span>
+            <span>Refresh 成功 {job?.refreshTokenCompleted ?? 0}</span>
+            <span>Refresh 失败 {job?.refreshTokenFailed ?? 0}</span>
+            <span>注册失败 {job?.failed ?? 0}</span>
             <span>活跃 {job?.active ?? 0}</span>
             <span>启动异常 {job?.workerErrors ?? 0}</span>
             <span>超时 {job?.roundTimeoutSeconds ?? 180}s</span>
+            {job?.oauthExchange && <span>OAuth 并行 {job.oauthConcurrency ?? 1}</span>}
             <span>注册方式 {formatEmailSourceLabel(job)}</span>
           </div>
         </div>
       </div>
+      {job?.workers && job.workers.length > 0 && (
+        <div className="worker-progress-block">
+          <div className="sub-panel-head">
+            <strong>并发窗口</strong>
+            <span>{job.workers.length} 个独立浏览器</span>
+          </div>
+          <div className="worker-lanes">
+            {job.workers.map((worker) => (
+              <div className="worker-lane" key={worker.worker}>
+                <div className="worker-lane-id">
+                  <strong>W{worker.worker}</strong>
+                  <span className={`status-pill ${workerStatusTone(worker.status)}`}>
+                    {workerStatusLabel(worker.status)}
+                  </span>
+                </div>
+                <div className="worker-lane-account">
+                  <strong>{worker.email ? (hideEmails ? maskEmail(worker.email) : worker.email) : "等待分配邮箱"}</strong>
+                  <span>{worker.round ? `第 ${worker.round} 轮` : "尚未领取轮次"} · {worker.stage || "waiting"}</span>
+                </div>
+                <p>{hideEmails ? maskTextEmails(worker.message || "") : worker.message}</p>
+                <code title={worker.fingerprint || "指纹生成中"}>{worker.fingerprint || "指纹生成中"}</code>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
       {failedAccounts.length > 0 && (
         <div className="failed-accounts-block">
           <div className="sub-panel-head">
@@ -1420,7 +1529,7 @@ export function App() {
                 <tr key={account.rowKey}>
                   <td className="select-col"><input type="checkbox" checked={selectedAccounts.has(account.rowKey)} aria-label={`选择 ${maskEmail(account.email)}`} onChange={() => toggleAccount(account.rowKey)} /></td>
                   <td><div className="email-cell"><strong>{hideEmails ? maskEmail(account.email) : account.email}</strong>{account.error && <span>{account.error}</span>}</div></td>
-                  <td><span className={`token-badge ${account.hasRefreshToken ? "ok" : "missing"}`}>{account.hasRefreshToken && <ShieldCheck size={13} />}{account.hasRefreshToken ? "已获取" : "缺失"}</span></td>
+                  <td><RefreshTokenBadge account={account} /></td>
                   <td><AvailabilityBadge availability={account.availability} /></td>
                   <td>{account.displayName || account.userId || "-"}</td>
                   <td>{account.planType || "-"}</td>
@@ -1772,6 +1881,20 @@ function hasImageCapability(availability?: AccountAvailability): boolean {
     availability?.imageAvailable ||
       availability?.category === "image-only" ||
       availability?.category === "chat-image",
+  );
+}
+
+function RefreshTokenBadge({ account }: { account: AccountRecord }) {
+  if (account.hasRefreshToken) {
+    return <span className="token-badge ok"><ShieldCheck size={13} />已获取</span>;
+  }
+  if (account.oauthStatus === "pending") {
+    return <span className="token-badge neutral"><Loader2 size={13} className="spin" />获取中</span>;
+  }
+  return (
+    <span className="token-badge missing" title={account.oauthError || "refresh_token 缺失"}>
+      缺失
+    </span>
   );
 }
 

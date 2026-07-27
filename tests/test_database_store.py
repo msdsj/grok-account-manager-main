@@ -1,9 +1,11 @@
 import tempfile
 import unittest
+import json
 from pathlib import Path
 
 from grok_account_manager.api.services import database as account_db
 from grok_account_manager.sinks.json_credential import JsonCredentialSink
+from grok_account_manager.sinks.txt_file import TxtFileSink
 
 
 class DatabaseStoreTests(unittest.TestCase):
@@ -92,6 +94,86 @@ class DatabaseStoreTests(unittest.TestCase):
         self.assertEqual(credentials_path.read_text(encoding="utf-8").strip().startswith("["), True)
         exported = account_db.export_credentials(["grok_credentials.json:0"])
         self.assertEqual(exported[0]["email"], "empty-file@example.com")
+
+    def test_json_sink_upgrades_sso_record_in_place(self) -> None:
+        credentials_dir = Path(self._tmpdir.name) / "credentials"
+        credentials_path = credentials_dir / "grok_credentials.json"
+
+        checkpoint_sink = JsonCredentialSink(str(credentials_dir))
+        checkpoint_sink.push(
+            "grok",
+            {
+                "email": "parallel@example.com",
+                "credential": "browser-sso",
+                "profile": {"first_name": "Parallel"},
+                "oauth_status": "not_requested",
+            },
+        )
+        checkpoint_sink.flush()
+        checkpoint = json.loads(credentials_path.read_text(encoding="utf-8"))[0]
+
+        final_sink = JsonCredentialSink(str(credentials_dir))
+        final_sink.push(
+            "grok",
+            {
+                "email": "parallel@example.com",
+                "credential": "browser-sso",
+                "oauth_status": "ready",
+                "oauth_error": "",
+                "full_credential": {
+                    "id": "replacement-id",
+                    "email": "parallel@example.com",
+                    "access_token": "oauth-access",
+                    "refresh_token": "oauth-refresh",
+                    "sso_token": "browser-sso",
+                    "auth_mode": "oauth",
+                },
+            },
+        )
+        final_sink.flush()
+
+        credentials = json.loads(credentials_path.read_text(encoding="utf-8"))
+        self.assertEqual(len(credentials), 1)
+        self.assertEqual(credentials[0]["id"], checkpoint["id"])
+        self.assertEqual(credentials[0]["refresh_token"], "oauth-refresh")
+        self.assertEqual(credentials[0]["oauth_exchange_status"], "ready")
+        self.assertIsNone(credentials[0]["oauth_exchange_error"])
+        stored_accounts = account_db.list_accounts()
+        self.assertEqual(len(stored_accounts), 1)
+        self.assertTrue(stored_accounts[0]["hasRefreshToken"])
+
+    def test_json_sink_rejects_oauth_result_without_refresh_token(self) -> None:
+        credentials_dir = Path(self._tmpdir.name) / "credentials"
+        sink = JsonCredentialSink(str(credentials_dir))
+
+        with self.assertRaisesRegex(ValueError, "refresh_token"):
+            sink.push(
+                "grok",
+                {
+                    "email": "discard@example.com",
+                    "credential": "discard-sso",
+                    "oauth_status": "failed",
+                    "oauth_error": "rate limited",
+                },
+            )
+
+        self.assertFalse((credentials_dir / "grok_credentials.json").exists())
+
+    def test_txt_sink_rejects_oauth_result_without_refresh_token(self) -> None:
+        output_path = Path(self._tmpdir.name) / "sso.txt"
+        sink = TxtFileSink(output_path)
+
+        with self.assertRaisesRegex(ValueError, "refresh_token"):
+            sink.push(
+                "grok",
+                {
+                    "email": "discard@example.com",
+                    "credential": "discard-sso",
+                    "oauth_status": "failed",
+                },
+            )
+
+        self.assertFalse(output_path.exists())
 
 
 if __name__ == "__main__":

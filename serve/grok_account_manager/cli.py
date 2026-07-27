@@ -168,6 +168,14 @@ def main() -> None:
             print(f"\n[*] 开始第 {rounds_done} 轮注册（provider={provider.name}）")
             try:
                 result = provider.run_round(session)
+                if args.oauth_exchange:
+                    full_credential = result.get("full_credential")
+                    has_refresh_token = isinstance(full_credential, dict) and bool(
+                        str(full_credential.get("refresh_token") or "").strip()
+                    )
+                    if result.get("oauth_status") != "ready" or not has_refresh_token:
+                        print("[Error] 本轮未获取 refresh_token，按配置不保存 SSO 或 JSON 凭证")
+                        continue
                 sink.push(provider.name, result)
                 print(f"[*] 本轮注册完成，邮箱: {result['email']}")
             except KeyboardInterrupt:

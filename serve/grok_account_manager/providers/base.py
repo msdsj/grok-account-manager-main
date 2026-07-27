@@ -11,6 +11,9 @@ class RegistrationResult(TypedDict, total=False):
     credential: str
     profile: dict[str, str]
     full_credential: dict[str, Any]
+    oauth_status: str
+    oauth_error: str
+    credential_enrichment_error: str
 
 
 class BrowserSession(Protocol):

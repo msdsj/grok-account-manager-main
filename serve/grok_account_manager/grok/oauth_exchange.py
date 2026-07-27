@@ -10,6 +10,7 @@ Invalid action。授权完成后轮询 token endpoint 获取 OAuth tokens。
 from __future__ import annotations
 
 import time
+from functools import lru_cache
 from typing import Callable, TypedDict
 from urllib.parse import quote, urlparse
 
@@ -72,6 +73,7 @@ def _positive_int(value, default: int, minimum: int = 1, maximum: int | None = N
     return result
 
 
+@lru_cache(maxsize=1)
 def _discover_oauth_endpoints(timeout: int = 30) -> dict[str, str | None]:
     """读取 OIDC discovery；失败时回退到 cockpit-tools 使用的已知端点。"""
     fallback: dict[str, str | None] = {
@@ -152,15 +154,21 @@ def _verification_url(device_data: dict, prefer_email_login: bool = True) -> str
     return url
 
 
-def _open_oauth_url(session, url: str):
+def _open_oauth_url(session, url: str) -> tuple[object, bool]:
     """在新 tab 打开 OAuth URL，但不要卡在页面完整加载等待上。"""
     opener = getattr(session, "open_new_tab", None)
+    opened_new_tab = False
     try:
         if callable(opener):
             page = opener()
+            opened_new_tab = True
         else:
             browser = getattr(session, "browser", None)
-            page = browser.new_tab() if browser is not None else session.refresh_page()
+            if browser is not None:
+                page = browser.new_tab()
+                opened_new_tab = True
+            else:
+                page = session.refresh_page()
         print("[OAuth Exchange] 已新开 tab 处理 device 授权")
     except Exception as e:
         print(f"[OAuth Exchange] 新开授权 tab 失败，改用当前 tab: {e}")
@@ -169,7 +177,7 @@ def _open_oauth_url(session, url: str):
     try:
         ok = page.get(url, retry=0, timeout=8)
         if ok:
-            return page
+            return page, opened_new_tab
         print("[OAuth Exchange] 授权页未在 8 秒内完成加载，继续用当前页面推进")
         try:
             page.stop_loading()
@@ -181,7 +189,7 @@ def _open_oauth_url(session, url: str):
             page.stop_loading()
         except Exception:
             pass
-    return page
+    return page, opened_new_tab
 
 
 def _page_status(session, page=None) -> str:
@@ -239,23 +247,29 @@ def exchange_sso_for_oauth_tokens(
 
             print(f"[OAuth Exchange] Device Code 已生成 ({attempt}/{max_attempts})，User Code: {user_code}")
             print(f"[OAuth Exchange] 打开授权页面: {verification_url}")
-            oauth_page = _open_oauth_url(session, verification_url)
-
-            tokens = _drive_device_authorization_and_poll(
-                session=session,
-                oauth_page=oauth_page,
-                device_code=str(device_data["device_code"]).strip(),
-                user_code=user_code,
-                token_endpoint=token_endpoint,
-                interval=interval,
-                expires_in=expires_in,
-                email=email,
-                password=password,
-                dev_token=dev_token,
-                code_getter=code_getter,
-                recovery_email=recovery_email,
-                stop_event=stop_event,
-            )
+            oauth_page, opened_new_tab = _open_oauth_url(session, verification_url)
+            try:
+                tokens = _drive_device_authorization_and_poll(
+                    session=session,
+                    oauth_page=oauth_page,
+                    device_code=str(device_data["device_code"]).strip(),
+                    user_code=user_code,
+                    token_endpoint=token_endpoint,
+                    interval=interval,
+                    expires_in=expires_in,
+                    email=email,
+                    password=password,
+                    dev_token=dev_token,
+                    code_getter=code_getter,
+                    recovery_email=recovery_email,
+                    stop_event=stop_event,
+                )
+            finally:
+                if opened_new_tab:
+                    try:
+                        oauth_page.close()
+                    except Exception:
+                        pass
             if not tokens:
                 raise RuntimeError("OAuth device 授权未完成，未返回 token")
 

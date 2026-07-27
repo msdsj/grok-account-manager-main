@@ -7,6 +7,7 @@ HTMLInputElement.prototype 原生 setter + _valueTracker 重置才能让按钮�
 
 from __future__ import annotations
 
+import random
 import secrets
 import time
 
@@ -17,7 +18,7 @@ from ..mail.sources import DuckMailSource, MailboxSource, VerificationMailbox
 from .base import RegistrationResult
 
 try:
-    from ..grok.client import fetch_complete_credential
+    from ..grok.client import build_cockpit_grok_credential, fetch_complete_credential
     from ..grok.oauth_exchange import exchange_sso_for_oauth_tokens
     GROK_API_AVAILABLE = True
 except ImportError:
@@ -37,9 +38,14 @@ class GrokProvider:
     stop_event = None  # threading.Event，用于响应停止信号
     mail_source: MailboxSource | None = None
     event_callback = None
+    result_callback = None
+    oauth_semaphore = None
+    oauth_cooldown_range = (2.0, 5.0)
 
     def run_round(self, session: DrissionBrowserSession) -> RegistrationResult:
         self.current_email = ""
+        self.registration_succeeded = False
+        self.oauth_exchange_error = ""
         self._set_stage("starting", "准备开始注册")
         if self.stop_event and self.stop_event.is_set():
             raise RuntimeError("任务已在开始前停止")
@@ -99,71 +105,105 @@ class GrokProvider:
         result: RegistrationResult = {
             "email": email,
             "credential": sso_value,
-            "profile": profile
+            "profile": profile,
+            "oauth_status": "pending" if self.enable_oauth_exchange else "not_requested",
         }
 
-        if self.enable_oauth_exchange and not (self.fetch_full_credential and GROK_API_AVAILABLE):
-            raise RuntimeError("已勾选获取 refresh_token，但 OAuth 凭证模块不可用")
+        # Registration and OAuth are two distinct outcomes. Emit an in-memory
+        # checkpoint for progress reporting; the job manager decides whether it
+        # may be persisted. When OAuth is required, only an RT-complete result
+        # is allowed onto disk.
+        self.registration_succeeded = True
+        self.checkpoint_result = dict(result)
+        self._emit_result_checkpoint(result)
 
-        # JSON 导出始终生成 cockpit-tools 可导入结构；未启用 OAuth 时使用 sso cookie。
-        # 启用 OAuth 时，refresh_token 是硬要求，避免把 null RT 账号当成成功账号保存。
+        oauth_tokens = None
+        oauth_error = ""
+        if self.enable_oauth_exchange:
+            if not (self.fetch_full_credential and GROK_API_AVAILABLE):
+                oauth_error = "OAuth 凭证模块不可用"
+            else:
+                self._set_stage("oauth_queue", "等待 refresh_token 授权名额")
+                acquired_oauth_slot = self._acquire_oauth_slot()
+                try:
+                    self._set_stage("oauth_exchange", "正在换取 OAuth refresh_token")
+                    oauth_password = profile.get("password")
+                    oauth_recovery_email = None
+                    if registration_mode == "google":
+                        oauth_password = str(getattr(mailbox, "password", "") or "").strip() or None
+                        oauth_recovery_email = str(getattr(mailbox, "recovery_email", "") or "").strip() or None
+
+                    oauth_error = "未知错误"
+                    max_oauth_attempts = 2
+                    for attempt in range(1, max_oauth_attempts + 1):
+                        if self.stop_event and self.stop_event.is_set():
+                            raise RuntimeError("任务已停止")
+                        try:
+                            print(
+                                "[Grok] 尝试通过 xAI Device Flow 换取 OAuth tokens... "
+                                f"({attempt}/{max_oauth_attempts})"
+                            )
+                            candidate_tokens = exchange_sso_for_oauth_tokens(
+                                session,
+                                email=email,
+                                password=oauth_password,
+                                code_getter=lambda: mailbox.wait_for_code(
+                                    timeout=180,
+                                    stop_event=self.stop_event,
+                                ),
+                                recovery_email=oauth_recovery_email,
+                                prefer_google_login=registration_mode == "google",
+                                stop_event=self.stop_event,
+                            )
+                            if (
+                                candidate_tokens
+                                and candidate_tokens.get("access_token")
+                                and candidate_tokens.get("refresh_token")
+                            ):
+                                oauth_tokens = candidate_tokens
+                                oauth_error = ""
+                                print("[Grok] 已获取 OAuth refresh_token")
+                                break
+                            if candidate_tokens and not candidate_tokens.get("access_token"):
+                                oauth_error = "OAuth token 响应没有 access_token"
+                            elif candidate_tokens and not candidate_tokens.get("refresh_token"):
+                                oauth_error = "OAuth token 响应没有 refresh_token"
+                            else:
+                                oauth_error = "OAuth exchange 未返回 token"
+                            print(f"[Grok] {oauth_error}")
+                        except Exception as error:
+                            if self.stop_event and self.stop_event.is_set():
+                                raise
+                            oauth_error = str(error)
+                            print(f"[Grok] OAuth exchange 失败: {error}")
+                        if attempt < max_oauth_attempts:
+                            retry_delay = random.uniform(5.0, 12.0)
+                            print(f"[Grok] {retry_delay:.1f}s 后重试 OAuth exchange...")
+                            self._interruptible_sleep(retry_delay)
+                finally:
+                    if acquired_oauth_slot:
+                        self._oauth_cooldown()
+                        self.oauth_semaphore.release()
+
+            if oauth_tokens:
+                result["oauth_status"] = "ready"
+                result["oauth_error"] = ""
+            else:
+                result["oauth_status"] = "failed"
+                result["oauth_error"] = oauth_error or "未获取到 refresh_token"
+                self.oauth_exchange_error = result["oauth_error"]
+                self._log(
+                    "warning",
+                    f"账号已注册，但 refresh_token 获取失败，本轮凭证不保存：{result['oauth_error']}",
+                    stage="oauth_exchange",
+                )
+
         if self.fetch_full_credential and GROK_API_AVAILABLE:
             if self.stop_event and self.stop_event.is_set():
                 raise RuntimeError("任务已停止")
-
-            oauth_tokens = None
-            if self.enable_oauth_exchange:
-                self._set_stage("oauth_exchange", "正在换取 OAuth refresh_token")
-                oauth_password = profile.get("password")
-                oauth_recovery_email = None
-                if registration_mode == "google":
-                    oauth_password = str(getattr(mailbox, "password", "") or "").strip() or None
-                    oauth_recovery_email = str(getattr(mailbox, "recovery_email", "") or "").strip() or None
-
-                oauth_error = "未知错误"
-                max_oauth_attempts = 2
-                for attempt in range(1, max_oauth_attempts + 1):
-                    if self.stop_event and self.stop_event.is_set():
-                        raise RuntimeError("任务已停止")
-                    try:
-                        print(f"[Grok] 尝试通过 xAI Device Flow 换取 OAuth tokens... ({attempt}/{max_oauth_attempts})")
-                        candidate_tokens = exchange_sso_for_oauth_tokens(
-                            session,
-                            email=email,
-                            password=oauth_password,
-                            code_getter=lambda: mailbox.wait_for_code(timeout=180, stop_event=self.stop_event),
-                            recovery_email=oauth_recovery_email,
-                            prefer_google_login=registration_mode == "google",
-                            stop_event=self.stop_event,
-                        )
-                        if candidate_tokens and candidate_tokens.get("access_token") and candidate_tokens.get("refresh_token"):
-                            oauth_tokens = candidate_tokens
-                            print("[Grok] 已获取 OAuth refresh_token")
-                            break
-                        if candidate_tokens and not candidate_tokens.get("access_token"):
-                            oauth_error = "OAuth token 响应没有 access_token"
-                        elif candidate_tokens and not candidate_tokens.get("refresh_token"):
-                            oauth_error = "OAuth token 响应没有 refresh_token"
-                        else:
-                            oauth_error = "OAuth exchange 未返回 token"
-                        print(f"[Grok] {oauth_error}")
-                    except Exception as e:
-                        oauth_error = str(e)
-                        print(f"[Grok] OAuth exchange 失败: {e}")
-                    if attempt < max_oauth_attempts:
-                        print("[Grok] 准备重试 OAuth exchange...")
-                        time.sleep(2)
-
-                if not oauth_tokens:
-                    raise RuntimeError(f"已勾选获取 refresh_token，但未成功获取：{oauth_error}")
-
+            self._set_stage("fetch_credential", "正在生成完整 JSON 凭证")
             try:
-                if self.stop_event and self.stop_event.is_set():
-                    raise RuntimeError("任务已停止")
-
-                self._set_stage("fetch_credential", "正在生成完整 JSON 凭证")
                 if oauth_tokens:
-                    print(f"[Grok] 成功获取 OAuth tokens，现在获取完整凭证...")
                     full_credential = fetch_complete_credential(
                         email=email,
                         sso_token=oauth_tokens["access_token"],
@@ -171,26 +211,76 @@ class GrokProvider:
                         oauth_tokens=oauth_tokens,
                     )
                 else:
-                    print(f"[Grok] 跳过 OAuth exchange，使用 sso cookie 生成 JSON 凭证")
                     full_credential = fetch_complete_credential(
                         email=email,
                         sso_token=sso_value,
-                        profile=profile
+                        profile=profile,
                     )
-                # grok2api's reverse transport authenticates with the browser
-                # sso cookie, so keep it even when OAuth exchange also succeeds.
-                full_credential["sso_token"] = sso_value
-                if self.enable_oauth_exchange and not full_credential.get("refresh_token"):
-                    raise RuntimeError("完整 JSON 凭证缺少 refresh_token")
-                result["full_credential"] = full_credential
-                print(f"[Grok] 成功生成 JSON 凭证 (user_id: {full_credential.get('user_id', 'N/A')})")
-            except Exception as e:
-                if self.enable_oauth_exchange:
-                    raise RuntimeError(f"已获取 refresh_token，但生成完整 JSON 凭证失败：{e}") from e
-                print(f"[Grok] 获取完整凭证失败，将由 json sink 兜底生成基础 JSON: {e}")
+            except Exception as error:
+                result["credential_enrichment_error"] = str(error)
+                full_credential = build_cockpit_grok_credential(
+                    email=email,
+                    access_token=oauth_tokens["access_token"] if oauth_tokens else sso_value,
+                    profile=profile,
+                    oauth_tokens=oauth_tokens,
+                )
+                self._log(
+                    "warning",
+                    f"完整账号信息补全失败，已保存基础凭证：{error}",
+                    stage="fetch_credential",
+                )
 
-        self._set_stage("done", "本轮注册完成")
+            # grok2api authenticates with the browser SSO cookie, so retain it
+            # even when the OAuth exchange also succeeded.
+            full_credential["sso_token"] = sso_value
+            full_credential["oauth_exchange_status"] = result["oauth_status"]
+            full_credential["oauth_exchange_error"] = result.get("oauth_error") or None
+            full_credential["credential_enrichment_error"] = result.get("credential_enrichment_error") or None
+            result["full_credential"] = full_credential
+            print(f"[Grok] 成功生成 JSON 凭证 (user_id: {full_credential.get('user_id', 'N/A')})")
+
+        done_message = "本轮注册完成"
+        if result.get("oauth_status") == "failed":
+            done_message += "，refresh_token 缺失，凭证不保留"
+        self._set_stage("done", done_message)
         return result
+
+    def _emit_result_checkpoint(self, result: RegistrationResult) -> None:
+        callback = self.result_callback
+        if callback is None:
+            return
+        try:
+            callback(dict(result))
+        except Exception as error:
+            raise RuntimeError(f"账号已注册，但基础凭证保存失败：{error}") from error
+
+    def _acquire_oauth_slot(self) -> bool:
+        semaphore = self.oauth_semaphore
+        if semaphore is None:
+            return False
+        announced = False
+        while not semaphore.acquire(timeout=0.5):
+            if self.stop_event and self.stop_event.is_set():
+                raise RuntimeError("任务已停止")
+            if not announced:
+                self._log("info", "其他窗口正在获取 refresh_token，本窗口排队等待", stage="oauth_queue")
+                announced = True
+        return True
+
+    def _interruptible_sleep(self, seconds: float) -> None:
+        deadline = time.monotonic() + max(0.0, seconds)
+        while time.monotonic() < deadline:
+            if self.stop_event and self.stop_event.is_set():
+                raise RuntimeError("任务已停止")
+            time.sleep(min(0.2, max(0.0, deadline - time.monotonic())))
+
+    def _oauth_cooldown(self) -> None:
+        minimum, maximum = self.oauth_cooldown_range
+        delay = random.uniform(float(minimum), float(maximum))
+        try:
+            self._interruptible_sleep(delay)
+        except RuntimeError:
+            return
 
     def _set_stage(self, stage: str, message: str | None = None) -> None:
         self.current_stage = stage

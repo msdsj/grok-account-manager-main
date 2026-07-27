@@ -119,6 +119,15 @@ npm run dev
 
 打开 `http://127.0.0.1:5173`。前端开发服务器会把 `/api`、`/v1` 和 `/admin/api` 代理到 FastAPI 后端。
 
+并发注册时每个 worker 使用独立临时 Chrome profile、独立调试端口和独立的稳定浏览器指纹，窗口会错峰启动。注册页面可按所选并发数同时运行；为降低同一出口 IP 对 xAI Device OAuth 的突发限速，`refresh_token` 阶段默认最多同时运行 2 个窗口，其余窗口会在各自浏览器中排队：
+
+```bash
+GROK_ACCOUNT_MANAGER_MAX_CONCURRENCY=20
+GROK_ACCOUNT_MANAGER_MAX_OAUTH_CONCURRENCY=2
+```
+
+浏览器 profile 和指纹隔离不能改变所有窗口共享本机出口 IP 的事实，不能保证绕过平台风控。勾选“获取 refresh_token”时，只有拿到有效 RT 的账号才会写入 `sso.txt`、`grok_credentials.json` 和账号数据库；OAuth 失败或超时的账号只记录任务失败原因，不保留凭证。未勾选时仍按 SSO 模式保存。
+
 生产模式可先构建前端：
 
 ```bash
