@@ -54,7 +54,7 @@ def create_app() -> FastAPI:
 
     @app.on_event("shutdown")
     def shutdown_services() -> None:
-        JOB_MANAGER.stop()
+        JOB_MANAGER.stop(wait=True, timeout=12)
         RELAY_MANAGER.stop()
 
     @app.get("/{request_path:path}", include_in_schema=False, response_model=None)

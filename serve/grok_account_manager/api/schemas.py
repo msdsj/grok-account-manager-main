@@ -11,6 +11,7 @@ class RegisterRequest(BaseModel):
     total: int = 1
     concurrency: int = 1
     oauthExchange: bool = True
+    minimizeBrowsers: bool = True
     emailSource: str = "duckmail"
     outlookData: str = ""
     outlookAccountsFile: str = ""

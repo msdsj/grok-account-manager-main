@@ -782,6 +782,24 @@ textarea:focus-visible {
   font-size: 14px;
 }
 
+.window-controls {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.window-controls .small-icon-btn {
+  width: 32px;
+  height: 32px;
+  min-width: 32px;
+  border-radius: 8px;
+}
+
+.window-controls strong {
+  min-width: 48px;
+  text-align: right;
+}
+
 .progress-track {
   height: 8px;
   background: rgba(137, 157, 190, 0.18);

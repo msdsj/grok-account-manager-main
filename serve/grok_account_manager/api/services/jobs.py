@@ -20,6 +20,7 @@ from ..config import (
     CREDENTIALS_DIR,
     DEFAULT_MAX_CONCURRENCY,
     DEFAULT_MAX_OAUTH_CONCURRENCY,
+    DEFAULT_OAUTH_ACCESS_DENIED_CIRCUIT_THRESHOLD,
     OAUTH_ROUND_TIMEOUT_SECONDS,
     REGISTRATION_ROUND_TIMEOUT_SECONDS,
     ROUND_PACING_MAX_SECONDS,
@@ -33,11 +34,12 @@ from .accounts import invalidate_accounts_cache
 
 
 def _fingerprint_summary(session: DrissionBrowserSession) -> str:
+    isolation = str(getattr(session, "isolation_summary", "") or "").strip()
     identity = getattr(session, "identity", None)
     if identity is None:
-        return ""
+        return f"（{isolation}）" if isolation else ""
     return (
-        f"（指纹 ID {identity.canvas_seed:08x}：{identity.gpu_renderer}，"
+        f"（{isolation}；指纹 ID {identity.canvas_seed:08x}：{identity.gpu_renderer}，"
         f"{identity.hardware_concurrency} 核，{identity.device_memory}GB 内存）"
     )
 
@@ -46,6 +48,15 @@ def _result_has_refresh_token(result: dict) -> bool:
     credential = result.get("full_credential")
     return isinstance(credential, dict) and bool(
         str(credential.get("refresh_token") or "").strip()
+    )
+
+
+def _is_oauth_access_denied(error: str) -> bool:
+    normalized = " ".join(str(error or "").strip().lower().split())
+    return (
+        "access_denied" in normalized
+        or "access denied" in normalized
+        or "授权已被拒绝" in normalized
     )
 
 
@@ -86,6 +97,7 @@ class RegistrationJobManager:
             total=1,
             concurrency=1,
             oauth_exchange=cfg.get("oauth_exchange", True),
+            minimize_browsers=cfg.get("minimize_browsers", True),
             email_source=cfg.get("email_source", "duckmail"),
             outlook_data=cfg.get("outlook_data", ""),
             outlook_accounts_file=cfg.get("outlook_accounts_file", ""),
@@ -98,6 +110,7 @@ class RegistrationJobManager:
         total: int,
         concurrency: int,
         oauth_exchange: bool,
+        minimize_browsers: bool = True,
         email_source: str = "duckmail",
         outlook_data: str = "",
         outlook_accounts_file: str = "",
@@ -149,6 +162,7 @@ class RegistrationJobManager:
 
             self._last_config = {
                 "oauth_exchange": bool(oauth_exchange),
+                "minimize_browsers": bool(minimize_browsers),
                 "email_source": email_source,
                 "outlook_data": outlook_data,
                 "outlook_accounts_file": outlook_accounts_file,
@@ -166,6 +180,7 @@ class RegistrationJobManager:
                 "total": total,
                 "concurrency": concurrency,
                 "oauthExchange": bool(oauth_exchange),
+                "windowsMinimized": bool(minimize_browsers),
                 "emailSource": getattr(mail_source, "name", email_source),
                 "outlookAccountCount": getattr(mail_source, "count", 0)
                 if getattr(mail_source, "name", "") == "outlook"
@@ -179,6 +194,10 @@ class RegistrationJobManager:
                 "registered": 0,
                 "refreshTokenCompleted": 0,
                 "refreshTokenFailed": 0,
+                "oauthAccessDeniedStreak": 0,
+                "oauthCircuitOpen": False,
+                "oauthCircuitReason": "",
+                "oauthCircuitThreshold": DEFAULT_OAUTH_ACCESS_DENIED_CIRCUIT_THRESHOLD,
                 "workerErrors": 0,
                 "active": 0,
                 "oauthConcurrency": oauth_concurrency,
@@ -235,7 +254,7 @@ class RegistrationJobManager:
             self._thread.start()
             return self.snapshot() or {}
 
-    def stop(self) -> dict | None:
+    def stop(self, *, wait: bool = False, timeout: float = 10.0) -> dict | None:
         with self._lock:
             sessions_to_close: list[DrissionBrowserSession] = []
             if self._job and self._job.get("status") in {"running", "stopping"}:
@@ -244,9 +263,33 @@ class RegistrationJobManager:
                 self._stop_event.set()
                 sessions_to_close = list(self._sessions)
             snapshot = self.snapshot()
+            job_thread = self._thread
         if sessions_to_close:
-            self._close_sessions(sessions_to_close)
-        return snapshot
+            for session in sessions_to_close:
+                try:
+                    session.request_stop()
+                except Exception:
+                    pass
+            if wait:
+                self._close_sessions(sessions_to_close)
+            else:
+                self._close_sessions_async(sessions_to_close)
+        if (
+            wait
+            and job_thread is not None
+            and job_thread is not threading.current_thread()
+            and job_thread.is_alive()
+        ):
+            job_thread.join(timeout=max(0.0, timeout))
+            with self._lock:
+                remaining_sessions = list(self._sessions)
+            if remaining_sessions:
+                self._close_sessions(remaining_sessions)
+        return self.snapshot() if wait else snapshot
+
+    def _close_sessions_async(self, sessions: list[DrissionBrowserSession]) -> None:
+        for session in sessions:
+            threading.Thread(target=session.stop, daemon=True).start()
 
     def _close_sessions(self, sessions: list[DrissionBrowserSession]) -> None:
         def _close_one(session: DrissionBrowserSession) -> None:
@@ -260,6 +303,38 @@ class RegistrationJobManager:
             thread.start()
         for thread in threads:
             thread.join(timeout=5)
+
+    def set_windows_minimized(self, minimized: bool) -> dict:
+        with self._lock:
+            if self._job is None or self._job.get("status") not in {"running", "stopping"}:
+                raise RuntimeError("当前没有运行中的注册任务")
+            sessions = list(self._sessions)
+            self._job["windowsMinimized"] = bool(minimized)
+
+        changed = 0
+        pending = 0
+        errors: list[str] = []
+        for session in sessions:
+            try:
+                if session.set_window_minimized(minimized):
+                    changed += 1
+                else:
+                    pending += 1
+            except Exception as error:
+                errors.append(str(error))
+
+        action = "最小化" if minimized else "恢复"
+        level = "warning" if errors else "info"
+        self._event(
+            level,
+            f"已请求{action}全部浏览器：立即生效 {changed}，启动中 {pending}，失败 {len(errors)}",
+        )
+        return {
+            "job": self.snapshot(),
+            "changed": changed,
+            "pending": pending,
+            "errors": errors,
+        }
 
     def _register_session(self, session: DrissionBrowserSession) -> None:
         with self._lock:
@@ -416,15 +491,37 @@ class RegistrationJobManager:
             )
             if item is None:
                 return
-            if not item.get("oauthFinalized"):
+            newly_finalized = not item.get("oauthFinalized")
+            if newly_finalized:
                 if oauth_status == "ready":
                     self._job["refreshTokenCompleted"] = (
                         int(self._job.get("refreshTokenCompleted") or 0) + 1
                     )
+                    self._job["oauthAccessDeniedStreak"] = 0
                 elif oauth_status == "failed":
                     self._job["refreshTokenFailed"] = (
                         int(self._job.get("refreshTokenFailed") or 0) + 1
                     )
+                    if _is_oauth_access_denied(oauth_error):
+                        streak = int(self._job.get("oauthAccessDeniedStreak") or 0) + 1
+                        self._job["oauthAccessDeniedStreak"] = streak
+                        threshold = int(
+                            self._job.get("oauthCircuitThreshold")
+                            or DEFAULT_OAUTH_ACCESS_DENIED_CIRCUIT_THRESHOLD
+                        )
+                        if streak >= threshold and not self._job.get("oauthCircuitOpen"):
+                            reason = (
+                                f"连续 {streak} 个账号被 xAI OAuth 服务端拒绝授权，"
+                                "已停止剩余任务，避免继续消耗邮箱"
+                            )
+                            self._job["oauthCircuitOpen"] = True
+                            self._job["oauthCircuitReason"] = reason
+                            if self._job.get("status") == "running":
+                                self._job["status"] = "stopping"
+                            self._stop_event.set()
+                            self._event_locked("warning", reason, stage="oauth_circuit_open")
+                    else:
+                        self._job["oauthAccessDeniedStreak"] = 0
             item.update(
                 {
                     "oauthStatus": oauth_status,
@@ -437,7 +534,11 @@ class RegistrationJobManager:
             worker_message = (
                 "账号与 refresh_token 已保存"
                 if oauth_status == "ready"
-                else "refresh_token 获取失败，凭证未保存"
+                else (
+                    f"refresh_token 获取失败，凭证未保存：{oauth_error}"
+                    if oauth_error
+                    else "refresh_token 获取失败，凭证未保存"
+                )
                 if oauth_status == "failed"
                 else "账号已保存"
             )
@@ -611,20 +712,26 @@ class RegistrationJobManager:
     def _start_worker_session(self, worker_index: int, chrome_lang: str = "zh-CN") -> DrissionBrowserSession:
         with self._lock:
             window_count = int((self._job or {}).get("concurrency") or 1)
+            minimize_browser = bool((self._job or {}).get("windowsMinimized", True))
         session = DrissionBrowserSession(
             build_chromium_options(
                 chrome_lang,
                 headless=False,
                 window_index=worker_index - 1,
                 window_count=window_count,
+                start_minimized=minimize_browser,
             )
         )
+        self._register_session(session)
         try:
+            with self._lock:
+                minimize_browser = bool((self._job or {}).get("windowsMinimized", True))
+            session.set_window_minimized(minimize_browser, apply_now=False)
             session.start()
         except Exception:
             session.stop()
+            self._unregister_session(session)
             raise
-        self._register_session(session)
         return session
 
     def _run_round_with_timeout(
@@ -634,6 +741,7 @@ class RegistrationJobManager:
         timeout_seconds: int,
         worker_index: int,
         round_index: int,
+        round_stop_event: threading.Event,
     ) -> tuple[str, dict | BaseException | None]:
         result_queue: queue.Queue[tuple[str, dict | BaseException | None]] = queue.Queue(maxsize=1)
 
@@ -678,6 +786,8 @@ class RegistrationJobManager:
                 )
                 last_heartbeat = now
         if thread.is_alive():
+            round_stop_event.set()
+            thread.join(timeout=3)
             return "timeout", None
         try:
             return result_queue.get_nowait()
@@ -787,6 +897,7 @@ class RegistrationJobManager:
                         round_timeout_seconds,
                         worker_index,
                         round_index,
+                        round_stop_event,
                     )
                     if status == "timeout":
                         round_stop_event.set()

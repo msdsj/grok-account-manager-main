@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import secrets
 import shutil
 import socket
 import subprocess
@@ -12,6 +13,7 @@ import threading
 import time
 from pathlib import Path
 
+import psutil
 from DrissionPage import Chromium, ChromiumOptions
 from DrissionPage.errors import PageDisconnectedError
 
@@ -20,7 +22,173 @@ from . import fingerprint as fingerprint_mod
 # 项目根目录（三层上：serve/grok_account_manager/core/browser.py → 项目根）
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 TURNSTILE_EXTENSION_PATH = str(PROJECT_ROOT / "extensions" / "turnstile_patch")
-_BROWSER_START_LOCK = threading.Lock()
+_BROWSER_START_LOCK = threading.RLock()
+_ACTIVE_PROFILE_PATHS: set[str] = set()
+_ACTIVE_CACHE_PATHS: set[str] = set()
+_ACTIVE_DEBUG_PORTS: set[int] = set()
+_ACTIVE_BROWSER_PIDS: set[int] = set()
+_STALE_TEMP_PATHS: set[str] = set()
+
+
+def _path_key(path: str | Path) -> str:
+    return os.path.normcase(os.path.realpath(os.fspath(path)))
+
+
+def _command_path_argument(arguments: list[str], name: str) -> str:
+    prefix = f"{name}="
+    for argument in arguments:
+        if argument.startswith(prefix):
+            return argument[len(prefix):]
+    return ""
+
+
+def _validate_browser_isolation(
+    *,
+    profile_dir: Path,
+    cache_dir: Path,
+    debug_port: int,
+    browser_address: str,
+    browser_user_data_path: str,
+    browser_pid: int,
+    browser_command: list[str],
+) -> None:
+    """Fail closed unless Chrome is using the exact isolated resources we assigned."""
+    problems: list[str] = []
+    expected_address = f"127.0.0.1:{debug_port}"
+    if browser_address.replace("localhost", "127.0.0.1") != expected_address:
+        problems.append(f"调试地址不匹配（实际 {browser_address}，预期 {expected_address}）")
+
+    expected_profile = _path_key(profile_dir)
+    expected_cache = _path_key(cache_dir)
+    if expected_profile == expected_cache:
+        problems.append("Profile 与缓存目录发生复用")
+    if not profile_dir.is_dir() or profile_dir.is_symlink():
+        problems.append("Profile 目录不存在或不是独立实体目录")
+    if not cache_dir.is_dir() or cache_dir.is_symlink():
+        problems.append("缓存目录不存在或不是独立实体目录")
+
+    reported_profile = _path_key(browser_user_data_path) if browser_user_data_path else ""
+    command_profile = _command_path_argument(browser_command, "--user-data-dir")
+    command_cache = _command_path_argument(browser_command, "--disk-cache-dir")
+    command_port = _command_path_argument(browser_command, "--remote-debugging-port")
+    if reported_profile != expected_profile:
+        problems.append("DrissionPage 连接的 Profile 与本轮分配目录不一致")
+    if not command_profile or _path_key(command_profile) != expected_profile:
+        problems.append("Chrome 主进程未使用本轮独立 Profile")
+    if not command_cache or _path_key(command_cache) != expected_cache:
+        problems.append("Chrome 主进程未使用本轮独立缓存目录")
+    if command_port != str(debug_port):
+        problems.append("Chrome 主进程未使用本轮独立调试端口")
+    if "--incognito" not in browser_command:
+        problems.append("Chrome 主进程未启用独立无痕上下文")
+    if browser_pid <= 0:
+        problems.append("无法取得 Chrome 主进程 PID")
+
+    if problems:
+        raise RuntimeError("浏览器隔离校验失败：" + "；".join(problems))
+
+
+def _remove_temp_tree(path: Path) -> None:
+    """Remove a Chrome temp tree after the process has released file handles."""
+    path_key = _path_key(path)
+    for attempt in range(5):
+        if not path.exists():
+            with _BROWSER_START_LOCK:
+                _STALE_TEMP_PATHS.discard(path_key)
+            return
+        try:
+            shutil.rmtree(path)
+        except FileNotFoundError:
+            with _BROWSER_START_LOCK:
+                _STALE_TEMP_PATHS.discard(path_key)
+            return
+        except Exception:
+            if attempt == 4:
+                break
+        time.sleep(0.15 * (attempt + 1))
+    if path.exists():
+        with _BROWSER_START_LOCK:
+            _STALE_TEMP_PATHS.add(path_key)
+        print(f"[警告] 浏览器临时目录仍被占用，未能清理: {path}")
+
+
+def _retry_stale_temp_cleanup() -> None:
+    with _BROWSER_START_LOCK:
+        stale_paths = tuple(_STALE_TEMP_PATHS)
+    temp_root = _path_key(tempfile.gettempdir())
+    for raw_path in stale_paths:
+        path = Path(raw_path)
+        if _path_key(path.parent) != temp_root or not path.name.startswith("grok-chrome-"):
+            continue
+        _remove_temp_tree(path)
+
+
+def _find_owned_browser_process(
+    profile_dir: Path,
+    cache_dir: Path,
+    debug_port: int,
+) -> tuple[psutil.Process, list[str]] | None:
+    """Find one Chrome process only when all three assigned resources match exactly."""
+    expected_profile = _path_key(profile_dir)
+    expected_cache = _path_key(cache_dir)
+    matches: list[tuple[psutil.Process, list[str]]] = []
+    for process in psutil.process_iter(["pid", "cmdline"]):
+        try:
+            command = list(process.info.get("cmdline") or [])
+            command_profile = _command_path_argument(command, "--user-data-dir")
+            command_cache = _command_path_argument(command, "--disk-cache-dir")
+            command_port = _command_path_argument(command, "--remote-debugging-port")
+            if (
+                command_profile
+                and command_cache
+                and _path_key(command_profile) == expected_profile
+                and _path_key(command_cache) == expected_cache
+                and command_port == str(debug_port)
+            ):
+                matches.append((process, command))
+        except (psutil.AccessDenied, psutil.NoSuchProcess, ValueError):
+            continue
+    if len(matches) > 1:
+        raise RuntimeError("浏览器隔离校验失败：同一环境匹配到多个 Chrome 主进程")
+    return matches[0] if matches else None
+
+
+def _stop_owned_browser_process(process_id: int | None, create_time: float | None) -> None:
+    """Ensure only the verified Chrome process tree is gone before deleting its profile."""
+    if not process_id:
+        return
+    try:
+        process = psutil.Process(process_id)
+        if create_time is not None and abs(process.create_time() - create_time) > 0.01:
+            return
+        process.wait(timeout=2)
+        return
+    except psutil.NoSuchProcess:
+        return
+    except psutil.TimeoutExpired:
+        pass
+    except Exception as error:
+        print(f"[警告] 等待 Chrome 主进程退出失败: PID {process_id} ({error})")
+        return
+
+    try:
+        processes = [*process.children(recursive=True), process]
+        for item in processes:
+            try:
+                item.terminate()
+            except psutil.NoSuchProcess:
+                pass
+        _gone, alive = psutil.wait_procs(processes, timeout=2)
+        for item in alive:
+            try:
+                item.kill()
+            except psutil.NoSuchProcess:
+                pass
+        psutil.wait_procs(alive, timeout=1)
+    except psutil.NoSuchProcess:
+        return
+    except Exception as error:
+        print(f"[警告] 清理 Chrome 进程树失败: PID {process_id} ({error})")
 
 
 def _find_free_local_port() -> int:
@@ -155,6 +323,7 @@ def build_chromium_options(
     headless: bool = False,
     window_index: int = 0,
     window_count: int = 1,
+    start_minimized: bool = False,
 ) -> ChromiumOptions:
     """构造启动参数：自动端口、Turnstile 扩展、强制语言。
 
@@ -188,7 +357,10 @@ def build_chromium_options(
     )
     co.set_argument(f"--window-size={window_width},{window_height}")
     co.set_argument(f"--window-position={left},{top}")
+    if start_minimized and not headless:
+        co.set_argument("--start-minimized")
     co._grok_window_bounds = (left, top, window_width, window_height)
+    co._grok_start_minimized = bool(start_minimized)
 
     co.set_timeouts(base=1)
     co.set_argument(f"--lang={lang}")
@@ -249,20 +421,57 @@ class DrissionBrowserSession:
         self._profile_dir: Path | None = None
         self._cache_dir: Path | None = None
         self._fingerprint_ext_dir: Path | None = None
+        self._profile_claimed = False
+        self._cache_claimed = False
         self.identity: fingerprint_mod.BrowserIdentity | None = None
         self.debug_port: int | None = None
+        self.browser_pid: int | None = None
+        self.browser_context_id = ""
+        self.environment_id = ""
+        self.environment_generation = 0
+        self.isolation_verified = False
+        self._owns_browser_process = False
+        self._browser_process_create_time: float | None = None
+        self._lifecycle_lock = threading.RLock()
+        self._stop_requested = False
         self._closed_intentionally = False
+        self._minimize_on_start = bool(getattr(options, "_grok_start_minimized", False))
         self._window_bounds = getattr(options, "_grok_window_bounds", None)
+        self._window_lock = threading.RLock()
 
     def _prepare_fresh_profile(self) -> None:
         self._cleanup_profile()
-        profile_dir = Path(tempfile.mkdtemp(prefix="grok-chrome-profile-"))
-        cache_dir = Path(tempfile.mkdtemp(prefix="grok-chrome-cache-"))
-        self._options.set_user_data_path(str(profile_dir))
-        self._options.set_cache_path(str(cache_dir))
-        self._profile_dir = profile_dir
-        self._cache_dir = cache_dir
-        print(f"[*] 已创建全新浏览器 profile: {profile_dir}")
+        _retry_stale_temp_cleanup()
+        try:
+            profile_dir = Path(tempfile.mkdtemp(prefix="grok-chrome-profile-"))
+            self._profile_dir = profile_dir
+            cache_dir = Path(tempfile.mkdtemp(prefix="grok-chrome-cache-"))
+            self._cache_dir = cache_dir
+            profile_dir.chmod(0o700)
+            cache_dir.chmod(0o700)
+            profile_key = _path_key(profile_dir)
+            cache_key = _path_key(cache_dir)
+            if (
+                profile_key in _ACTIVE_PROFILE_PATHS
+                or cache_key in _ACTIVE_CACHE_PATHS
+                or profile_key == cache_key
+            ):
+                raise RuntimeError("无法分配唯一浏览器 Profile 和缓存目录")
+            _ACTIVE_PROFILE_PATHS.add(profile_key)
+            _ACTIVE_CACHE_PATHS.add(cache_key)
+            self._profile_claimed = True
+            self._cache_claimed = True
+            self._options.set_user_data_path(str(profile_dir))
+            self._options.set_cache_path(str(cache_dir))
+            self.environment_generation += 1
+            self.environment_id = secrets.token_hex(6)
+            print(
+                f"[*] 已创建全新浏览器环境: id={self.environment_id}, "
+                f"profile={profile_dir}"
+            )
+        except Exception:
+            self._cleanup_profile()
+            raise
 
     def _prepare_fresh_fingerprint(self) -> None:
         """每轮生成一套新的随机浏览器指纹身份，用同名扩展重新加载给 Chromium。"""
@@ -270,13 +479,20 @@ class DrissionBrowserSession:
             shutil.rmtree(self._fingerprint_ext_dir, ignore_errors=True)
             self._fingerprint_ext_dir = None
         self.identity = fingerprint_mod.random_identity()
-        ext_dir = Path(tempfile.mkdtemp(prefix="grok-chrome-fp-"))
-        for filename, content in fingerprint_mod.build_fingerprint_extension_files(self.identity).items():
-            (ext_dir / filename).write_text(content, encoding="utf-8")
-        self._fingerprint_ext_dir = ext_dir
-        self._options.remove_extensions()
-        self._options.add_extension(TURNSTILE_EXTENSION_PATH)
-        self._options.add_extension(str(ext_dir))
+        try:
+            ext_dir = Path(tempfile.mkdtemp(prefix="grok-chrome-fp-"))
+            self._fingerprint_ext_dir = ext_dir
+            ext_dir.chmod(0o700)
+            for filename, content in fingerprint_mod.build_fingerprint_extension_files(self.identity).items():
+                (ext_dir / filename).write_text(content, encoding="utf-8")
+            self._options.remove_extensions()
+            self._options.add_extension(TURNSTILE_EXTENSION_PATH)
+            self._options.add_extension(str(ext_dir))
+        except Exception:
+            if self._fingerprint_ext_dir is not None:
+                _remove_temp_tree(self._fingerprint_ext_dir)
+                self._fingerprint_ext_dir = None
+            raise
         print(
             f"[*] 已生成本轮浏览器指纹: id={self.identity.canvas_seed:08x}, "
             f"gpu={self.identity.gpu_renderer}, "
@@ -284,47 +500,189 @@ class DrissionBrowserSession:
         )
 
     def _cleanup_profile(self) -> None:
-        for path in (self._profile_dir, self._cache_dir, self._fingerprint_ext_dir):
-            if not path:
-                continue
-            try:
-                shutil.rmtree(path, ignore_errors=True)
-            except Exception as error:
-                print(f"[警告] 清理浏览器临时目录失败: {path} ({error})")
+        paths = tuple(
+            path
+            for path in (self._profile_dir, self._cache_dir, self._fingerprint_ext_dir)
+            if path is not None
+        )
+        with _BROWSER_START_LOCK:
+            if self._profile_dir is not None and self._profile_claimed:
+                _ACTIVE_PROFILE_PATHS.discard(_path_key(self._profile_dir))
+            if self._cache_dir is not None and self._cache_claimed:
+                _ACTIVE_CACHE_PATHS.discard(_path_key(self._cache_dir))
+            if self.debug_port is not None:
+                _ACTIVE_DEBUG_PORTS.discard(self.debug_port)
+            if self.browser_pid is not None:
+                _ACTIVE_BROWSER_PIDS.discard(self.browser_pid)
         self._profile_dir = None
         self._cache_dir = None
         self._fingerprint_ext_dir = None
+        self._profile_claimed = False
+        self._cache_claimed = False
+        self.debug_port = None
+        self.browser_pid = None
+        self.browser_context_id = ""
+        self._owns_browser_process = False
+        self._browser_process_create_time = None
+        self.isolation_verified = False
+        for path in paths:
+            _remove_temp_tree(path)
 
-    def start(self):
+    def _claim_debug_port(self) -> int:
+        for _attempt in range(50):
+            port = _find_free_local_port()
+            if port in _ACTIVE_DEBUG_PORTS:
+                continue
+            _ACTIVE_DEBUG_PORTS.add(port)
+            self.debug_port = port
+            return port
+        raise RuntimeError("无法分配唯一 Chrome 调试端口")
+
+    def _verify_isolation(self) -> None:
+        if (
+            self._browser is None
+            or self._profile_dir is None
+            or self._cache_dir is None
+            or self.debug_port is None
+        ):
+            raise RuntimeError("浏览器隔离校验所需状态不完整")
+
+        process_id = int(getattr(self._browser, "process_id", 0) or 0)
+        try:
+            process = psutil.Process(process_id)
+            browser_command = process.cmdline()
+            create_time = process.create_time()
+        except Exception as error:
+            located = _find_owned_browser_process(
+                self._profile_dir,
+                self._cache_dir,
+                self.debug_port,
+            )
+            if located is None:
+                raise RuntimeError(
+                    f"浏览器隔离校验失败：无法读取 Chrome 主进程 {process_id}: {error}"
+                ) from error
+            process, browser_command = located
+            process_id = process.pid
+            create_time = process.create_time()
+
+        if process_id in _ACTIVE_BROWSER_PIDS and process_id != self.browser_pid:
+            raise RuntimeError(f"浏览器隔离校验失败：PID {process_id} 已被其他 Worker 使用")
+
+        command_profile = _command_path_argument(browser_command, "--user-data-dir")
+        command_port = _command_path_argument(browser_command, "--remote-debugging-port")
+        if (
+            command_profile
+            and _path_key(command_profile) == _path_key(self._profile_dir)
+            and command_port == str(self.debug_port)
+        ):
+            self.browser_pid = process_id
+            self._browser_process_create_time = create_time
+            self._owns_browser_process = True
+
+        _validate_browser_isolation(
+            profile_dir=self._profile_dir,
+            cache_dir=self._cache_dir,
+            debug_port=self.debug_port,
+            browser_address=str(getattr(self._browser, "address", "") or ""),
+            browser_user_data_path=str(getattr(self._browser, "user_data_path", "") or ""),
+            browser_pid=process_id,
+            browser_command=browser_command,
+        )
+        try:
+            with socket.create_connection(("127.0.0.1", self.debug_port), timeout=1):
+                pass
+        except OSError as error:
+            raise RuntimeError(
+                f"浏览器隔离校验失败：独立调试端口 {self.debug_port} 不可连接"
+            ) from error
+
+        _ACTIVE_BROWSER_PIDS.add(process_id)
+        self.browser_pid = process_id
+        self._browser_process_create_time = create_time
+        self._owns_browser_process = True
+        self.isolation_verified = True
+        print(f"[*] 浏览器隔离校验通过: {self.isolation_summary}")
+
+    def _capture_browser_context(self) -> None:
+        try:
+            target_info = self._page.run_cdp("Target.getTargetInfo").get("targetInfo", {})
+            self.browser_context_id = str(target_info.get("browserContextId") or "")
+        except Exception:
+            self.browser_context_id = ""
+
+    def _start_locked(self):
+        if self._stop_requested:
+            raise RuntimeError("任务已停止：浏览器会话禁止重新启动")
+        if self._browser is not None:
+            raise RuntimeError("浏览器会话已启动，拒绝复用时再次初始化环境")
         self._closed_intentionally = False
         # set_user_data_path() disables DrissionPage's auto_port flag. Allocate
         # and bind each browser serially so concurrent workers cannot all fall
         # back to the default 9222 endpoint and attach to one Chrome instance.
         with _BROWSER_START_LOCK:
-            self._prepare_fresh_profile()
-            self._prepare_fresh_fingerprint()
-            self.debug_port = _find_free_local_port()
-            self._options.set_local_port(self.debug_port)
-            print(f"[*] 已为浏览器分配独立调试端口: {self.debug_port}")
-            self._browser = Chromium(self._options)
-        tabs = self._browser.get_tabs()
-        # DrissionPage 的 /json tab 列表把最新 tab 放在第 0 位。
-        self._page = tabs[0] if tabs else self._browser.new_tab()
+            try:
+                self._prepare_fresh_profile()
+                self._prepare_fresh_fingerprint()
+                if self._stop_requested:
+                    raise RuntimeError("任务已停止：取消浏览器启动")
+                debug_port = self._claim_debug_port()
+                self._options.set_local_port(debug_port)
+                print(f"[*] 已为浏览器分配独立调试端口: {debug_port}")
+                self._browser = Chromium(self._options)
+                self._verify_isolation()
+                if self._stop_requested:
+                    raise RuntimeError("任务已停止：浏览器启动后立即关闭")
+                tabs = self._browser.get_tabs()
+                # DrissionPage 的 /json tab 列表把最新 tab 放在第 0 位。
+                self._page = tabs[0] if tabs else self._browser.new_tab()
+                self._capture_browser_context()
+            except Exception:
+                self._shutdown_browser_locked()
+                raise
         self._apply_window_bounds()
         return self
 
+    def start(self):
+        with self._lifecycle_lock:
+            return self._start_locked()
+
     def _apply_window_bounds(self) -> None:
-        if self._page is None or not self._window_bounds:
+        if self._page is None:
             return
-        left, top, width, height = self._window_bounds
         try:
-            window_info = self._page.run_cdp("Browser.getWindowForTarget")
-            window_id = window_info["windowId"]
-            self._page.run_cdp(
-                "Browser.setWindowBounds",
-                windowId=window_id,
-                bounds={"windowState": "normal"},
-            )
+            with self._window_lock:
+                window_id = self._window_id()
+                if self._minimize_on_start:
+                    # Chrome is launched with --start-minimized. Do not first
+                    # restore and tile it, otherwise macOS briefly shows the
+                    # window before this command can minimize it.
+                    self._set_window_minimized(window_id)
+                    print("[*] 浏览器窗口已最小化")
+                else:
+                    self._restore_window_bounds(window_id, bring_to_front=True)
+        except Exception as error:
+            print(f"[警告] 通过 CDP 设置浏览器窗口失败，将保留启动参数状态: {error}")
+
+    def _window_id(self) -> int:
+        if self._page is None:
+            raise RuntimeError("浏览器窗口尚未创建")
+        window_info = self._page.run_cdp("Browser.getWindowForTarget")
+        window_id = int(window_info.get("windowId") or 0)
+        if window_id <= 0:
+            raise RuntimeError("无法取得浏览器窗口 ID")
+        return window_id
+
+    def _restore_window_bounds(self, window_id: int, *, bring_to_front: bool) -> None:
+        if self._page is None:
+            raise RuntimeError("浏览器窗口尚未创建")
+        self._page.run_cdp(
+            "Browser.setWindowBounds",
+            windowId=window_id,
+            bounds={"windowState": "normal"},
+        )
+        if self._window_bounds:
+            left, top, width, height = self._window_bounds
             self._page.run_cdp(
                 "Browser.setWindowBounds",
                 windowId=window_id,
@@ -335,27 +693,84 @@ class DrissionBrowserSession:
                     "height": height,
                 },
             )
-            self._page.run_cdp("Page.bringToFront")
             print(f"[*] 浏览器窗口已平铺: x={left}, y={top}, {width}x{height}")
-        except Exception as error:
-            print(f"[警告] 通过 CDP 平铺浏览器窗口失败，将保留启动参数位置: {error}")
+        if bring_to_front:
+            self._page.run_cdp("Page.bringToFront")
 
-    def stop(self):
-        if self._browser is not None:
+    def _set_window_minimized(self, window_id: int) -> None:
+        if self._page is None:
+            raise RuntimeError("浏览器窗口尚未创建")
+        self._page.run_cdp(
+            "Browser.setWindowBounds",
+            windowId=window_id,
+            bounds={"windowState": "minimized"},
+        )
+
+    def set_window_minimized(self, minimized: bool = True, *, apply_now: bool = True) -> bool:
+        """Set this owned window state, or remember it while Chrome is starting."""
+        self._minimize_on_start = bool(minimized)
+        if not apply_now:
+            return False
+        with self._window_lock:
+            if self._page is None or self._stop_requested:
+                return False
+            window_id = self._window_id()
+            if minimized:
+                self._set_window_minimized(window_id)
+            else:
+                self._restore_window_bounds(window_id, bring_to_front=True)
+        return True
+
+    def _shutdown_browser_locked(self) -> None:
+        self._closed_intentionally = True
+        browser = self._browser
+        process_id = self.browser_pid or int(getattr(browser, "process_id", 0) or 0)
+        create_time = self._browser_process_create_time
+        if browser is not None and self._owns_browser_process:
             try:
-                self._browser.quit(timeout=2, force=True)
+                browser.quit(timeout=3, force=False)
             except Exception:
                 pass
+        if self._owns_browser_process:
+            _stop_owned_browser_process(process_id, create_time)
         self._browser = None
         self._page = None
-        self.debug_port = None
-        self._closed_intentionally = True
         self._cleanup_profile()
+
+    def request_stop(self) -> None:
+        """Signal the verified Chrome process immediately; cleanup continues asynchronously."""
+        self._stop_requested = True
+        self._closed_intentionally = True
+        if not self._owns_browser_process or not self.browser_pid:
+            return
+        try:
+            process = psutil.Process(self.browser_pid)
+            if (
+                self._browser_process_create_time is not None
+                and abs(process.create_time() - self._browser_process_create_time) > 0.01
+            ):
+                return
+            processes = [*process.children(recursive=True), process]
+            for item in processes:
+                try:
+                    item.kill()
+                except psutil.NoSuchProcess:
+                    pass
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+
+    def stop(self):
+        self.request_stop()
+        with self._lifecycle_lock:
+            self._shutdown_browser_locked()
 
     def restart(self):
         """每轮结束都重启整个浏览器实例，避免长时间复用造成的页面/Cookie 污染。"""
-        self.stop()
-        self.start()
+        with self._lifecycle_lock:
+            if self._stop_requested:
+                raise RuntimeError("任务已停止：浏览器会话禁止重新启动")
+            self._shutdown_browser_locked()
+            return self._start_locked()
 
     @property
     def page(self):
@@ -366,6 +781,15 @@ class DrissionBrowserSession:
     @property
     def browser(self):
         return self._browser
+
+    @property
+    def isolation_summary(self) -> str:
+        profile_name = self._profile_dir.name if self._profile_dir is not None else "-"
+        status = "已校验" if self.isolation_verified else "未校验"
+        return (
+            f"环境 {self.environment_id or '-'} · {status} · PID {self.browser_pid or '-'} · "
+            f"CDP {self.debug_port or '-'} · Profile {profile_name}"
+        )
 
     def refresh_page(self):
         """验证码确认后页面会跳转，旧 page 句柄可能断开，统一重新获取当前活动 tab。
@@ -399,6 +823,8 @@ class DrissionBrowserSession:
     def open_new_tab(self, url: str | None = None):
         """在当前无痕上下文中新开 tab，并返回稳定绑定到新 target 的页面对象。"""
         if self._browser is None:
+            if self._closed_intentionally or self._stop_requested:
+                raise RuntimeError("任务已停止：浏览器已关闭")
             self.start()
 
         browser = self._browser

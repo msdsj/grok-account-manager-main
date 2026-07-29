@@ -9,6 +9,7 @@ requires-python = ">=3.12,<3.14"
 dependencies = [
     "DrissionPage==4.1.0.9",
     "fastapi>=0.115",
+    "psutil>=5.9",
     "requests>=2.31",
     "python-dotenv>=1.0",
     "uvicorn[standard]>=0.30",

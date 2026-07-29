@@ -17,7 +17,6 @@ def get_accounts() -> dict:
 
 
 @router.get("/api/state")
-@router.get("/api/jobs/current")
 def get_state() -> dict:
     return {
         "job": JOB_MANAGER.snapshot(),
@@ -25,3 +24,7 @@ def get_state() -> dict:
         "relay": RELAY_MANAGER.snapshot(),
     }
 
+
+@router.get("/api/jobs/current")
+def get_current_job() -> dict:
+    return {"job": JOB_MANAGER.snapshot()}

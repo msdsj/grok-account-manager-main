@@ -11,8 +11,10 @@ import {
   ImageIcon,
   KeyRound,
   Loader2,
+  Maximize2,
   Megaphone,
   MessageCircle,
+  Minimize2,
   Play,
   RefreshCw,
   ShieldCheck,
@@ -81,6 +83,7 @@ interface RegistrationJob {
   total: number;
   concurrency: number;
   oauthExchange: boolean;
+  windowsMinimized?: boolean;
   emailSource?: EmailSource;
   outlookAccountCount?: number;
   googleAccountCount?: number;
@@ -90,6 +93,9 @@ interface RegistrationJob {
   registered?: number;
   refreshTokenCompleted?: number;
   refreshTokenFailed?: number;
+  oauthAccessDeniedStreak?: number;
+  oauthCircuitOpen?: boolean;
+  oauthCircuitReason?: string;
   workerErrors: number;
   active: number;
   oauthConcurrency?: number;
@@ -321,11 +327,13 @@ export function App() {
   const [total, setTotal] = useState(5);
   const [concurrency, setConcurrency] = useState(1);
   const [oauthExchange, setOauthExchange] = useState(true);
+  const [minimizeBrowsers, setMinimizeBrowsers] = useState(true);
   const [emailSource, setEmailSource] = useState<EmailSource>("duckmail");
   const [outlookData, setOutlookData] = useState("");
   const [googleData, setGoogleData] = useState("");
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
+  const [windowAction, setWindowAction] = useState<"minimize" | "restore" | null>(null);
   const [retrying, setRetrying] = useState(false);
   const [exporting, setExporting] = useState<ExportFormat | null>(null);
   const [testingAccounts, setTestingAccounts] = useState(false);
@@ -380,13 +388,21 @@ export function App() {
     const requestSequence = ++stateRequestSequence.current;
     try {
       const next = await apiJson<AppState>("/api/state");
-      if (requestSequence !== stateRequestSequence.current) return false;
+      if (requestSequence !== stateRequestSequence.current) return null;
       setState(next);
-      return true;
+      return next;
     } catch (requestError) {
-      if (requestSequence !== stateRequestSequence.current) return false;
+      if (requestSequence !== stateRequestSequence.current) return null;
       throw requestError;
     }
+  }, []);
+
+  const loadLatestJob = useCallback(async () => {
+    const requestSequence = ++stateRequestSequence.current;
+    const next = await apiJson<{ job: RegistrationJob | null }>("/api/jobs/current");
+    if (requestSequence !== stateRequestSequence.current) return undefined;
+    setState((current) => ({ ...current, job: next.job }));
+    return next.job;
   }, []);
 
   const refresh = useCallback(async () => {
@@ -408,10 +424,36 @@ export function App() {
   useEffect(() => {
     let alive = true;
     let timer: number | undefined;
+    let fullStateLoaded = false;
+    let compactPolls = 0;
+    let previousJobStatus: JobStatus | undefined;
     const load = async () => {
       try {
-        const applied = await loadLatestState();
-        if (alive && applied) setError(null);
+        if (!fullStateLoaded || compactPolls >= 15) {
+          const next = await loadLatestState();
+          if (next) {
+            fullStateLoaded = true;
+            compactPolls = 0;
+            previousJobStatus = next.job?.status;
+            if (alive) setError(null);
+          }
+        } else {
+          const nextJob = await loadLatestJob();
+          if (nextJob !== undefined) {
+            compactPolls += 1;
+            const wasRunning = previousJobStatus === "running" || previousJobStatus === "stopping";
+            const nowRunning = nextJob?.status === "running" || nextJob?.status === "stopping";
+            previousJobStatus = nextJob?.status;
+            if (wasRunning && !nowRunning) {
+              const next = await loadLatestState();
+              if (next) {
+                compactPolls = 0;
+                previousJobStatus = next.job?.status;
+              }
+            }
+            if (alive) setError(null);
+          }
+        }
       } catch (loadError) {
         if (alive) setError(String(loadError));
       } finally {
@@ -427,7 +469,7 @@ export function App() {
       stateRequestSequence.current += 1;
       if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [loadLatestState]);
+  }, [loadLatestJob, loadLatestState]);
 
   useEffect(() => {
     const onPopState = () => setActiveView(routeForPath(window.location.pathname).id);
@@ -566,6 +608,7 @@ export function App() {
           total: safeTotal,
           concurrency: safeConcurrency,
           oauthExchange,
+          minimizeBrowsers,
           emailSource,
           outlookData: emailSource === "outlook" ? outlookData : "",
           googleData: needsGoogleAccounts ? googleData : "",
@@ -616,6 +659,25 @@ export function App() {
       setError(String(stopError));
     } finally {
       setSubmitting(false);
+    }
+  }
+
+  async function setBrowserWindowsMinimized(minimized: boolean) {
+    if (!isRunning || windowAction) return;
+    const action = minimized ? "minimize" : "restore";
+    setWindowAction(action);
+    setError(null);
+    try {
+      const response = await apiJson<{ job: RegistrationJob | null }>(
+        `/api/register/windows/${action}`,
+        { method: "POST", body: "{}" },
+      );
+      stateRequestSequence.current += 1;
+      setState((current) => ({ ...current, job: response.job }));
+    } catch (windowError) {
+      setError(String(windowError));
+    } finally {
+      setWindowAction(null);
     }
   }
 
@@ -984,6 +1046,15 @@ export function App() {
             />
             <span>获取 refresh_token</span>
           </label>
+          <label className="toggle-row">
+            <input
+              type="checkbox"
+              checked={minimizeBrowsers}
+              disabled={isRunning}
+              onChange={(event) => setMinimizeBrowsers(event.target.checked)}
+            />
+            <span>启动后最小化浏览器</span>
+          </label>
           <div className="field-group">
             <span>注册方式</span>
             <div className="segmented-control">
@@ -1013,16 +1084,38 @@ export function App() {
               开始
             </button>
             <button className="secondary-btn" type="button" disabled={!isRunning || submitting} onClick={() => void stopRegistration()}>
-              <Square size={17} />
-              停止
+              {submitting ? <Loader2 size={17} className="spin" /> : <Square size={17} />}
+              {submitting ? "正在停止" : "停止"}
             </button>
           </div>
         </form>
         <div className="job-card embedded">
-          <div className="job-card-head">
-            <span className={`status-pill ${statusTone(job?.status)}`}>{statusLabel(job?.status)}</span>
-            <strong>{job ? `${finished}/${job.total}` : "0/0"}</strong>
-          </div>
+            <div className="job-card-head">
+              <span className={`status-pill ${statusTone(job?.status)}`}>{statusLabel(job?.status)}</span>
+              <div className="window-controls">
+                <button
+                  className="small-icon-btn"
+                  type="button"
+                  disabled={!isRunning || windowAction !== null || job?.windowsMinimized === true}
+                  onClick={() => void setBrowserWindowsMinimized(true)}
+                  title="最小化所有注册浏览器"
+                  aria-label="最小化所有注册浏览器"
+                >
+                  {windowAction === "minimize" ? <Loader2 size={15} className="spin" /> : <Minimize2 size={15} />}
+                </button>
+                <button
+                  className="small-icon-btn"
+                  type="button"
+                  disabled={!isRunning || windowAction !== null || job?.windowsMinimized !== true}
+                  onClick={() => void setBrowserWindowsMinimized(false)}
+                  title="恢复并平铺所有注册浏览器"
+                  aria-label="恢复并平铺所有注册浏览器"
+                >
+                  {windowAction === "restore" ? <Loader2 size={15} className="spin" /> : <Maximize2 size={15} />}
+                </button>
+                <strong>{job ? `${finished}/${job.total}` : "0/0"}</strong>
+              </div>
+            </div>
           <div className="progress-track">
             <div className="progress-fill" style={{ width: `${progress}%` }} />
           </div>
@@ -1035,6 +1128,10 @@ export function App() {
             <span>已注册 {job?.registered ?? job?.completed ?? 0}</span>
             <span>Refresh 成功 {job?.refreshTokenCompleted ?? 0}</span>
             <span>Refresh 失败 {job?.refreshTokenFailed ?? 0}</span>
+            {(job?.oauthAccessDeniedStreak ?? 0) > 0 && (
+              <span>连续拒绝 {job?.oauthAccessDeniedStreak}</span>
+            )}
+            {job?.oauthCircuitOpen && <span title={job.oauthCircuitReason}>OAuth 已熔断</span>}
             <span>注册失败 {job?.failed ?? 0}</span>
             <span>活跃 {job?.active ?? 0}</span>
             <span>启动异常 {job?.workerErrors ?? 0}</span>
@@ -1064,7 +1161,7 @@ export function App() {
                   <span>{worker.round ? `第 ${worker.round} 轮` : "尚未领取轮次"} · {worker.stage || "waiting"}</span>
                 </div>
                 <p>{hideEmails ? maskTextEmails(worker.message || "") : worker.message}</p>
-                <code title={worker.fingerprint || "指纹生成中"}>{worker.fingerprint || "指纹生成中"}</code>
+                <code title={worker.fingerprint || "环境校验中"}>{worker.fingerprint || "环境校验中"}</code>
               </div>
             ))}
           </div>
