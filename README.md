@@ -21,6 +21,7 @@ GitHub：<https://github.com/msdsj/grok-account-manager-main>
 
 - Grok 邮箱注册自动化，注册资料姓名和密码每轮随机生成。
 - 邮箱源支持 DuckMail、Outlook、Gmail/Google 账号池，`----` 和 `|` 两种分隔格式都兼容。
+- 注册页、浏览器启动和 OAuth 短暂网络错误都有有界重试，任务停止后不会继续拉起浏览器。
 - 输出 cockpit-tools 可导入的 GrokAccount JSON 数组，并同步写入本地账号数据库。
 - React 控制台使用侧边栏路由，支持注册任务、账号列表、Grok CLI 4.5 测试、Chat 对话测试、图片生成测试和本地中转。
 - 可选 `sub2api` sink，把注册结果写入独立部署的 Sub2API 管理 API。
@@ -93,6 +94,8 @@ email@gmail.com----password----recovery@example.com
 email@gmail.com|password|recovery@example.com
 ```
 
+Outlook、Gmail 和 Google 账号在一次进程中只会领取一次，池耗尽后会明确报错，不会循环复用已参与注册的邮箱。如果开启多并发或页面失败重试，账号池行数需要留出相应余量。
+
 ## 本地数据库
 
 账号完整凭证、导出索引和测试结果会写入本地 SQLite：
@@ -124,9 +127,10 @@ npm run dev
 ```bash
 GROK_ACCOUNT_MANAGER_MAX_CONCURRENCY=20
 GROK_ACCOUNT_MANAGER_MAX_OAUTH_CONCURRENCY=2
+GROK_ACCOUNT_MANAGER_MAX_REGISTRATION_ATTEMPTS=3
 ```
 
-浏览器 profile 和指纹隔离不能改变所有窗口共享本机出口 IP 的事实，不能保证绕过平台风控。勾选“获取 refresh_token”时，只有拿到有效 RT 的账号才会写入 `sso.txt`、`grok_credentials.json` 和账号数据库；OAuth 失败或超时的账号只记录任务失败原因，不保留凭证。未勾选时仍按 SSO 模式保存。
+浏览器 profile 和指纹隔离不能改变所有窗口共享本机出口 IP 的事实，不能保证绕过平台风控。勾选“获取 refresh_token”时，只有拿到有效 RT 的账号才会写入 `sso.txt`、`grok_credentials.json` 和账号数据库；OAuth 失败或超时时，SSO checkpoint 会保留在本地恢复队列，但不会冒充 RT 完整账号导入账号库。未勾选时仍按 SSO 模式保存。
 
 生产模式可先构建前端：
 
@@ -145,8 +149,11 @@ uv run grok-account-manager-api
 - `output/grok-account-manager.db`：本地账号数据库。
 - `output/sso.txt`：使用 `txt` sink 时写入的 SSO 兜底文本。
 - `output/sso-failed.txt`：Sub2API 写入失败时的兜底文本。
+- `output/pending-registration-results.json`：控制台任务的未完成 OAuth checkpoint 和落盘失败恢复队列。
 
 `output/` 是运行产物目录，默认不纳入 Git。
+
+恢复队列采用原子替换并设为 `0600` 权限。`persistence_failed` 会在 FastAPI 后端下次启动时自动重试；`oauth_pending` 只保留已注册的 SSO 恢复信息，不会自动写入正式账号库。如果现有 `grok_credentials.json` 无法解析或结构非法，sink 会生成同目录 `grok_credentials.json.broken-时间戳` 备份并拒绝覆盖原文件。
 
 ## OAuth Refresh Token
 
@@ -156,7 +163,7 @@ uv run grok-account-manager-api
 uv run grok-account-manager grok --count 1 --sink json --oauth-exchange
 ```
 
-该流程会监听 `127.0.0.1:56121/callback` 并可能需要人工完成网页授权或 Turnstile。
+该流程使用 xAI Device Flow，会在同一浏览器上打开授权页，并可能需要人工完成网页授权或 Turnstile。
 
 ## Sub2API
 
@@ -185,9 +192,9 @@ serve/grok_account_manager/
   cli.py                  # CLI 参数解析和轮次调度
   core/browser.py         # Chromium 启停、扩展加载、cookie 等待
   mail/duckmail.py        # DuckMail 接码
-  mail/sources.py         # DuckMail / Outlook 邮箱源
+  mail/sources.py         # DuckMail / Outlook / Gmail / Google 邮箱源
   grok/client.py          # GrokAccount JSON 构建与额度 API
-  grok/oauth_exchange.py  # xAI OAuth PKCE loopback
+  grok/oauth_exchange.py  # xAI OAuth Device Flow
   providers/grok.py       # Grok 注册页面自动化
   sinks/                  # JSON/TXT/Sub2API 输出
 extensions/turnstile_patch/

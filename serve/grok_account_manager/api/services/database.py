@@ -6,9 +6,9 @@ import json
 import os
 import sqlite3
 import time
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from collections.abc import Iterator
 from typing import Any
 
 from dotenv import load_dotenv
@@ -35,13 +35,40 @@ def _resolve_db_path() -> Path:
 DB_PATH = _resolve_db_path()
 
 
+def _database_sidecar_paths() -> tuple[Path, Path]:
+    return (
+        DB_PATH.with_name(f"{DB_PATH.name}-wal"),
+        DB_PATH.with_name(f"{DB_PATH.name}-shm"),
+    )
+
+
+def _secure_database_files() -> None:
+    for path in (DB_PATH, *_database_sidecar_paths()):
+        try:
+            path.chmod(0o600)
+        except FileNotFoundError:
+            continue
+
+
+def _prepare_private_database_file() -> None:
+    file_descriptor = os.open(DB_PATH, os.O_WRONLY | os.O_CREAT, 0o600)
+    os.close(file_descriptor)
+    DB_PATH.chmod(0o600)
+
+
 def _connect() -> sqlite3.Connection:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _prepare_private_database_file()
     conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        _secure_database_files()
+    except Exception:
+        conn.close()
+        raise
     return conn
 
 
@@ -52,7 +79,11 @@ def _connection() -> Iterator[sqlite3.Connection]:
         yield conn
         conn.commit()
     finally:
-        conn.close()
+        try:
+            _secure_database_files()
+        finally:
+            conn.close()
+        _secure_database_files()
 
 
 def init_db() -> None:

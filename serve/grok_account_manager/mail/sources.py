@@ -447,7 +447,13 @@ class DuckMailMailbox:
     def wait_for_code(self, timeout: int = 180, interval: int = 3, stop_event=None) -> str | None:
         if stop_event and stop_event.is_set():
             raise RuntimeError("任务已停止")
-        return get_oai_code(self._token, self.email, stop_event=stop_event)
+        return get_oai_code(
+            self._token,
+            self.email,
+            stop_event=stop_event,
+            timeout=timeout,
+            interval=interval,
+        )
 
 
 class DuckMailSource:
@@ -473,7 +479,9 @@ class OutlookAccountPool:
 
     def create_mailbox(self, log_callback=None) -> "OutlookMailbox":
         with self._lock:
-            account = self._accounts[self._next % len(self._accounts)]
+            if self._next >= len(self._accounts):
+                raise RuntimeError("Outlook 邮箱池已耗尽，不会循环复用已领取账号")
+            account = self._accounts[self._next]
             self._next += 1
         mailbox = OutlookMailbox(account, log_callback=log_callback)
         mailbox.prepare()
@@ -553,7 +561,9 @@ class GoogleAccountPool:
 
     def create_mailbox(self, log_callback=None) -> "GoogleMailbox":
         with self._lock:
-            account = self._accounts[self._next % len(self._accounts)]
+            if self._next >= len(self._accounts):
+                raise RuntimeError("Google 邮箱池已耗尽，不会循环复用已领取账号")
+            account = self._accounts[self._next]
             self._next += 1
         mailbox = GoogleMailbox(account, use_imap=self.registration_mode == "email")
         mailbox.prepare()
@@ -754,9 +764,9 @@ def _wait_for_outlook_auto_code(
         stage="wait_email_code",
     )
     deadline = time.time() + timeout
-    folder_counts = dict(before_counts or {})
+    folder_counts = before_counts if before_counts is not None else {}
     if not folder_counts:
-        folder_counts = {"INBOX": 0}
+        folder_counts["INBOX"] = 0
 
     imap_access_token: str | None = None
     graph_access_token: str | None = None
@@ -871,9 +881,9 @@ def _wait_for_outlook_imap_code(
 ) -> str | None:
     _mail_log(log_callback, "info", f"[*] Outlook IMAP 等待验证码: {account.email}", email=account.email, stage="wait_email_code")
     deadline = time.time() + timeout
-    folder_counts = dict(before_counts or {})
+    folder_counts = before_counts if before_counts is not None else {}
     if not folder_counts:
-        folder_counts = {"INBOX": 0}
+        folder_counts["INBOX"] = 0
     access_token = refresh_outlook_token(account)
     attempt = 0
 
@@ -912,9 +922,9 @@ def _wait_for_outlook_graph_code(
 ) -> str | None:
     _mail_log(log_callback, "info", f"[*] Outlook Graph 等待验证码: {account.email}", email=account.email, stage="wait_email_code")
     deadline = time.time() + timeout
-    folder_counts = dict(before_counts or {})
+    folder_counts = before_counts if before_counts is not None else {}
     if not folder_counts:
-        folder_counts = {OUTLOOK_GRAPH_INBOX_KEY: 0}
+        folder_counts[OUTLOOK_GRAPH_INBOX_KEY] = 0
     access_token = refresh_outlook_graph_token(account)
     attempt = 0
 
@@ -981,15 +991,15 @@ def _scan_outlook_imap_once(
             )
 
             for seq in range(total, start - 1, -1):
-                subject, text, html = _fetch_message_content(client, seq)
-                code = extract_verification_code(subject, text, html)
+                subject, text, html, sender = _fetch_message_content(client, seq)
+                code = extract_verification_code(subject, text, html, sender)
                 if code:
                     code = _normalize_verification_code(code)
                     folder_counts[folder] = max(folder_counts.get(folder, 0), total)
                     _mail_log(
                         log_callback,
                         "success",
-                        f"[*] Outlook IMAP 获取到验证码: {code}（文件夹: {folder}）",
+                        f"[*] Outlook IMAP 已获取验证码（文件夹: {folder}）",
                         email=account.email,
                         stage="wait_email_code",
                     )
@@ -1035,7 +1045,7 @@ def _scan_outlook_graph_once(
         params={
             "$top": str(limit),
             "$orderby": "receivedDateTime desc",
-            "$select": "subject,bodyPreview,body,receivedDateTime",
+            "$select": "subject,bodyPreview,body,receivedDateTime,from",
         },
     )
     messages = data.get("value") or []
@@ -1046,19 +1056,60 @@ def _scan_outlook_graph_once(
         preview = str(message.get("bodyPreview") or "")
         body = message.get("body") if isinstance(message.get("body"), dict) else {}
         body_content = str(body.get("content") or "")
-        code = extract_verification_code(subject, preview, body_content)
+        sender_data = message.get("from") if isinstance(message.get("from"), dict) else {}
+        sender_address = sender_data.get("emailAddress") if isinstance(sender_data.get("emailAddress"), dict) else {}
+        sender = str(sender_address.get("address") or "")
+        code = extract_verification_code(subject, preview, body_content, sender)
         if code:
             code = _normalize_verification_code(code)
             folder_counts[OUTLOOK_GRAPH_INBOX_KEY] = max(folder_counts.get(OUTLOOK_GRAPH_INBOX_KEY, 0), total)
             _mail_log(
                 log_callback,
                 "success",
-                f"[*] Outlook Graph 获取到验证码: {code}",
+                "[*] Outlook Graph 已获取验证码",
                 email=email,
                 stage="wait_email_code",
             )
             return code
     return None
+
+
+def _scan_google_imap_once(
+    account: GoogleAccount,
+    folder_counts: dict[str, int],
+) -> str | None:
+    client: imaplib.IMAP4_SSL | None = None
+    try:
+        client = _connect_google_imap(account)
+        for folder in _discover_google_folders(client):
+            total = _select_outlook_folder_count(client, folder)
+            if total is None or total <= 0:
+                continue
+
+            before_count = folder_counts.get(folder, 0)
+            if total <= before_count:
+                continue
+
+            start = max(1, total - GOOGLE_SCAN_DEPTH + 1, before_count + 1)
+            if start > total:
+                continue
+
+            print(f"[*] Gmail 文件夹更新: {folder} {before_count} -> {total}")
+            for seq in range(total, start - 1, -1):
+                subject, text, html, sender = _fetch_message_content(client, seq)
+                code = extract_verification_code(subject, text, html, sender)
+                if code:
+                    code = _normalize_verification_code(code)
+                    folder_counts[folder] = max(folder_counts.get(folder, 0), total)
+                    print(f"[*] Gmail IMAP 已获取验证码（文件夹: {folder}）")
+                    return code
+        return None
+    finally:
+        if client is not None:
+            try:
+                client.logout()
+            except Exception:
+                pass
 
 
 def wait_for_google_code(
@@ -1070,58 +1121,28 @@ def wait_for_google_code(
 ) -> str | None:
     print(f"[*] Gmail IMAP 等待验证码: {account.email}")
     deadline = time.time() + timeout
-    folder_counts = dict(before_counts or {})
+    folder_counts = before_counts if before_counts is not None else {}
     if not folder_counts:
-        folder_counts = {"INBOX": 0}
+        folder_counts["INBOX"] = 0
 
     while time.time() < deadline:
         if stop_event and stop_event.is_set():
             raise RuntimeError("任务已停止")
 
-        client: imaplib.IMAP4_SSL | None = None
         try:
-            client = _connect_google_imap(account)
-            for folder in _discover_google_folders(client):
-                total = _select_outlook_folder_count(client, folder)
-                if total is None or total <= 0:
-                    continue
-
-                before_count = folder_counts.get(folder, 0)
-                start = max(1, total - GOOGLE_SCAN_DEPTH + 1)
-                if total > before_count:
-                    start = max(start, before_count + 1)
-
-                if start > total:
-                    continue
-
-                if total > before_count:
-                    print(f"[*] Gmail 文件夹更新: {folder} {before_count} -> {total}")
-
-                for seq in range(total, start - 1, -1):
-                    subject, text, html = _fetch_message_content(client, seq)
-                    code = extract_verification_code(subject, text, html)
-                    if code:
-                        if "-" in code:
-                            code = code.replace("-", "")
-                        folder_counts[folder] = max(folder_counts.get(folder, 0), total)
-                        print(f"[*] Gmail IMAP 获取到验证码: {code}（文件夹: {folder}）")
-                        return code
+            code = _scan_google_imap_once(account, folder_counts)
+            if code:
+                return code
             time.sleep(interval)
         except Exception as error:
             print(f"[警告] Gmail IMAP 读取失败，稍后重试: {error}")
             time.sleep(interval)
-        finally:
-            if client is not None:
-                try:
-                    client.logout()
-                except Exception:
-                    pass
 
     print("[Error] Gmail IMAP 轮询超时，未获取到验证码")
     return None
 
 
-def _fetch_message_content(client: imaplib.IMAP4_SSL, seq: int) -> tuple[str, str, str]:
+def _fetch_message_content(client: imaplib.IMAP4_SSL, seq: int) -> tuple[str, str, str, str]:
     status, data = client.fetch(str(seq), "(BODY.PEEK[])")
     if status != "OK":
         raise RuntimeError(f"FETCH {seq} 失败: {status}")
@@ -1131,14 +1152,15 @@ def _fetch_message_content(client: imaplib.IMAP4_SSL, seq: int) -> tuple[str, st
         if isinstance(item, tuple) and len(item) >= 2 and isinstance(item[1], bytes):
             raw_parts.append(item[1])
     if not raw_parts:
-        return "", "", ""
+        return "", "", "", ""
 
     message = message_from_bytes(b"".join(raw_parts))
     subject = _decode_header_value(message.get("Subject", ""))
+    sender = _decode_header_value(message.get("From", ""))
     text_parts: list[str] = []
     html_parts: list[str] = []
     _collect_message_text(message, text_parts, html_parts)
-    return subject, "\n".join(text_parts), "\n".join(html_parts)
+    return subject, "\n".join(text_parts), "\n".join(html_parts), sender
 
 
 def _decode_header_value(value: str) -> str:

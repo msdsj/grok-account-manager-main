@@ -7,6 +7,7 @@ HTMLInputElement.prototype 原生 setter + _valueTracker 重置才能让按钮�
 
 from __future__ import annotations
 
+import os
 import random
 import secrets
 import time
@@ -19,7 +20,7 @@ from .base import RegistrationResult
 
 try:
     from ..grok.client import build_cockpit_grok_credential, fetch_complete_credential
-    from ..grok.oauth_exchange import exchange_sso_for_oauth_tokens
+    from ..grok.oauth_exchange import OAuthTerminalError, exchange_sso_for_oauth_tokens
     GROK_API_AVAILABLE = True
 except ImportError:
     GROK_API_AVAILABLE = False
@@ -41,8 +42,39 @@ class GrokProvider:
     result_callback = None
     oauth_semaphore = None
     oauth_cooldown_range = (2.0, 5.0)
+    max_registration_attempts = 3
 
     def run_round(self, session: DrissionBrowserSession) -> RegistrationResult:
+        raw_attempts = os.environ.get(
+            "GROK_ACCOUNT_MANAGER_MAX_REGISTRATION_ATTEMPTS",
+            str(self.max_registration_attempts),
+        )
+        try:
+            max_attempts = max(1, min(4, int(raw_attempts)))
+        except (TypeError, ValueError):
+            max_attempts = self.max_registration_attempts
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                return self._run_round_once(session)
+            except Exception as error:
+                stopped = bool(self.stop_event and self.stop_event.is_set())
+                pool_exhausted = "邮箱池已耗尽" in str(error)
+                if stopped or pool_exhausted or self.registration_succeeded or attempt >= max_attempts:
+                    raise
+                delay = random.uniform(1.0, 3.0)
+                self._log(
+                    "warning",
+                    f"注册页面流程失败，{delay:.1f}s 后更换浏览器和邮箱重试 "
+                    f"({attempt}/{max_attempts - 1})：{error}",
+                    stage="registration_retry",
+                )
+                self._interruptible_sleep(delay)
+                session.restart()
+
+        raise RuntimeError("注册重试结束但没有返回结果")
+
+    def _run_round_once(self, session: DrissionBrowserSession) -> RegistrationResult:
         self.current_email = ""
         self.registration_succeeded = False
         self.oauth_exchange_error = ""
@@ -100,7 +132,11 @@ class GrokProvider:
             raise RuntimeError("任务已停止")
 
         self._set_stage("wait_sso_cookie", "正在等待登录凭证 cookie")
-        sso_value = wait_for_cookie(session, self.success_cookie_name, stop_event=self.stop_event)
+        sso_value = _wait_for_sso_cookie_with_resubmit(
+            session,
+            self.success_cookie_name,
+            stop_event=self.stop_event,
+        )
 
         result: RegistrationResult = {
             "email": email,
@@ -171,6 +207,10 @@ class GrokProvider:
                             else:
                                 oauth_error = "OAuth exchange 未返回 token"
                             print(f"[Grok] {oauth_error}")
+                        except OAuthTerminalError as error:
+                            oauth_error = str(error)
+                            print(f"[Grok] OAuth exchange 已被服务端终止: {error}")
+                            break
                         except Exception as error:
                             if self.stop_event and self.stop_event.is_set():
                                 raise
@@ -310,6 +350,95 @@ return !!(givenInput && familyInput && passwordInput);
         ))
     except Exception:
         return False
+
+
+def _wait_for_profile_after_code(
+    session: DrissionBrowserSession,
+    *,
+    timeout: float = 10.0,
+    stop_event=None,
+) -> bool:
+    """确认验证码已被服务端接受，避免把仍停在 OTP 页面误报为成功。"""
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    while time.monotonic() < deadline:
+        if stop_event and stop_event.is_set():
+            raise RuntimeError("任务已停止")
+        page = session.refresh_page()
+        if _has_profile_form(page):
+            return True
+        time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
+    return False
+
+
+def _resubmit_final_profile(page) -> bool:
+    """资料页点击后仍未跳转时补交一次；人机验证未就绪时不点击。"""
+    try:
+        return bool(page.run_js(
+            r"""
+const challengeInput = document.querySelector('input[name="cf-turnstile-response"]');
+if (challengeInput && !String(challengeInput.value || '').trim()) {
+    return false;
+}
+
+function isVisible(node) {
+    if (!node) return false;
+    const style = window.getComputedStyle(node);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+}
+
+const buttons = Array.from(document.querySelectorAll('button[type="submit"], button')).filter((node) => {
+    return isVisible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true';
+});
+const submitButton = buttons.find((node) => {
+    const text = (node.innerText || node.textContent || '').replace(/\s+/g, '');
+    return text === '完成注册' || text.includes('完成注册');
+});
+if (!submitButton) return false;
+submitButton.focus();
+submitButton.click();
+return true;
+            """
+        ))
+    except Exception:
+        return False
+
+
+def _wait_for_sso_cookie_with_resubmit(
+    session: DrissionBrowserSession,
+    cookie_name: str,
+    *,
+    stop_event=None,
+) -> str:
+    """先给首次提交 30 秒，仍停在资料页时有条件地补交一次。"""
+    try:
+        return wait_for_cookie(
+            session,
+            cookie_name,
+            timeout=30,
+            stop_event=stop_event,
+        )
+    except Exception as first_error:
+        if stop_event and stop_event.is_set():
+            raise
+
+        try:
+            page = session.refresh_page()
+        except Exception:
+            page = None
+        if page is not None and _has_profile_form(page) and _resubmit_final_profile(page):
+            print("[*] 首次提交后仍停在资料页，已补点一次完成注册。")
+
+        try:
+            return wait_for_cookie(
+                session,
+                cookie_name,
+                timeout=150,
+                stop_event=stop_event,
+            )
+        except Exception as final_error:
+            raise final_error from first_error
 
 
 def _is_transient_page_error(error: Exception) -> bool:
@@ -859,9 +988,32 @@ if (isConsentPage) {
     return 'idle';
 }
 
+const recoveryInput = Array.from(document.querySelectorAll(
+    'input[name="knowledgePreregisteredEmailResponse"], input[type="email"], input[type="text"]'
+)).find((node) => {
+    const name = String(node.name || node.id || node.autocomplete || '').toLowerCase();
+    return isVisible(node) && !node.disabled && !node.readOnly && (
+        name.includes('recovery') || name.includes('knowledge') ||
+        bodyText.includes('recovery email') || bodyText.includes('辅助邮箱')
+    );
+});
+if (recoveryInput && recoveryEmail && !recoveryDone) {
+    if (!setNativeValue(recoveryInput, recoveryEmail)) {
+        return 'idle';
+    }
+    if (!clickNext()) {
+        return 'idle';
+    }
+    return 'recovery';
+}
+
 const identifierInput = Array.from(document.querySelectorAll(
     'input[type="email"], input[name="identifier"], input#identifierId'
-)).find((node) => isVisible(node) && !node.disabled && !node.readOnly);
+)).find((node) => {
+    const marker = String(node.name || node.id || node.autocomplete || '').toLowerCase();
+    return isVisible(node) && !node.disabled && !node.readOnly &&
+        !marker.includes('recovery') && !marker.includes('knowledge');
+});
 if (identifierInput) {
     const currentIdentifier = String(identifierInput.value || '').trim();
     if (currentIdentifier.toLowerCase() !== email.toLowerCase()) {
@@ -901,24 +1053,6 @@ if (passwordInput) {
         return 'idle';
     }
     return 'password';
-}
-
-const recoveryInput = Array.from(document.querySelectorAll(
-    'input[type="email"], input[type="text"], input[name="knowledgePreregisteredEmailResponse"]'
-)).find((node) => {
-    const name = String(node.name || node.id || node.autocomplete || '').toLowerCase();
-    return isVisible(node) && !node.disabled && !node.readOnly && (
-        name.includes('recovery') || name.includes('knowledge') || bodyText.includes('recovery email') || bodyText.includes('辅助邮箱')
-    );
-});
-if (recoveryInput && recoveryEmail && !recoveryDone) {
-    if (!setNativeValue(recoveryInput, recoveryEmail)) {
-        return 'idle';
-    }
-    if (!clickNext()) {
-        return 'idle';
-    }
-    return 'recovery';
 }
 
 if (isAccountChooserPage) {
@@ -1171,7 +1305,11 @@ function dispatchInputEvents(input, value) {
 }
 
 const input = Array.from(document.querySelectorAll('input[data-input-otp="true"], input[name="code"], input[autocomplete="one-time-code"], input[inputmode="numeric"], input[inputmode="text"]')).find((node) => {
-    return isVisible(node) && !node.disabled && !node.readOnly && Number(node.maxLength || code.length || 6) > 1;
+    const declaredLength = Number(node.maxLength);
+    const expectedLength = Number.isFinite(declaredLength) && declaredLength > 0
+        ? declaredLength
+        : (code.length || 6);
+    return isVisible(node) && !node.disabled && !node.readOnly && expectedLength > 1;
 }) || null;
 
 const otpBoxes = Array.from(document.querySelectorAll('input')).filter((node) => {
@@ -1194,7 +1332,10 @@ if (input) {
     dispatchInputEvents(input, code);
 
     const normalizedValue = String(input.value || '').trim();
-    const expectedLength = Number(input.maxLength || code.length || 6);
+    const declaredLength = Number(input.maxLength);
+    const expectedLength = Number.isFinite(declaredLength) && declaredLength > 0
+        ? declaredLength
+        : (code.length || 6);
     const slots = Array.from(document.querySelectorAll('[data-input-otp-slot="true"]'));
     const filledSlots = slots.filter((slot) => (slot.textContent || '').trim()).length;
 
@@ -1291,13 +1432,20 @@ function isVisible(node) {
 }
 
 const aggregateInput = Array.from(document.querySelectorAll('input[data-input-otp="true"], input[name="code"], input[autocomplete="one-time-code"], input[inputmode="numeric"], input[inputmode="text"]')).find((node) => {
-    return isVisible(node) && !node.disabled && !node.readOnly && Number(node.maxLength || 0) > 1;
+    const declaredLength = Number(node.maxLength);
+    const expectedLength = Number.isFinite(declaredLength) && declaredLength > 0
+        ? declaredLength
+        : 6;
+    return isVisible(node) && !node.disabled && !node.readOnly && expectedLength > 1;
 }) || null;
 
 let value = '';
 if (aggregateInput) {
     value = String(aggregateInput.value || '').trim();
-    const expectedLength = Number(aggregateInput.maxLength || value.length || 6);
+    const declaredLength = Number(aggregateInput.maxLength);
+    const expectedLength = Number.isFinite(declaredLength) && declaredLength > 0
+        ? declaredLength
+        : (value.length || 6);
     if (!value || (expectedLength > 0 && value.length !== expectedLength)) {
         return false;
     }
@@ -1351,18 +1499,17 @@ return 'clicked';
                 clicked = 'disconnected'
 
             if clicked == 'clicked':
-                print(f"[*] 已填写验证码并点击确认邮箱: {code}")
-                time.sleep(2)
-                page = session.refresh_page()
-                if _has_profile_form(page):
+                print("[*] 已填写验证码并点击确认邮箱。")
+                if _wait_for_profile_after_code(session, stop_event=stop_event):
                     print("[*] 验证码确认完成，最终注册页已就绪。")
-                return code
+                    return code
+                raise RuntimeError("验证码提交后未进入最终注册页，验证码可能已过期或被拒绝")
 
             if clicked == 'no-button':
-                current_url = page.url
-                if 'sign-up' in current_url or 'signup' in current_url:
-                    print(f"[*] 已填写验证码，页面已自动跳转到下一步: {current_url}")
+                if _wait_for_profile_after_code(session, stop_event=stop_event):
+                    print("[*] 验证码已自动提交，最终注册页已就绪。")
                     return code
+                raise RuntimeError("验证码填写后未找到确认按钮，且页面未进入最终注册步骤")
 
             if clicked == 'disconnected':
                 time.sleep(1)
@@ -1392,7 +1539,8 @@ def _get_turnstile_token(page, stop_event=None):
             challenge_wrapper = challenge_solution.parent()
             challenge_iframe = challenge_wrapper.shadow_root.ele("tag:iframe")
 
-            challenge_iframe.run_js("""
+            try:
+                challenge_iframe.run_js("""
 window.dtp = 1
 function getRandomInt(min, max) {
     return Math.floor(Math.random() * (max - min + 1)) + min;
@@ -1400,11 +1548,21 @@ function getRandomInt(min, max) {
 
 // 旧方案在 4K 屏下不稳定，这里给出更自然的屏幕坐标。
 let screenX = getRandomInt(800, 1200);
-let screenY = getRandomInt(400, 600);
+let screenY = getRandomInt(400, 700);
 
-Object.defineProperty(MouseEvent.prototype, 'screenX', { value: screenX });
-Object.defineProperty(MouseEvent.prototype, 'screenY', { value: screenY });
+for (const [name, value] of [['screenX', screenX], ['screenY', screenY]]) {
+    const current = Object.getOwnPropertyDescriptor(MouseEvent.prototype, name);
+    if (!current || current.configurable) {
+        Object.defineProperty(MouseEvent.prototype, name, {
+            configurable: true,
+            get: function () { return value; },
+        });
+    }
+}
                         """)
+            except Exception:
+                # 坐标增强是可选的，失败时仍应尝试点击已定位的 checkbox。
+                pass
 
             challenge_iframe_body = challenge_iframe.ele("tag:body").shadow_root
             challenge_button = challenge_iframe_body.ele("tag:input")
@@ -1696,7 +1854,7 @@ const challengeInput = document.querySelector('input[name="cf-turnstile-response
 return challengeInput ? String(challengeInput.value || '').trim() : 'not-found';
                     """
                 )
-                if challenge_value not in ('not-found', ''):
+                if challenge_value == 'not-found' or challenge_value:
                     submit_button.click()
                     clicked = True
                 else:
@@ -1708,7 +1866,7 @@ return challengeInput ? String(challengeInput.value || '').trim() : 'not-found';
                 raise
 
         if clicked:
-            print(f"[*] 已填写注册资料并点击完成注册: {given_name} {family_name} / {password}")
+            print(f"[*] 已填写注册资料并点击完成注册: {given_name} {family_name}")
             return profile
 
         time.sleep(0.5)

@@ -1,9 +1,16 @@
 import os
+from pathlib import Path
 import threading
+import tempfile
 import time
 import unittest
 from unittest.mock import Mock, patch
 
+from grok_account_manager.api.services.pending import (
+    OAUTH_PENDING,
+    PERSISTENCE_FAILED,
+    PendingResultStore,
+)
 from grok_account_manager.api.services.jobs import (
     RegistrationJobManager,
     _is_oauth_access_denied,
@@ -11,8 +18,18 @@ from grok_account_manager.api.services.jobs import (
 
 
 class RegistrationJobManagerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.pending_store = PendingResultStore(Path(self._tmpdir.name) / "pending.json")
+
+    def tearDown(self) -> None:
+        self._tmpdir.cleanup()
+
+    def _manager(self) -> RegistrationJobManager:
+        return RegistrationJobManager(pending_store=self.pending_store)
+
     def test_parallel_registration_limits_only_oauth_stage(self) -> None:
-        manager = RegistrationJobManager()
+        manager = self._manager()
         with (
             patch.dict(
                 os.environ,
@@ -35,7 +52,7 @@ class RegistrationJobManagerTests(unittest.TestCase):
         self.assertEqual({worker["worker"] for worker in job["workers"]}, {1, 2, 3, 4, 5})
 
     def test_oauth_checkpoint_is_visible_but_not_persisted(self) -> None:
-        manager = RegistrationJobManager()
+        manager = self._manager()
         with (
             patch.dict(
                 os.environ,
@@ -65,9 +82,152 @@ class RegistrationJobManagerTests(unittest.TestCase):
         snapshot = manager.snapshot()
         self.assertEqual(snapshot["registered"], 1)
         self.assertEqual(snapshot["registeredAccounts"][0]["oauthStatus"], "pending")
+        pending = self.pending_store.list(OAUTH_PENDING)
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["result"]["credential"], "pending-sso")
+
+    def test_ready_oauth_result_is_persisted_then_removed_from_pending_store(self) -> None:
+        manager = self._manager()
+        with patch("grok_account_manager.api.services.jobs.threading.Thread.start"):
+            manager.start(total=1, concurrency=1, oauth_exchange=True, email_source="duckmail")
+        manager._registration_checkpoint_callback(1, 1)(
+            {
+                "email": "ready@example.com",
+                "credential": "browser-sso",
+                "oauth_status": "pending",
+            }
+        )
+        pending_id = self.pending_store.list(OAUTH_PENDING)[0]["id"]
+        ready_result = {
+            "email": "ready@example.com",
+            "credential": "browser-sso",
+            "oauth_status": "ready",
+            "full_credential": {
+                "email": "ready@example.com",
+                "access_token": "access",
+                "refresh_token": "refresh",
+                "sso_token": "browser-sso",
+            },
+        }
+
+        def assert_durable_before_persist(*_args, **_kwargs) -> None:
+            retryable = self.pending_store.list(PERSISTENCE_FAILED)
+            self.assertEqual(len(retryable), 1)
+            self.assertEqual(retryable[0]["result"]["full_credential"]["refresh_token"], "refresh")
+
+        with patch.object(manager, "_persist_result", side_effect=assert_durable_before_persist) as persist:
+            status, error, saved = manager._persist_completed_result(
+                "grok",
+                ready_result,
+                oauth_required=True,
+                pending_id=pending_id,
+            )
+
+        persist.assert_called_once_with("grok", ready_result, write_txt=True)
+        self.assertEqual((status, error, saved), ("ready", "", True))
+        self.assertEqual(self.pending_store.list(), [])
+
+    def test_final_persistence_failure_replaces_oauth_pending_with_retryable_result(self) -> None:
+        manager = self._manager()
+        with patch("grok_account_manager.api.services.jobs.threading.Thread.start"):
+            manager.start(total=1, concurrency=1, oauth_exchange=True, email_source="duckmail")
+        manager._registration_checkpoint_callback(1, 1)(
+            {
+                "email": "retry@example.com",
+                "credential": "browser-sso",
+                "oauth_status": "pending",
+            }
+        )
+        pending_id = self.pending_store.list(OAUTH_PENDING)[0]["id"]
+        ready_result = {
+            "email": "retry@example.com",
+            "credential": "browser-sso",
+            "oauth_status": "ready",
+            "full_credential": {
+                "email": "retry@example.com",
+                "access_token": "access",
+                "refresh_token": "refresh",
+                "sso_token": "browser-sso",
+            },
+        }
+
+        with patch.object(manager, "_persist_result", side_effect=OSError("disk full")):
+            with self.assertRaisesRegex(OSError, "disk full"):
+                manager._persist_completed_result(
+                    "grok",
+                    ready_result,
+                    oauth_required=True,
+                    pending_id=pending_id,
+                )
+
+        failed = self.pending_store.list(PERSISTENCE_FAILED)
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0]["result"]["full_credential"]["refresh_token"], "refresh")
+        self.assertEqual(failed[0]["error"], "disk full")
+
+    def test_manager_initialization_retries_only_persistence_failures(self) -> None:
+        oauth_result = {
+            "email": "pending@example.com",
+            "credential": "pending-sso",
+            "oauth_status": "pending",
+        }
+        ready_result = {
+            "email": "retry@example.com",
+            "credential": "ready-sso",
+            "oauth_status": "ready",
+            "full_credential": {
+                "email": "retry@example.com",
+                "access_token": "access",
+                "refresh_token": "refresh",
+            },
+        }
+        self.pending_store.upsert(
+            "old-job:1",
+            status=OAUTH_PENDING,
+            provider_name="grok",
+            result=oauth_result,
+            write_txt=True,
+            oauth_required=True,
+        )
+        self.pending_store.upsert(
+            "old-job:2",
+            status=PERSISTENCE_FAILED,
+            provider_name="grok",
+            result=ready_result,
+            write_txt=True,
+            oauth_required=True,
+        )
+
+        with patch.object(RegistrationJobManager, "_persist_result") as persist:
+            manager = RegistrationJobManager(pending_store=self.pending_store)
+
+        persist.assert_called_once_with("grok", ready_result, write_txt=True)
+        self.assertEqual(manager.pending_retry_summary, {"found": 1, "completed": 1, "failed": 0})
+        remaining = self.pending_store.list()
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(remaining[0]["status"], OAUTH_PENDING)
+
+    def test_failed_account_history_marks_job_completed_with_errors(self) -> None:
+        manager = self._manager()
+        manager._job = {
+            "id": "job-with-persistence-error",
+            "status": "running",
+            "concurrency": 0,
+            "oauthExchange": False,
+            "failed": 0,
+            "workerErrors": 0,
+            "refreshTokenFailed": 0,
+            "failedAccounts": [{"reason": "disk full"}],
+            "events": [],
+        }
+
+        manager._run_job("job-with-persistence-error")
+
+        self.assertEqual(manager._job["status"], "completed_with_errors")
+        self.assertIn("落盘失败", manager._job["events"][-1]["message"])
 
     def test_failed_oauth_result_is_not_persisted(self) -> None:
-        manager = RegistrationJobManager()
+        manager = self._manager()
         with patch.object(manager, "_persist_result") as persist:
             status, error, saved = manager._persist_completed_result(
                 "grok",
@@ -86,7 +246,7 @@ class RegistrationJobManagerTests(unittest.TestCase):
         self.assertFalse(saved)
 
     def test_worker_session_is_registered_before_browser_start(self) -> None:
-        manager = RegistrationJobManager()
+        manager = self._manager()
         manager._job = {"concurrency": 1, "windowsMinimized": True}
         fake_session = Mock()
 
@@ -111,7 +271,7 @@ class RegistrationJobManagerTests(unittest.TestCase):
         fake_session.set_window_minimized.assert_called_once_with(True, apply_now=False)
 
     def test_window_command_updates_ready_and_starting_sessions(self) -> None:
-        manager = RegistrationJobManager()
+        manager = self._manager()
         manager._job = {
             "status": "running",
             "windowsMinimized": False,
@@ -133,7 +293,7 @@ class RegistrationJobManagerTests(unittest.TestCase):
         starting_session.set_window_minimized.assert_called_once_with(True)
 
     def test_retry_preserves_browser_window_preference(self) -> None:
-        manager = RegistrationJobManager()
+        manager = self._manager()
         manager._last_config = {
             "oauth_exchange": True,
             "minimize_browsers": False,
@@ -146,7 +306,7 @@ class RegistrationJobManagerTests(unittest.TestCase):
         self.assertFalse(start.call_args.kwargs["minimize_browsers"])
 
     def test_round_timeout_requests_cooperative_stop(self) -> None:
-        manager = RegistrationJobManager()
+        manager = self._manager()
         round_stop = threading.Event()
 
         class Provider:
@@ -178,7 +338,7 @@ class RegistrationJobManagerTests(unittest.TestCase):
         self.assertFalse(_is_oauth_access_denied("connection reset"))
 
     def test_repeated_access_denied_opens_oauth_circuit(self) -> None:
-        manager = RegistrationJobManager()
+        manager = self._manager()
         manager._job = {
             "status": "running",
             "refreshTokenCompleted": 0,
@@ -217,7 +377,7 @@ class RegistrationJobManagerTests(unittest.TestCase):
         self.assertIn("Access denied", snapshot["workers"][0]["message"])
 
     def test_stop_returns_via_async_browser_cleanup(self) -> None:
-        manager = RegistrationJobManager()
+        manager = self._manager()
         manager._job = {"status": "running", "events": []}
         session = Mock()
         manager._sessions.add(session)

@@ -28,6 +28,8 @@ _ACTIVE_CACHE_PATHS: set[str] = set()
 _ACTIVE_DEBUG_PORTS: set[int] = set()
 _ACTIVE_BROWSER_PIDS: set[int] = set()
 _STALE_TEMP_PATHS: set[str] = set()
+_BROWSER_START_MAX_ATTEMPTS = 3
+_BROWSER_START_RETRY_DELAY_SECONDS = 0.25
 
 
 def _path_key(path: str | Path) -> str:
@@ -123,12 +125,12 @@ def _retry_stale_temp_cleanup() -> None:
         _remove_temp_tree(path)
 
 
-def _find_owned_browser_process(
+def _find_owned_browser_processes(
     profile_dir: Path,
     cache_dir: Path,
     debug_port: int,
-) -> tuple[psutil.Process, list[str]] | None:
-    """Find one Chrome process only when all three assigned resources match exactly."""
+) -> list[tuple[psutil.Process, list[str]]]:
+    """Find Chrome processes only when all three assigned resources match exactly."""
     expected_profile = _path_key(profile_dir)
     expected_cache = _path_key(cache_dir)
     matches: list[tuple[psutil.Process, list[str]]] = []
@@ -148,6 +150,16 @@ def _find_owned_browser_process(
                 matches.append((process, command))
         except (psutil.AccessDenied, psutil.NoSuchProcess, ValueError):
             continue
+    return matches
+
+
+def _find_owned_browser_process(
+    profile_dir: Path,
+    cache_dir: Path,
+    debug_port: int,
+) -> tuple[psutil.Process, list[str]] | None:
+    """Find one unambiguous Chrome main process for isolation verification."""
+    matches = _find_owned_browser_processes(profile_dir, cache_dir, debug_port)
     if len(matches) > 1:
         raise RuntimeError("浏览器隔离校验失败：同一环境匹配到多个 Chrome 主进程")
     return matches[0] if matches else None
@@ -621,31 +633,47 @@ class DrissionBrowserSession:
         # and bind each browser serially so concurrent workers cannot all fall
         # back to the default 9222 endpoint and attach to one Chrome instance.
         with _BROWSER_START_LOCK:
-            try:
-                self._prepare_fresh_profile()
-                self._prepare_fresh_fingerprint()
-                if self._stop_requested:
-                    raise RuntimeError("任务已停止：取消浏览器启动")
-                debug_port = self._claim_debug_port()
-                self._options.set_local_port(debug_port)
-                print(f"[*] 已为浏览器分配独立调试端口: {debug_port}")
-                self._browser = Chromium(self._options)
-                self._verify_isolation()
-                if self._stop_requested:
-                    raise RuntimeError("任务已停止：浏览器启动后立即关闭")
-                tabs = self._browser.get_tabs()
-                # DrissionPage 的 /json tab 列表把最新 tab 放在第 0 位。
-                self._page = tabs[0] if tabs else self._browser.new_tab()
-                self._capture_browser_context()
-            except Exception:
-                self._shutdown_browser_locked()
-                raise
+            self._prepare_fresh_profile()
+            self._prepare_fresh_fingerprint()
+            if self._stop_requested:
+                raise RuntimeError("任务已停止：取消浏览器启动")
+            debug_port = self._claim_debug_port()
+            self._options.set_local_port(debug_port)
+            print(f"[*] 已为浏览器分配独立调试端口: {debug_port}")
+            self._browser = Chromium(self._options)
+            self._verify_isolation()
+            if self._stop_requested:
+                raise RuntimeError("任务已停止：浏览器启动后立即关闭")
+            tabs = self._browser.get_tabs()
+            # DrissionPage 的 /json tab 列表把最新 tab 放在第 0 位。
+            self._page = tabs[0] if tabs else self._browser.new_tab()
+            self._capture_browser_context()
         self._apply_window_bounds()
         return self
 
+    def _start_with_retry_locked(self):
+        if self._browser is not None:
+            raise RuntimeError("浏览器会话已启动，拒绝复用时再次初始化环境")
+        for attempt in range(1, _BROWSER_START_MAX_ATTEMPTS + 1):
+            if self._stop_requested:
+                raise RuntimeError("任务已停止：浏览器会话禁止重新启动")
+            try:
+                return self._start_locked()
+            except Exception as error:
+                self._shutdown_browser_locked()
+                if self._stop_requested:
+                    raise RuntimeError("任务已停止：取消浏览器启动重试") from error
+                if attempt >= _BROWSER_START_MAX_ATTEMPTS:
+                    raise
+                print(
+                    f"[警告] 浏览器启动失败（{attempt}/{_BROWSER_START_MAX_ATTEMPTS}）：{error}；"
+                    "清理后重试"
+                )
+                time.sleep(_BROWSER_START_RETRY_DELAY_SECONDS * attempt)
+
     def start(self):
         with self._lifecycle_lock:
-            return self._start_locked()
+            return self._start_with_retry_locked()
 
     def _apply_window_bounds(self) -> None:
         if self._page is None:
@@ -733,6 +761,21 @@ class DrissionBrowserSession:
                 pass
         if self._owns_browser_process:
             _stop_owned_browser_process(process_id, create_time)
+        elif self._profile_dir is not None and self._cache_dir is not None and self.debug_port is not None:
+            try:
+                matches = _find_owned_browser_processes(
+                    self._profile_dir,
+                    self._cache_dir,
+                    self.debug_port,
+                )
+                for process, _command in matches:
+                    try:
+                        process_create_time = process.create_time()
+                    except (psutil.AccessDenied, psutil.NoSuchProcess):
+                        continue
+                    _stop_owned_browser_process(process.pid, process_create_time)
+            except Exception as error:
+                print(f"[警告] 反查并清理本轮 Chrome 进程失败: {error}")
         self._browser = None
         self._page = None
         self._cleanup_profile()
@@ -770,7 +813,7 @@ class DrissionBrowserSession:
             if self._stop_requested:
                 raise RuntimeError("任务已停止：浏览器会话禁止重新启动")
             self._shutdown_browser_locked()
-            return self._start_locked()
+            return self._start_with_retry_locked()
 
     @property
     def page(self):

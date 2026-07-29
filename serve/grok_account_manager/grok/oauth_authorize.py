@@ -10,6 +10,7 @@
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -27,6 +28,24 @@ OIDC_SCOPE = "openid profile email offline_access grok-cli:access api:access con
 
 DEVICE_AUTHORIZATION_ENDPOINT = "https://auth.x.ai/oauth2/device/code"
 TOKEN_ENDPOINT = "https://auth.x.ai/oauth2/token"
+
+
+def _write_private_credential(filepath: Path, credential: dict) -> None:
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+    file_descriptor = os.open(
+        filepath,
+        os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+        0o600,
+    )
+    try:
+        filepath.chmod(0o600)
+        with os.fdopen(file_descriptor, "w", encoding="utf-8") as handle:
+            file_descriptor = -1
+            json.dump([credential], handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+    finally:
+        if file_descriptor >= 0:
+            os.close(file_descriptor)
 
 
 def _verification_url(device_data: dict) -> str:
@@ -202,8 +221,7 @@ def main():
         filename = f"grok_{timestamp}_{email_hash}.json"
         filepath = output_dir / filename
 
-        with open(filepath, "w", encoding="utf-8") as f:
-            json.dump([credential], f, ensure_ascii=False, indent=2)
+        _write_private_credential(filepath, credential)
 
         print(f"\n{'='*60}")
         print(f"✓ 完整凭证已保存到: {filepath}")

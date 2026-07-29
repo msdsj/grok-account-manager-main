@@ -132,6 +132,94 @@ class BrowserIsolationTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "禁止重新启动"):
             session.restart()
 
+    def test_start_retries_after_cleanup(self) -> None:
+        session = DrissionBrowserSession(ChromiumOptions())
+        start_attempt = Mock(side_effect=[RuntimeError("transient startup failure"), session])
+
+        with (
+            patch.object(session, "_start_locked", start_attempt),
+            patch.object(session, "_shutdown_browser_locked") as cleanup,
+            patch("grok_account_manager.core.browser.time.sleep") as retry_sleep,
+        ):
+            result = session.start()
+
+        self.assertIs(result, session)
+        self.assertEqual(start_attempt.call_count, 2)
+        cleanup.assert_called_once_with()
+        retry_sleep.assert_called_once()
+
+    def test_start_retry_count_is_bounded(self) -> None:
+        session = DrissionBrowserSession(ChromiumOptions())
+        start_attempt = Mock(side_effect=RuntimeError("persistent startup failure"))
+
+        with (
+            patch.object(session, "_start_locked", start_attempt),
+            patch.object(session, "_shutdown_browser_locked") as cleanup,
+            patch("grok_account_manager.core.browser.time.sleep") as retry_sleep,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "persistent startup failure"):
+                session.start()
+
+        self.assertEqual(start_attempt.call_count, 3)
+        self.assertEqual(cleanup.call_count, 3)
+        self.assertEqual(retry_sleep.call_count, 2)
+
+    def test_stop_request_cancels_start_retries(self) -> None:
+        session = DrissionBrowserSession(ChromiumOptions())
+
+        def fail_after_stop_request():
+            session._stop_requested = True
+            raise RuntimeError("startup interrupted")
+
+        with (
+            patch.object(session, "_start_locked", side_effect=fail_after_stop_request) as start_attempt,
+            patch.object(session, "_shutdown_browser_locked") as cleanup,
+            patch("grok_account_manager.core.browser.time.sleep") as retry_sleep,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "取消浏览器启动重试"):
+                session.start()
+
+        start_attempt.assert_called_once_with()
+        cleanup.assert_called_once_with()
+        retry_sleep.assert_not_called()
+
+    def test_restart_uses_start_retries_after_normal_shutdown(self) -> None:
+        session = DrissionBrowserSession(ChromiumOptions())
+        start_attempt = Mock(side_effect=[RuntimeError("restart startup failure"), session])
+
+        with (
+            patch.object(session, "_start_locked", start_attempt),
+            patch.object(session, "_shutdown_browser_locked") as cleanup,
+            patch("grok_account_manager.core.browser.time.sleep"),
+        ):
+            result = session.restart()
+
+        self.assertIs(result, session)
+        self.assertEqual(start_attempt.call_count, 2)
+        self.assertEqual(cleanup.call_count, 2)
+
+    def test_failed_unverified_start_cleans_matching_chrome_process(self) -> None:
+        session = DrissionBrowserSession(ChromiumOptions())
+        session._profile_dir = Path("/tmp/grok-chrome-profile-test")
+        session._cache_dir = Path("/tmp/grok-chrome-cache-test")
+        session.debug_port = 43123
+        process = Mock()
+        process.pid = 4321
+        process.create_time.return_value = 12.5
+
+        with (
+            patch(
+                "grok_account_manager.core.browser._find_owned_browser_processes",
+                return_value=[(process, [])],
+            ),
+            patch("grok_account_manager.core.browser._stop_owned_browser_process") as stop_process,
+            patch.object(session, "_cleanup_profile") as cleanup_profile,
+        ):
+            session._shutdown_browser_locked()
+
+        stop_process.assert_called_once_with(4321, 12.5)
+        cleanup_profile.assert_called_once_with()
+
     def test_stop_request_is_visible_while_start_lock_is_busy(self) -> None:
         session = DrissionBrowserSession(ChromiumOptions())
         session._lifecycle_lock.acquire()

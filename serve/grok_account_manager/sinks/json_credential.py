@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
+import os
+import shutil
 import tempfile
-from typing import TYPE_CHECKING
+import time
+from pathlib import Path
+from typing import TYPE_CHECKING, NoReturn
 
 from ..grok.client import build_cockpit_grok_credential
 
@@ -79,10 +82,14 @@ def _write_credentials_atomic(filepath: Path, credentials: list[dict]) -> None:
             suffix=".tmp",
             delete=False,
         ) as handle:
+            os.chmod(handle.name, 0o600)
             json.dump(credentials, handle, ensure_ascii=False, indent=2)
             handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
             temp_path = Path(handle.name)
         temp_path.replace(filepath)
+        filepath.chmod(0o600)
     finally:
         if temp_path is not None and temp_path.exists():
             temp_path.unlink(missing_ok=True)
@@ -93,17 +100,37 @@ def _load_existing_credentials(filepath: Path) -> list[dict]:
         return []
     raw = filepath.read_text(encoding="utf-8").strip()
     if not raw:
-        filepath.write_text("[]", encoding="utf-8")
         return []
     try:
         data = json.loads(raw)
-    except json.JSONDecodeError:
-        filepath.write_text("[]", encoding="utf-8")
-        return []
+    except json.JSONDecodeError as error:
+        _raise_broken_credentials(filepath, f"JSON 解析失败: {error}")
     if not isinstance(data, list):
-        filepath.write_text("[]", encoding="utf-8")
-        return []
-    return [item for item in data if isinstance(item, dict)]
+        _raise_broken_credentials(filepath, "顶层结构不是 JSON 数组")
+    if not all(isinstance(item, dict) for item in data):
+        _raise_broken_credentials(filepath, "数组中包含非对象凭证记录")
+    return data
+
+
+def _raise_broken_credentials(filepath: Path, reason: str) -> NoReturn:
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    backup_path = filepath.with_name(f"{filepath.name}.broken-{timestamp}")
+    suffix = 1
+    while backup_path.exists():
+        backup_path = filepath.with_name(f"{filepath.name}.broken-{timestamp}-{suffix}")
+        suffix += 1
+
+    descriptor = os.open(backup_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "wb") as target, filepath.open("rb") as source:
+            shutil.copyfileobj(source, target)
+            target.flush()
+            os.fsync(target.fileno())
+    except Exception:
+        backup_path.unlink(missing_ok=True)
+        raise
+    backup_path.chmod(0o600)
+    raise ValueError(f"凭证文件已损坏（{reason}），已备份到 {backup_path}，拒绝覆盖原文件")
 
 
 class JsonCredentialSink:
@@ -181,3 +208,4 @@ class JsonCredentialSink:
                 account_db.upsert_account(account, credential, filepath, item_index)
         except Exception as error:
             print(f"[JsonCredentialSink] 写入账号数据库失败: {error}")
+            raise

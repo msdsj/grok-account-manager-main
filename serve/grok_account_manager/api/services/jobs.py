@@ -31,6 +31,7 @@ from ..config import (
 )
 from ..utils import json_default, now_ms, safe_int
 from .accounts import invalidate_accounts_cache
+from .pending import OAUTH_PENDING, PERSISTENCE_FAILED, PendingResultStore
 
 
 def _fingerprint_summary(session: DrissionBrowserSession) -> str:
@@ -69,7 +70,7 @@ class CombinedStopEvent:
 
 
 class RegistrationJobManager:
-    def __init__(self) -> None:
+    def __init__(self, pending_store: PendingResultStore | None = None) -> None:
         self._lock = threading.RLock()
         self._persist_lock = threading.Lock()
         self._stop_event = threading.Event()
@@ -80,6 +81,52 @@ class RegistrationJobManager:
         self._oauth_semaphore: threading.BoundedSemaphore | None = None
         self._next_job_start_not_before = 0.0
         self._last_config: dict = {}
+        self._pending_store = pending_store if pending_store is not None else PendingResultStore()
+        self.pending_retry_summary = self.retry_pending_persistence()
+
+    def retry_pending_persistence(self) -> dict[str, int]:
+        """Retry only results that previously reached final persistence and failed."""
+        summary = {"found": 0, "completed": 0, "failed": 0}
+        try:
+            records = self._pending_store.list(PERSISTENCE_FAILED)
+        except Exception as error:
+            print(f"[RegistrationJobManager] 读取待恢复凭证失败: {error}")
+            summary["failed"] = 1
+            return summary
+
+        summary["found"] = len(records)
+        for record in records:
+            record_id = str(record.get("id") or "")
+            result = record.get("result")
+            if not record_id or not isinstance(result, dict):
+                summary["failed"] += 1
+                continue
+            try:
+                if bool(record.get("oauth_required")) and (
+                    str(result.get("oauth_status") or "") != "ready"
+                    or not _result_has_refresh_token(result)
+                ):
+                    raise ValueError("待恢复 OAuth 结果缺少有效 refresh_token")
+                self._persist_result(
+                    str(record.get("provider_name") or "grok"),
+                    result,
+                    write_txt=bool(record.get("write_txt")),
+                )
+            except Exception as error:
+                summary["failed"] += 1
+                try:
+                    self._pending_store.note_error(record_id, str(error), increment_attempts=True)
+                except Exception as store_error:
+                    print(f"[RegistrationJobManager] 更新待恢复凭证失败: {store_error}")
+            else:
+                try:
+                    self._pending_store.remove(record_id)
+                except Exception as error:
+                    summary["failed"] += 1
+                    print(f"[RegistrationJobManager] 清理已恢复凭证失败: {error}")
+                else:
+                    summary["completed"] += 1
+        return summary
 
     def snapshot(self) -> dict | None:
         with self._lock:
@@ -403,18 +450,97 @@ class RegistrationJobManager:
 
         return _callback
 
+    @staticmethod
+    def _pending_result_id(job_id: str, round_index: int) -> str:
+        return f"{job_id}:{round_index}"
+
+    def _record_pending_result(
+        self,
+        record_id: str,
+        *,
+        status: str,
+        provider_name: str,
+        result: dict,
+        write_txt: bool,
+        oauth_required: bool,
+        job_id: str = "",
+        worker_index: int = 0,
+        round_index: int = 0,
+        error: str = "",
+    ) -> None:
+        self._pending_store.upsert(
+            record_id,
+            status=status,
+            provider_name=provider_name,
+            result=result,
+            write_txt=write_txt,
+            oauth_required=oauth_required,
+            job_id=job_id,
+            worker_index=worker_index,
+            round_index=round_index,
+            error=error,
+        )
+
     def _registration_checkpoint_callback(self, worker_index: int, round_index: int):
         with self._lock:
             expected_job_id = str((self._job or {}).get("id") or "")
             oauth_required = bool((self._job or {}).get("oauthExchange"))
+        pending_id = self._pending_result_id(expected_job_id, round_index)
 
         def _callback(result: dict) -> None:
-            if not oauth_required:
-                self._persist_result("grok", result)
             email = str(result.get("email") or "")
             with self._lock:
-                if str((self._job or {}).get("id") or "") != expected_job_id:
+                if (
+                    str((self._job or {}).get("id") or "") != expected_job_id
+                    or (self._job or {}).get("status") not in {"running", "stopping"}
+                ):
                     return
+                if oauth_required:
+                    self._record_pending_result(
+                        pending_id,
+                        status=OAUTH_PENDING,
+                        provider_name="grok",
+                        result=result,
+                        write_txt=True,
+                        oauth_required=True,
+                        job_id=expected_job_id,
+                        worker_index=worker_index,
+                        round_index=round_index,
+                    )
+                else:
+                    self._record_pending_result(
+                        pending_id,
+                        status=PERSISTENCE_FAILED,
+                        provider_name="grok",
+                        result=result,
+                        write_txt=True,
+                        oauth_required=False,
+                        job_id=expected_job_id,
+                        worker_index=worker_index,
+                        round_index=round_index,
+                        error="等待正式持久化",
+                    )
+                    try:
+                        self._persist_result("grok", result)
+                    except Exception as error:
+                        self._record_pending_result(
+                            pending_id,
+                            status=PERSISTENCE_FAILED,
+                            provider_name="grok",
+                            result=result,
+                            write_txt=True,
+                            oauth_required=False,
+                            job_id=expected_job_id,
+                            worker_index=worker_index,
+                            round_index=round_index,
+                            error=str(error),
+                        )
+                        raise
+                    else:
+                        try:
+                            self._pending_store.remove(pending_id)
+                        except Exception as error:
+                            print(f"[RegistrationJobManager] 清理已保存 checkpoint 失败: {error}")
                 registered_accounts = self._job.setdefault("registeredAccounts", [])
                 item = next(
                     (
@@ -663,10 +789,10 @@ class RegistrationJobManager:
     def _persist_result(self, provider_name: str, result: dict, *, write_txt: bool = True) -> None:
         with self._persist_lock:
             json_sink = JsonCredentialSink(str(CREDENTIALS_DIR))
-            if write_txt:
-                TxtFileSink(TXT_OUTPUT).push(provider_name, result)
             json_sink.push(provider_name, result)
             json_sink.flush()
+            if write_txt:
+                TxtFileSink(TXT_OUTPUT).push(provider_name, result)
             invalidate_accounts_cache()
 
     def _persist_completed_result(
@@ -675,23 +801,59 @@ class RegistrationJobManager:
         result: dict,
         *,
         oauth_required: bool,
+        pending_id: str | None = None,
     ) -> tuple[str, str, bool]:
         oauth_status = str(result.get("oauth_status") or "not_requested")
         oauth_error = str(result.get("oauth_error") or "")
         if oauth_required and (
             oauth_status != "ready" or not _result_has_refresh_token(result)
         ):
+            if pending_id:
+                self._pending_store.note_error(
+                    pending_id,
+                    oauth_error or "未获取到 refresh_token，凭证未保存",
+                )
             return (
                 "failed",
                 oauth_error or "未获取到 refresh_token，凭证未保存",
                 False,
             )
 
-        self._persist_result(
-            provider_name,
-            result,
-            write_txt=oauth_required,
-        )
+        write_txt = bool(oauth_required)
+        if pending_id:
+            self._record_pending_result(
+                pending_id,
+                status=PERSISTENCE_FAILED,
+                provider_name=provider_name,
+                result=result,
+                write_txt=write_txt,
+                oauth_required=oauth_required,
+                error="等待正式持久化",
+            )
+        try:
+            self._persist_result(
+                provider_name,
+                result,
+                write_txt=write_txt,
+            )
+        except Exception as error:
+            if pending_id:
+                self._record_pending_result(
+                    pending_id,
+                    status=PERSISTENCE_FAILED,
+                    provider_name=provider_name,
+                    result=result,
+                    write_txt=write_txt,
+                    oauth_required=oauth_required,
+                    error=str(error),
+                )
+            raise
+        else:
+            if pending_id:
+                try:
+                    self._pending_store.remove(pending_id)
+                except Exception as error:
+                    print(f"[RegistrationJobManager] 清理已保存凭证失败: {error}")
         return oauth_status, oauth_error, True
 
     def _create_provider(
@@ -867,6 +1029,9 @@ class RegistrationJobManager:
                 ok = False
                 cancelled = False
                 round_stop_event = threading.Event()
+                with self._lock:
+                    round_job_id = str((self._job or {}).get("id") or "")
+                pending_id = self._pending_result_id(round_job_id, round_index)
                 provider = self._create_provider(
                     oauth_exchange,
                     CombinedStopEvent(self._stop_event, round_stop_event),
@@ -908,7 +1073,12 @@ class RegistrationJobManager:
                             ok = True
                             reason = (
                                 f"账号已注册，但后续阶段超过 {round_timeout_seconds} 秒；"
-                                "未获取 refresh_token，凭证未保存"
+                                "未获取 refresh_token，SSO checkpoint 已保留"
+                                if oauth_exchange
+                                else (
+                                    f"账号已注册，但后续阶段超过 {round_timeout_seconds} 秒；"
+                                    "结果已保存或进入恢复队列"
+                                )
                             )
                             self._finalize_registered_account(
                                 worker_index=worker_index,
@@ -958,6 +1128,7 @@ class RegistrationJobManager:
                                 provider.name,
                                 result,
                                 oauth_required=oauth_exchange,
+                                pending_id=pending_id,
                             )
                             self._finalize_registered_account(
                                 worker_index=worker_index,
@@ -980,6 +1151,7 @@ class RegistrationJobManager:
                             provider.name,
                             result,
                             oauth_required=oauth_exchange,
+                            pending_id=pending_id,
                         )
                         self._finalize_registered_account(
                             worker_index=worker_index,
@@ -1020,7 +1192,7 @@ class RegistrationJobManager:
                                 (
                                     f"第 {round_index} 轮账号已注册但未取得 RT，凭证未保存，后续处理已停止"
                                     if oauth_exchange
-                                    else f"第 {round_index} 轮账号已保存，后续处理已停止"
+                                    else f"第 {round_index} 轮账号已注册，结果已保存或进入恢复队列"
                                 )
                                 if registered
                                 else f"第 {round_index} 轮已被停止"
@@ -1050,7 +1222,7 @@ class RegistrationJobManager:
                                 (
                                     f"第 {round_index} 轮账号已注册但未取得 RT，凭证未保存：{error}"
                                     if oauth_exchange
-                                    else f"第 {round_index} 轮账号已保存，但后续处理失败：{error}"
+                                    else f"第 {round_index} 轮账号已注册，正式落盘失败并已进入恢复队列：{error}"
                                 )
                                 if registered
                                 else f"第 {round_index} 轮失败：{error}"
@@ -1081,7 +1253,7 @@ class RegistrationJobManager:
                                 (
                                     f"第 {round_index} 轮账号已注册但未取得 RT，凭证未保存，后续处理已停止"
                                     if oauth_exchange
-                                    else f"第 {round_index} 轮账号已保存，后续处理已停止"
+                                    else f"第 {round_index} 轮账号已注册，结果已保存或进入恢复队列"
                                 )
                                 if registered
                                 else f"第 {round_index} 轮已被停止"
@@ -1111,7 +1283,7 @@ class RegistrationJobManager:
                                 (
                                     f"第 {round_index} 轮账号已注册但未取得 RT，凭证未保存：{error}"
                                     if oauth_exchange
-                                    else f"第 {round_index} 轮账号已保存，但后续处理失败：{error}"
+                                    else f"第 {round_index} 轮账号已注册，正式落盘失败并已进入恢复队列：{error}"
                                 )
                                 if registered
                                 else f"第 {round_index} 轮失败：{error}"
@@ -1215,9 +1387,10 @@ class RegistrationJobManager:
                 self._job.get("failed", 0) > 0
                 or self._job.get("workerErrors", 0) > 0
                 or self._job.get("refreshTokenFailed", 0) > 0
+                or bool(self._job.get("failedAccounts"))
             ):
                 self._job["status"] = "completed_with_errors"
-                self._event_locked("warning", "任务完成，但存在注册失败或 refresh_token 缺失")
+                self._event_locked("warning", "任务完成，但存在注册、refresh_token 或落盘失败")
             else:
                 self._job["status"] = "completed"
                 self._event_locked("success", "任务已全部完成")

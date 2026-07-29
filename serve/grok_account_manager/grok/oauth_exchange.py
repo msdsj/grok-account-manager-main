@@ -46,6 +46,11 @@ DEVICE_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:device_code"
 DEFAULT_INTERVAL_SECONDS = 5
 MAX_LOGIN_SECONDS = 30 * 60
 MAX_CONSECUTIVE_POLL_TRANSPORT_ERRORS = 3
+MAX_CONSECUTIVE_PAGE_ERRORS = 6
+
+
+class OAuthTerminalError(RuntimeError):
+    """Device Flow 已被服务端终止，重新申请 code 不会恢复。"""
 
 
 def _validate_xai_endpoint(raw: str | None, field: str, fallback: str | None = None) -> str:
@@ -245,8 +250,8 @@ def exchange_sso_for_oauth_tokens(
                 maximum=MAX_LOGIN_SECONDS,
             )
 
-            print(f"[OAuth Exchange] Device Code 已生成 ({attempt}/{max_attempts})，User Code: {user_code}")
-            print(f"[OAuth Exchange] 打开授权页面: {verification_url}")
+            print(f"[OAuth Exchange] Device Code 已生成 ({attempt}/{max_attempts})")
+            print("[OAuth Exchange] 正在浏览器中打开授权页面")
             oauth_page, opened_new_tab = _open_oauth_url(session, verification_url)
             try:
                 tokens = _drive_device_authorization_and_poll(
@@ -318,6 +323,9 @@ def _poll_device_token_once(
             return "fatal", "xAI token response missing access_token"
         return "complete", data
 
+    if response.status_code in {408, 425, 429} or 500 <= response.status_code < 600:
+        return "transport_error", f"HTTP {response.status_code}: {data}"
+
     error_code = str(data.get("error") or "").strip()
     error_description = str(data.get("error_description") or "").strip()
     if error_code == "authorization_pending":
@@ -327,7 +335,7 @@ def _poll_device_token_once(
     if error_code == "access_denied":
         return "fatal", "Grok OAuth 授权已被拒绝"
     if error_code == "expired_token":
-        return "fatal", "Grok OAuth 验证码已过期"
+        return "expired", "Grok OAuth 验证码已过期"
     if error_code:
         suffix = f" ({error_description})" if error_description else ""
         return "fatal", f"Grok OAuth 失败: {error_code}{suffix}"
@@ -355,6 +363,7 @@ def _drive_device_authorization_and_poll(
     notices: set[str] = set()
     last_status_at = 0.0
     consecutive_transport_errors = 0
+    consecutive_page_errors = 0
     consent_click_sent = False
     consent_click_at = 0.0
 
@@ -386,8 +395,10 @@ def _drive_device_authorization_and_poll(
                 if consecutive_transport_errors >= MAX_CONSECUTIVE_POLL_TRANSPORT_ERRORS:
                     raise RuntimeError(f"token 轮询连续传输失败，最后错误：{payload}")
                 next_poll_at = now + interval
-            else:
+            elif poll_result == "expired":
                 raise RuntimeError(str(payload))
+            else:
+                raise OAuthTerminalError(str(payload))
 
         if now - last_status_at >= 5:
             remaining = max(0, int(deadline - now))
@@ -404,9 +415,21 @@ def _drive_device_authorization_and_poll(
                 user_code=user_code,
                 email_code=email_code,
             )
-        except Exception:
+        except Exception as error:
+            consecutive_page_errors += 1
+            if consecutive_page_errors >= MAX_CONSECUTIVE_PAGE_ERRORS:
+                raise RuntimeError(
+                    "授权页连续驱动失败 "
+                    f"({consecutive_page_errors} 次)：{error}"
+                ) from error
+            try:
+                oauth_page = session.refresh_page()
+            except Exception:
+                pass
             time.sleep(0.5)
             continue
+
+        consecutive_page_errors = 0
 
         if action == "needs-email-code" and not email_code:
             print("[OAuth Exchange] 授权登录要求邮箱验证码，开始读取验证码")
@@ -726,7 +749,23 @@ if (host.includes('accounts.google.') || host === 'google.com' || host.endsWith(
         return label ? `google-consent-click:${label}` : 'idle';
     }
 
-    const identifierInput = visibleInputs('input[type="email"], input[name="identifier"], input#identifierId').at(0);
+    const recoveryInput = visibleInputs('input[name="knowledgePreregisteredEmailResponse"], input[type="email"], input[type="text"]').find((node) => {
+        const name = String(node.name || node.id || node.autocomplete || '').toLowerCase();
+        return name.includes('recovery') || name.includes('knowledge') || bodyText.includes('recovery email') || bodyText.includes('辅助邮箱');
+    });
+    if (recoveryInput && recoveryEmail) {
+        const current = String(recoveryInput.value || '').trim();
+        if (current.toLowerCase() !== recoveryEmail.toLowerCase()) {
+            return setValue(recoveryInput, recoveryEmail) ? 'google-recovery-filled' : 'idle';
+        }
+        const label = clickButton('google-recovery-next', ['next', '下一步'], recoveryInput);
+        return label ? `google-recovery-click:${label}` : 'google-recovery-filled';
+    }
+
+    const identifierInput = visibleInputs('input[type="email"], input[name="identifier"], input#identifierId').find((node) => {
+        const marker = String(node.name || node.id || node.autocomplete || '').toLowerCase();
+        return !marker.includes('recovery') && !marker.includes('knowledge');
+    });
     if (identifierInput && email) {
         const current = String(identifierInput.value || '').trim();
         if (current.toLowerCase() !== email.toLowerCase()) {
@@ -744,19 +783,6 @@ if (host.includes('accounts.google.') || host === 'google.com' || host.endsWith(
         }
         const label = clickButton('google-password-next', ['next', '下一步'], passwordInput);
         return label ? `google-password-click:${label}` : 'google-password-filled';
-    }
-
-    const recoveryInput = visibleInputs('input[type="email"], input[type="text"], input[name="knowledgePreregisteredEmailResponse"]').find((node) => {
-        const name = String(node.name || node.id || node.autocomplete || '').toLowerCase();
-        return name.includes('recovery') || name.includes('knowledge') || bodyText.includes('recovery email') || bodyText.includes('辅助邮箱');
-    });
-    if (recoveryInput && recoveryEmail) {
-        const current = String(recoveryInput.value || '').trim();
-        if (current.toLowerCase() !== recoveryEmail.toLowerCase()) {
-            return setValue(recoveryInput, recoveryEmail) ? 'google-recovery-filled' : 'idle';
-        }
-        const label = clickButton('google-recovery-next', ['next', '下一步'], recoveryInput);
-        return label ? `google-recovery-click:${label}` : 'google-recovery-filled';
     }
 
     if (isAccountChooserPage) {
@@ -1023,17 +1049,32 @@ def _try_click_turnstile_checkbox(page) -> bool:
         challenge_solution = page.ele("@name=cf-turnstile-response")
         challenge_wrapper = challenge_solution.parent()
         challenge_iframe = challenge_wrapper.shadow_root.ele("tag:iframe")
+    except Exception:
+        return False
+
+    try:
         challenge_iframe.run_js(
             """
 function getRandomInt(min, max) {
     return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 let screenX = getRandomInt(800, 1200);
-let screenY = getRandomInt(400, 600);
-Object.defineProperty(MouseEvent.prototype, 'screenX', { value: screenX });
-Object.defineProperty(MouseEvent.prototype, 'screenY', { value: screenY });
+let screenY = getRandomInt(400, 700);
+for (const [name, value] of [['screenX', screenX], ['screenY', screenY]]) {
+    const current = Object.getOwnPropertyDescriptor(MouseEvent.prototype, name);
+    if (!current || current.configurable) {
+        Object.defineProperty(MouseEvent.prototype, name, {
+            configurable: true,
+            get: function () { return value; },
+        });
+    }
+}
             """
         )
+    except Exception:
+        pass
+
+    try:
         challenge_iframe_body = challenge_iframe.ele("tag:body").shadow_root
         challenge_button = challenge_iframe_body.ele("tag:input")
         challenge_button.click()

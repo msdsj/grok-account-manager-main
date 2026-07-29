@@ -2,6 +2,8 @@ import tempfile
 import unittest
 import json
 from pathlib import Path
+import stat
+from unittest.mock import patch
 
 from grok_account_manager.api.services import database as account_db
 from grok_account_manager.sinks.json_credential import JsonCredentialSink
@@ -91,9 +93,59 @@ class DatabaseStoreTests(unittest.TestCase):
         sink.push("grok", {"full_credential": credential})
         sink.flush()
 
-        self.assertEqual(credentials_path.read_text(encoding="utf-8").strip().startswith("["), True)
+        self.assertTrue(credentials_path.read_text(encoding="utf-8").strip().startswith("["))
+        self.assertEqual(list(credentials_dir.glob("grok_credentials.json.broken-*")), [])
+        self.assertEqual(stat.S_IMODE(credentials_path.stat().st_mode), 0o600)
         exported = account_db.export_credentials(["grok_credentials.json:0"])
         self.assertEqual(exported[0]["email"], "empty-file@example.com")
+
+    def test_json_sink_backs_up_corrupt_and_non_list_files_without_overwriting(self) -> None:
+        credential = {
+            "id": "acc-broken",
+            "email": "broken@example.com",
+            "access_token": "token",
+            "refresh_token": "refresh",
+        }
+        cases = (
+            ("corrupt", "{not-json"),
+            ("object", '{"email":"old@example.com"}'),
+            ("mixed-list", '[{"email":"old@example.com"}, "invalid"]'),
+        )
+        for name, original in cases:
+            with self.subTest(name=name):
+                credentials_dir = Path(self._tmpdir.name) / name
+                credentials_dir.mkdir(parents=True, exist_ok=True)
+                credentials_path = credentials_dir / "grok_credentials.json"
+                credentials_path.write_text(original, encoding="utf-8")
+                sink = JsonCredentialSink(str(credentials_dir))
+                sink.push("grok", {"full_credential": credential})
+
+                with self.assertRaisesRegex(ValueError, "拒绝覆盖"):
+                    sink.flush()
+
+                self.assertEqual(credentials_path.read_text(encoding="utf-8"), original)
+                backups = list(credentials_dir.glob("grok_credentials.json.broken-*"))
+                self.assertEqual(len(backups), 1)
+                self.assertEqual(backups[0].read_text(encoding="utf-8"), original)
+
+    def test_json_sink_uses_private_permissions_and_surfaces_database_failure(self) -> None:
+        credentials_dir = Path(self._tmpdir.name) / "credentials-private"
+        credential = {
+            "id": "acc-private",
+            "email": "private@example.com",
+            "access_token": "token",
+            "refresh_token": "refresh",
+        }
+        sink = JsonCredentialSink(str(credentials_dir))
+        sink.push("grok", {"full_credential": credential})
+
+        with patch.object(account_db, "upsert_account", side_effect=OSError("database unavailable")):
+            with self.assertRaisesRegex(OSError, "database unavailable"):
+                sink.flush()
+
+        credentials_path = credentials_dir / "grok_credentials.json"
+        self.assertTrue(credentials_path.exists())
+        self.assertEqual(stat.S_IMODE(credentials_path.stat().st_mode), 0o600)
 
     def test_json_sink_upgrades_sso_record_in_place(self) -> None:
         credentials_dir = Path(self._tmpdir.name) / "credentials"

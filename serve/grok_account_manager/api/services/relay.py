@@ -491,10 +491,20 @@ class RelayManager:
 
     def _save_config(self, config: RelayConfig) -> None:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        CONFIG_PATH.write_text(
-            json.dumps(asdict(config), ensure_ascii=False, indent=2),
-            encoding="utf-8",
+        file_descriptor = os.open(
+            CONFIG_PATH,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+            0o600,
         )
+        try:
+            CONFIG_PATH.chmod(0o600)
+            with os.fdopen(file_descriptor, "w", encoding="utf-8") as handle:
+                file_descriptor = -1
+                json.dump(asdict(config), handle, ensure_ascii=False, indent=2)
+                handle.write("\n")
+        finally:
+            if file_descriptor >= 0:
+                os.close(file_descriptor)
 
 
 def _safe_port(value: Any, default: int) -> int:

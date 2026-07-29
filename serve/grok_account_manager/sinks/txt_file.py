@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import os
+import threading
 from pathlib import Path
 
 from ..providers.base import RegistrationResult
+
+
+_TXT_WRITE_LOCK = threading.Lock()
 
 
 class TxtFileSink:
@@ -20,8 +24,26 @@ class TxtFileSink:
             raise Exception("待写入的凭证为空")
 
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.output_path.open("a", encoding="utf-8") as f:
-            f.write(credential + "\n")
+        with _TXT_WRITE_LOCK:
+            file_descriptor = os.open(
+                self.output_path,
+                os.O_RDWR | os.O_CREAT | os.O_APPEND,
+                0o600,
+            )
+            try:
+                self.output_path.chmod(0o600)
+                with os.fdopen(file_descriptor, "a+", encoding="utf-8") as handle:
+                    file_descriptor = -1
+                    handle.seek(0)
+                    if any(line.rstrip("\r\n") == credential for line in handle):
+                        print(f"[*] 凭证已存在，跳过重复追加: {self.output_path}")
+                        return
+                    handle.write(credential + "\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            finally:
+                if file_descriptor >= 0:
+                    os.close(file_descriptor)
         print(f"[*] 已追加凭证到文件: {self.output_path}")
 
     def flush(self) -> None:
