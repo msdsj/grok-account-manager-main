@@ -9,9 +9,12 @@ small API probes through the configured local key.
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
+import base64
 import json
 import os
 from pathlib import Path
+import secrets
+import shutil
 import subprocess
 import threading
 import time
@@ -28,12 +31,21 @@ CONFIG_PATH = OUTPUT_DIR / "relay-config.json"
 LOG_PATH = OUTPUT_DIR / "grok2api-relay.log"
 DATA_DIR = OUTPUT_DIR / "grok2api-data"
 LOG_DIR = OUTPUT_DIR / "grok2api-logs"
+V2_DATA_DIR = OUTPUT_DIR / "grok2api-v2-data"
+V2_CONFIG_PATH = OUTPUT_DIR / "grok2api-v2-config.yaml"
+V2_IMAGE = "grok-account-manager-grok2api:local"
+V2_ADMIN_USERNAME = "grok-account-manager"
 _LEGACY_GROK2API_PATH = PROJECT_ROOT.parent.parent / "未命名文件夹" / "grok2api"
 _SIBLING_GROK2API_PATH = PROJECT_ROOT.parent / "grok2api"
+_DOWNLOADED_GROK2API_PATH = Path.home() / "Downloads" / "grok2api-main"
 DEFAULT_GROK2API_PATH = Path(
     os.environ.get("GROK2API_PATH")
     or os.environ.get("GROK_ACCOUNT_MANAGER_GROK2API_PATH")
-    or (_LEGACY_GROK2API_PATH if _LEGACY_GROK2API_PATH.exists() else _SIBLING_GROK2API_PATH)
+    or (
+        _DOWNLOADED_GROK2API_PATH
+        if _DOWNLOADED_GROK2API_PATH.exists()
+        else (_LEGACY_GROK2API_PATH if _LEGACY_GROK2API_PATH.exists() else _SIBLING_GROK2API_PATH)
+    )
 )
 SSO_TXT_PATH = OUTPUT_DIR / "sso.txt"
 
@@ -68,10 +80,18 @@ class RelayManager:
         self._process: subprocess.Popen | None = None
         self._config = self._load_config()
 
+    def _project_dir(self) -> Path:
+        return Path(self._config.grok2api_path).expanduser().resolve()
+
+    def _uses_v2(self) -> bool:
+        project_dir = self._project_dir()
+        return (project_dir / "backend" / "go.mod").exists()
+
     def snapshot(self) -> dict:
         config = self._config
         status = self.status()
         public_base_url = os.environ.get("GROK_ACCOUNT_MANAGER_PUBLIC_BASE_URL", "http://127.0.0.1:8765")
+        uses_v2 = self._uses_v2()
         return {
             **status,
             "config": {
@@ -84,8 +104,9 @@ class RelayManager:
                 "apiKeyMasked": _mask_secret(config.api_key),
                 "adminKey": config.admin_key,
                 "adminKeyMasked": _mask_secret(config.admin_key),
-                "dataDir": str(DATA_DIR),
+                "dataDir": str(V2_DATA_DIR if uses_v2 else DATA_DIR),
                 "logPath": str(LOG_PATH),
+                "engine": "grok2api-v2" if uses_v2 else "grok2api-legacy",
             },
         }
 
@@ -145,8 +166,11 @@ class RelayManager:
                 self.apply_remote_config()
                 return self.snapshot()
 
-            project_dir = Path(self._config.grok2api_path).expanduser().resolve()
-            if not (project_dir / "app" / "main.py").exists():
+            project_dir = self._project_dir()
+            uses_v2 = self._uses_v2()
+            if uses_v2:
+                self._ensure_v2_runtime(project_dir)
+            elif not (project_dir / "app" / "main.py").exists():
                 raise ValueError(f"未找到 grok2api 项目入口：{project_dir}/app/main.py")
 
             OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -170,7 +194,11 @@ class RelayManager:
             log_file = LOG_PATH.open("a", encoding="utf-8")
             log_file.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] starting grok2api\n")
             log_file.flush()
-            command = _grok2api_command(project_dir, self._config.host, self._config.port)
+            command = (
+                _grok2api_v2_command(self._config, V2_CONFIG_PATH)
+                if uses_v2
+                else _grok2api_command(project_dir, self._config.host, self._config.port)
+            )
             try:
                 self._process = subprocess.Popen(
                     command,
@@ -207,24 +235,42 @@ class RelayManager:
                 proc.wait(timeout=5)
         return self.snapshot()
 
-    def apply_remote_config(self) -> dict:
+    def apply_remote_config(self, clearance: dict[str, str] | None = None) -> dict:
+        if self._uses_v2():
+            return self._ensure_v2_client_key()
         cfg = self._config
+        payload: dict[str, Any] = {
+            "app": {"api_key": cfg.api_key, "app_key": cfg.admin_key, "app_url": cfg.base_url},
+        }
+        if clearance:
+            payload["proxy"] = {
+                "clearance": {
+                    "mode": "manual",
+                    "cf_cookies": clearance["cookies"],
+                    "user_agent": clearance.get("userAgent") or "",
+                }
+            }
         response = requests.post(
             f"{cfg.base_url}/admin/api/config",
             headers=_admin_headers(cfg),
-            json={"app": {"api_key": cfg.api_key, "app_key": cfg.admin_key, "app_url": cfg.base_url}},
+            json=payload,
             timeout=15,
         )
         _raise_response_error(response)
         return response.json()
 
     def sync_accounts(self, credentials: list[dict], *, refresh_existing: bool = False) -> dict:
+        if self._uses_v2():
+            return self._v2_import_accounts(credentials)
         cfg = self._config
         tokens = _credentials_to_tokens(credentials)
         if not tokens:
             raise ValueError("没有找到可同步的 sso/access_token")
         if not self.is_running():
             self.start()
+        clearance = _credentials_to_clearance(credentials)
+        if clearance:
+            self.apply_remote_config(clearance)
         response = requests.post(
             f"{cfg.base_url}/admin/api/tokens/add",
             headers=_admin_headers(cfg),
@@ -245,12 +291,17 @@ class RelayManager:
 
     def replace_accounts(self, credentials: list[dict], *, pool: str = "basic", prune_unlisted: bool = True) -> dict:
         """Replace the relay runtime pool with the current project account tokens."""
+        if self._uses_v2():
+            return self._v2_import_accounts(credentials)
         cfg = self._config
         tokens = _credentials_to_tokens(credentials)
         if not tokens:
             raise ValueError("没有找到可同步的 sso/access_token")
         if not self.is_running():
             self.start()
+        clearance = _credentials_to_clearance(credentials)
+        if clearance:
+            self.apply_remote_config(clearance)
 
         token_items = [{"token": token, "tags": ["grok-account-manager"]} for token in tokens]
         response = requests.post(
@@ -280,6 +331,8 @@ class RelayManager:
         return payload
 
     def list_tokens(self) -> dict:
+        if self._uses_v2():
+            return {"tokens": []}
         cfg = self._config
         response = requests.get(
             f"{cfg.base_url}/admin/api/tokens",
@@ -290,6 +343,8 @@ class RelayManager:
         return response.json()
 
     def delete_tokens(self, tokens: list[str]) -> dict:
+        if self._uses_v2():
+            return {"deleted": 0}
         cfg = self._config
         clean_tokens = [str(token or "").strip() for token in tokens if str(token or "").strip()]
         if not clean_tokens:
@@ -304,6 +359,8 @@ class RelayManager:
         return response.json()
 
     def refresh_tokens(self, tokens: list[str]) -> dict:
+        if self._uses_v2():
+            return {"summary": {"total": 0, "ok": 0, "fail": 0}}
         cfg = self._config
         clean_tokens = [str(token or "").strip() for token in tokens if str(token or "").strip()]
         if not clean_tokens:
@@ -318,6 +375,8 @@ class RelayManager:
         return response.json()
 
     def force_sync(self) -> dict:
+        if self._uses_v2():
+            return {"synced": True}
         cfg = self._config
         response = requests.post(
             f"{cfg.base_url}/admin/api/sync",
@@ -328,6 +387,10 @@ class RelayManager:
         return response.json()
 
     def list_models(self) -> dict:
+        if not self.is_running():
+            self.start()
+        if self._uses_v2():
+            self._ensure_v2_client_key()
         cfg = self._config
         response = requests.get(
             f"{cfg.base_url}/v1/models",
@@ -340,6 +403,8 @@ class RelayManager:
     def send_chat_completion(self, *, model: str, messages: list[dict], timeout: int = 180) -> dict:
         if not self.is_running():
             self.start()
+        if self._uses_v2():
+            self._ensure_v2_client_key()
         cfg = self._config
         response = requests.post(
             f"{cfg.base_url}/v1/chat/completions",
@@ -366,6 +431,8 @@ class RelayManager:
     def generate_image(self, *, model: str, prompt: str, n: int, size: str, timeout: int = 180) -> dict:
         if not self.is_running():
             self.start()
+        if self._uses_v2():
+            self._ensure_v2_client_key()
         cfg = self._config
         response = requests.post(
             f"{cfg.base_url}/v1/images/generations",
@@ -398,6 +465,8 @@ class RelayManager:
     ) -> requests.Response:
         if not self.is_running():
             self.start()
+        if self._uses_v2():
+            self._ensure_v2_client_key()
         cfg = self._config
         target_url = f"{cfg.base_url}{path}"
         if query:
@@ -467,9 +536,144 @@ class RelayManager:
         except Exception as error:
             return {"status": "error", "message": str(error)}
 
+    def _ensure_v2_runtime(self, project_dir: Path) -> None:
+        if not (project_dir / "backend" / "go.mod").exists():
+            raise ValueError(f"未找到新版 grok2api 项目入口：{project_dir}/backend/go.mod")
+        if not shutil.which("docker"):
+            raise RuntimeError("新版 grok2api 需要 Docker Desktop，但未找到 docker 命令")
+
+        docker_info = subprocess.run(
+            ["docker", "info"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if docker_info.returncode != 0:
+            raise RuntimeError("新版 grok2api 需要 Docker Desktop，请先启动 Docker Desktop 后再启动中转")
+
+        self._ensure_v2_config(project_dir)
+        image_check = subprocess.run(
+            ["docker", "image", "inspect", V2_IMAGE],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if image_check.returncode == 0:
+            return
+
+        with LOG_PATH.open("a", encoding="utf-8") as log_file:
+            log_file.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] building grok2api v2 image\n")
+            log_file.flush()
+            build = subprocess.run(
+                ["docker", "build", "--tag", V2_IMAGE, str(project_dir)],
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                check=False,
+            )
+        if build.returncode != 0:
+            raise RuntimeError(f"新版 grok2api 镜像构建失败，退出码 {build.returncode}。请查看 {LOG_PATH}")
+
+    def _ensure_v2_config(self, project_dir: Path) -> None:
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        V2_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        if V2_CONFIG_PATH.exists():
+            return
+
+        if self._config.admin_key == "grok2api":
+            self._config.admin_key = secrets.token_urlsafe(24)
+            self._save_config(self._config)
+
+        template_path = project_dir / "config.example.yaml"
+        try:
+            config_text = template_path.read_text(encoding="utf-8")
+        except OSError as error:
+            raise RuntimeError(f"无法读取新版 grok2api 配置模板：{error}") from error
+        replacements = {
+            'listen: "127.0.0.1:8000"': 'listen: "0.0.0.0:8000"',
+            'jwtSecret: "replace-with-at-least-32-characters"': f'jwtSecret: "{secrets.token_hex(32)}"',
+            'credentialEncryptionKey: "replace-with-base64-key"': (
+                f'credentialEncryptionKey: "{base64.b64encode(secrets.token_bytes(32)).decode("ascii")}"'
+            ),
+            'username: "admin"': f'username: "{V2_ADMIN_USERNAME}"',
+            'password: "replace-with-a-strong-password"': f'password: "{self._config.admin_key}"',
+        }
+        for old, new in replacements.items():
+            config_text = config_text.replace(old, new)
+        _write_private_text(V2_CONFIG_PATH, config_text)
+
+    def _v2_admin_headers(self) -> dict[str, str]:
+        cfg = self._config
+        response = requests.post(
+            f"{cfg.base_url}/api/admin/v1/auth/login",
+            json={"username": V2_ADMIN_USERNAME, "password": cfg.admin_key},
+            timeout=20,
+        )
+        _raise_response_error(response)
+        payload = response.json()
+        data = payload.get("data") if isinstance(payload, dict) else None
+        tokens = data.get("tokens") if isinstance(data, dict) else None
+        access_token = str(tokens.get("accessToken") or "").strip() if isinstance(tokens, dict) else ""
+        if not access_token:
+            raise RuntimeError("新版 grok2api 管理员登录没有返回 access token")
+        return {"Authorization": f"Bearer {access_token}"}
+
+    def _ensure_v2_client_key(self) -> dict:
+        if self._config.api_key.startswith("g2a_"):
+            return {"managedApiKey": True}
+        response = requests.post(
+            f"{self._config.base_url}/api/admin/v1/client-keys",
+            headers=self._v2_admin_headers(),
+            json={"name": "grok-account-manager", "enabled": True, "accountPool": "free"},
+            timeout=20,
+        )
+        _raise_response_error(response)
+        payload = response.json()
+        data = payload.get("data") if isinstance(payload, dict) else None
+        api_key = str(data.get("secret") or "").strip() if isinstance(data, dict) else ""
+        if not api_key:
+            raise RuntimeError("新版 grok2api 创建客户端 Key 没有返回 secret")
+        self._config.api_key = api_key
+        self._save_config(self._config)
+        return {"managedApiKey": True}
+
+    def _v2_import_accounts(self, credentials: list[dict]) -> dict:
+        if not self.is_running():
+            self.start()
+        self._ensure_v2_client_key()
+        web_accounts = _credentials_to_v2_web_accounts(credentials)
+        build_accounts = _credentials_to_v2_build_accounts(credentials)
+        if not web_accounts and not build_accounts:
+            raise ValueError("没有找到可同步的 Grok Web 或 Grok Build 凭据")
+        results: dict[str, dict] = {}
+        if web_accounts:
+            document = {"provider": "grok_web", "accounts": web_accounts}
+            results["web"] = self._v2_upload_accounts(
+                "/api/admin/v1/accounts/web/import",
+                "grok-account-manager-web.json",
+                document,
+            )
+        if build_accounts:
+            results["build"] = self._v2_upload_accounts(
+                "/api/admin/v1/accounts/import",
+                "grok-account-manager-build.json",
+                {"accounts": build_accounts},
+            )
+        return {"requested": len(web_accounts) + len(build_accounts), "result": results}
+
+    def _v2_upload_accounts(self, path: str, filename: str, document: dict) -> dict:
+        response = requests.post(
+            f"{self._config.base_url}{path}",
+            headers=self._v2_admin_headers(),
+            files={"file": (filename, json.dumps(document, ensure_ascii=False).encode("utf-8"), "application/json")},
+            timeout=180,
+        )
+        _raise_response_error(response)
+        return _parse_sse_result(response.text)
+
     def _healthcheck(self) -> bool:
         try:
-            response = requests.get(f"{self._config.base_url}/health", timeout=2)
+            endpoint = "/healthz" if self._uses_v2() else "/health"
+            response = requests.get(f"{self._config.base_url}{endpoint}", timeout=2)
             return response.ok
         except Exception:
             return False
@@ -478,8 +682,16 @@ class RelayManager:
         if CONFIG_PATH.exists():
             try:
                 data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+                configured_path = Path(
+                    str(data.get("grok2api_path") or data.get("grok2apiPath") or DEFAULT_GROK2API_PATH)
+                ).expanduser()
+                if (
+                    _DOWNLOADED_GROK2API_PATH.exists()
+                    and (configured_path / "app" / "main.py").exists()
+                ):
+                    configured_path = _DOWNLOADED_GROK2API_PATH
                 return RelayConfig(
-                    grok2api_path=str(data.get("grok2api_path") or data.get("grok2apiPath") or DEFAULT_GROK2API_PATH),
+                    grok2api_path=str(configured_path),
                     host=str(data.get("host") or "127.0.0.1"),
                     port=_safe_port(data.get("port"), 8000),
                     api_key=str(data.get("api_key") or data.get("apiKey") or "local-grok-api-key"),
@@ -532,6 +744,37 @@ def _grok2api_command(project_dir: Path, host: str, port: int) -> list[str]:
     ]
 
 
+def _grok2api_v2_command(config: RelayConfig, config_path: Path) -> list[str]:
+    container_name = f"grok-account-manager-grok2api-{config.port}"
+    return [
+        "docker",
+        "run",
+        "--rm",
+        "--name",
+        container_name,
+        "--publish",
+        f"{config.host}:{config.port}:8000",
+        "--volume",
+        f"{config_path}:/run/grok2api/config.yaml:ro",
+        "--volume",
+        f"{V2_DATA_DIR}:/app/data",
+        V2_IMAGE,
+    ]
+
+
+def _write_private_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        path.chmod(0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = -1
+            handle.write(content)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
 def _mask_secret(value: str) -> str:
     text = str(value or "")
     if len(text) <= 8:
@@ -564,6 +807,125 @@ def _credentials_to_tokens(credentials: list[dict]) -> list[str]:
     if not any(tokens):
         tokens = _read_sso_txt_tokens()
     return [token for token in dict.fromkeys(tokens) if token]
+
+
+def _credentials_to_clearance(credentials: list[dict]) -> dict[str, str] | None:
+    for item in reversed(credentials):
+        if not isinstance(item, dict):
+            continue
+        cookies = str(item.get("grok_cf_cookies") or "").strip()
+        if "cf_clearance=" not in cookies.lower():
+            continue
+        return {
+            "cookies": cookies,
+            "userAgent": str(item.get("grok_cf_user_agent") or "").strip(),
+        }
+    return None
+
+
+def _credentials_to_v2_web_accounts(credentials: list[dict]) -> list[dict[str, str]]:
+    accounts: list[dict[str, str]] = []
+    seen_tokens: set[str] = set()
+    for item in credentials:
+        if not isinstance(item, dict):
+            continue
+        token = _credential_to_token(item)
+        if not token or token in seen_tokens:
+            continue
+        seen_tokens.add(token)
+        tier = _credential_web_tier(item)
+        account = {
+            "name": str(item.get("display_name") or item.get("email") or f"Grok Web {len(accounts) + 1}"),
+            "email": str(item.get("email") or ""),
+            "user_id": str(item.get("user_id") or ""),
+            "sso_token": token,
+            "tier": tier,
+        }
+        cookies = str(item.get("grok_cf_cookies") or item.get("cloudflare_cookies") or "").strip()
+        if cookies:
+            account["cloudflare_cookies"] = cookies
+        accounts.append(account)
+
+    if not accounts:
+        for token in _read_sso_txt_tokens():
+            if token and token not in seen_tokens:
+                seen_tokens.add(token)
+                accounts.append(
+                    {
+                        "name": f"Grok Web {len(accounts) + 1}",
+                        "sso_token": token,
+                        "tier": "basic",
+                    }
+                )
+    return accounts
+
+
+def _credentials_to_v2_build_accounts(credentials: list[dict]) -> list[dict[str, str]]:
+    accounts: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in credentials:
+        if not isinstance(item, dict):
+            continue
+        refresh_token = str(item.get("refresh_token") or "").strip()
+        access_token = str(item.get("access_token") or "").strip()
+        if not refresh_token or (refresh_token in seen):
+            continue
+        seen.add(refresh_token)
+        entry = {
+            "provider": "grok_build",
+            "name": str(item.get("display_name") or item.get("email") or f"Grok Build {len(accounts) + 1}"),
+            "email": str(item.get("email") or ""),
+            "user_id": str(item.get("user_id") or ""),
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "id_token": str(item.get("id_token") or ""),
+            "token_type": str(item.get("token_type") or "Bearer"),
+            "client_id": str(item.get("oidc_client_id") or ""),
+            "team_id": str(item.get("team_id") or ""),
+        }
+        expires_at = str(item.get("expires_at_raw") or item.get("expires_at") or "").strip()
+        if expires_at:
+            entry["expires_at"] = expires_at
+        accounts.append(entry)
+    return accounts
+
+
+def _credential_web_tier(credential: dict) -> str:
+    values = [
+        credential.get("plan_type"),
+        credential.get("subscription_tier"),
+        (credential.get("quota") or {}).get("subscriptionTier") if isinstance(credential.get("quota"), dict) else "",
+    ]
+    text = " ".join(str(value or "").lower() for value in values)
+    if "heavy" in text:
+        return "heavy"
+    if any(marker in text for marker in ("super", "premium", "pro")):
+        return "super"
+    return "basic"
+
+
+def _parse_sse_result(payload: str) -> dict:
+    complete: dict = {}
+    for block in payload.replace("\r\n", "\n").split("\n\n"):
+        event = "message"
+        data_lines: list[str] = []
+        for line in block.splitlines():
+            if line.startswith("event:"):
+                event = line[6:].strip()
+            elif line.startswith("data:"):
+                data_lines.append(line[5:].strip())
+        if not data_lines:
+            continue
+        try:
+            data = json.loads("\n".join(data_lines))
+        except json.JSONDecodeError:
+            continue
+        if event == "error":
+            message = data.get("message") if isinstance(data, dict) else "导入账号失败"
+            raise RuntimeError(str(message or "导入账号失败"))
+        if event == "complete" and isinstance(data, dict):
+            complete = data
+    return complete or {"accepted": True}
 
 
 def _read_sso_txt_tokens() -> list[str]:
@@ -618,16 +980,18 @@ def _raise_response_error(response: requests.Response) -> None:
 
 
 def _response_error_text(response: requests.Response) -> str:
+    status = response.status_code
     try:
         data = response.json()
         error = data.get("error") if isinstance(data, dict) else None
         if isinstance(error, dict):
-            return str(error.get("message") or error)
+            message = str(error.get("message") or error)
+            return f"grok2api 请求失败 (HTTP {status})：{message}"
         if error:
-            return str(error)
-        return str(data)
+            return f"grok2api 请求失败 (HTTP {status})：{error}"
+        return f"grok2api 请求失败 (HTTP {status})：{data}"
     except Exception:
-        return f"HTTP {response.status_code}: {response.text[:400]}"
+        return f"grok2api 请求失败 (HTTP {status})：{response.text[:400]}"
 
 
 def _tail(path: Path, max_chars: int = 3000) -> str:

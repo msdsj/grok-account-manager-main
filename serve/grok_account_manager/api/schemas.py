@@ -45,7 +45,7 @@ class AccountChatTestRequest(BaseModel):
 
 class AccountImageTestRequest(BaseModel):
     exportKey: str = ""
-    model: str = "grok-imagine-image-lite"
+    model: str = "grok-imagine-image"
     prompt: str = ""
     n: int = 1
     size: str = "1024x1024"

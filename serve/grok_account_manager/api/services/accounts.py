@@ -59,6 +59,9 @@ def account_from_credential(credential: dict, file_path: Path, item_index: int =
         oauth_status = "unknown"
     created_at = credential.get("created_at")
     account_id = str(credential.get("id") or "").strip() or file_path.stem
+    has_web_access = bool(str(credential.get("sso_token") or "").strip())
+    has_build_access = bool(refresh_token or str(credential.get("auth_mode") or "").lower() in {"oauth", "oidc"})
+    providers = [provider for provider, enabled in (("build", has_build_access), ("web", has_web_access)) if enabled]
 
     quota = credential.get("quota") or {}
     frequent_usage = quota.get("frequentUsage")
@@ -75,6 +78,9 @@ def account_from_credential(credential: dict, file_path: Path, item_index: int =
         "email": email or "unknown",
         "displayName": " ".join(part for part in [first_name, last_name] if part).strip(),
         "authMode": credential.get("auth_mode") or "oauth",
+        "providers": providers,
+        "buildAvailable": has_build_access,
+        "webAvailable": has_web_access,
         "planType": credential.get("plan_type") or "",
         "hasGrokCodeAccess": credential.get("has_grok_code_access"),
         "userId": credential.get("user_id") or "",
@@ -358,9 +364,16 @@ def _relay_chat_fallback_model(model: str) -> str | None:
 
 def _relay_image_fallback_model(model: str) -> str | None:
     normalized = str(model or "").strip().lower()
-    if normalized in {"grok-imagine-image", "grok-imagine-image-pro"}:
-        return "grok-imagine-image-lite"
+    if normalized in {"grok-imagine-image-quality", "grok-imagine-image-pro"}:
+        return "grok-imagine-image"
     return None
+
+
+def _image_error_message(error: Exception) -> str:
+    text = str(error).strip() or "未知错误"
+    if "internal server error" in text.lower():
+        return "图片生成失败：grok2api 上游返回内部错误，请检查账号状态或代理"
+    return f"图片生成失败：{text}"
 
 
 def _relay_messages(messages: list[dict]) -> list[dict]:
@@ -518,8 +531,22 @@ def test_account_image(export_key: str, model: str, prompt: str, n: int, size: s
         raise ValueError("请选择要测试的账号")
     ref = refs[0]
     started = time.monotonic()
-    model = str(model or "").strip() or "grok-imagine-image-lite"
-    _sync_project_pool_to_relay()
+    model = str(model or "").strip() or "grok-imagine-image"
+    try:
+        _sync_project_pool_to_relay()
+    except Exception as error:
+        message = _image_error_message(error)
+        _mark_account_capability(
+            ref,
+            {
+                "imageAvailable": False,
+                "imageModel": None,
+                "imageSource": None,
+                "error": message,
+                "latencyMs": int((time.monotonic() - started) * 1000),
+            },
+        )
+        raise ValueError(message) from error
     fallback_from = None
     try:
         result = RELAY_MANAGER.generate_image(
@@ -532,15 +559,40 @@ def test_account_image(export_key: str, model: str, prompt: str, n: int, size: s
     except Exception as error:
         fallback_model = _relay_image_fallback_model(model)
         if not fallback_model or not _is_no_available_account_error(error):
-            raise
+            message = _image_error_message(error)
+            _mark_account_capability(
+                ref,
+                {
+                    "imageAvailable": False,
+                    "imageModel": None,
+                    "imageSource": None,
+                    "error": message,
+                    "latencyMs": int((time.monotonic() - started) * 1000),
+                },
+            )
+            raise ValueError(message) from error
         fallback_from = model
-        result = RELAY_MANAGER.generate_image(
-            model=fallback_model,
-            prompt=prompt,
-            n=n,
-            size=size,
-            timeout=timeout,
-        )
+        try:
+            result = RELAY_MANAGER.generate_image(
+                model=fallback_model,
+                prompt=prompt,
+                n=n,
+                size=size,
+                timeout=timeout,
+            )
+        except Exception as fallback_error:
+            message = _image_error_message(fallback_error)
+            _mark_account_capability(
+                ref,
+                {
+                    "imageAvailable": False,
+                    "imageModel": None,
+                    "imageSource": None,
+                    "error": message,
+                    "latencyMs": int((time.monotonic() - started) * 1000),
+                },
+            )
+            raise ValueError(message) from fallback_error
     _mark_account_capability(
         ref,
         {

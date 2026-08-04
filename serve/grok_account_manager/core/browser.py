@@ -1042,6 +1042,41 @@ return '';
         return None
 
 
+def get_grok_clearance(session: DrissionBrowserSession) -> dict[str, str]:
+    """Collect the Grok Cloudflare cookies tied to the active browser session."""
+    try:
+        page = session.page
+        cookies, _errors = _collect_cookie_candidates(session, page)
+    except Exception:
+        return {}
+
+    allowed_names = {"cf_clearance", "__cf_bm", "__cflb"}
+    parts: list[str] = []
+    seen_names: set[str] = set()
+    for item in cookies:
+        name, value, domain = _cookie_item_parts(item)
+        normalized_name = name.lower()
+        normalized_domain = domain.lower().lstrip(".")
+        if (
+            normalized_name not in allowed_names
+            or not value
+            or normalized_name in seen_names
+            or not (normalized_domain == "grok.com" or normalized_domain.endswith(".grok.com"))
+        ):
+            continue
+        seen_names.add(normalized_name)
+        parts.append(f"{name}={value}")
+
+    if not any(part.lower().startswith("cf_clearance=") for part in parts):
+        return {}
+
+    try:
+        user_agent = str(page.run_js("return navigator.userAgent;") or "").strip()
+    except Exception:
+        user_agent = ""
+    return {"cookies": "; ".join(parts), "userAgent": user_agent}
+
+
 def wait_for_cookie(session: DrissionBrowserSession, cookie_name: str, timeout: int = 180, stop_event=None) -> str:
     """注册完成后等待指定 cookie 出现并返回其值。"""
     deadline = time.time() + timeout

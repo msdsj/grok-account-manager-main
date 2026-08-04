@@ -14,7 +14,7 @@ import time
 
 from DrissionPage.errors import PageDisconnectedError
 
-from ..core.browser import DrissionBrowserSession, wait_for_cookie
+from ..core.browser import DrissionBrowserSession, get_grok_clearance, wait_for_cookie
 from ..mail.sources import DuckMailSource, MailboxSource, VerificationMailbox
 from .base import RegistrationResult
 
@@ -146,6 +146,7 @@ class GrokProvider:
             self.success_cookie_name,
             stop_event=self.stop_event,
         )
+        grok_clearance = get_grok_clearance(session)
 
         result: RegistrationResult = {
             "email": email,
@@ -289,6 +290,10 @@ class GrokProvider:
             # grok2api authenticates with the browser SSO cookie, so retain it
             # even when the OAuth exchange also succeeded.
             full_credential["sso_token"] = sso_value
+            if grok_clearance:
+                full_credential["grok_cf_cookies"] = grok_clearance["cookies"]
+                if grok_clearance.get("userAgent"):
+                    full_credential["grok_cf_user_agent"] = grok_clearance["userAgent"]
             full_credential["oauth_exchange_status"] = result["oauth_status"]
             full_credential["oauth_exchange_error"] = result.get("oauth_error") or None
             full_credential["credential_enrichment_error"] = result.get("credential_enrichment_error") or None

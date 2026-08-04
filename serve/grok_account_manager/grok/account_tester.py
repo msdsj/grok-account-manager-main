@@ -24,8 +24,7 @@ DEFAULT_CLI45_MODELS = ("grok-4.5",)
 DEFAULT_GROK45_MODELS = DEFAULT_CLI45_MODELS
 DEFAULT_IMAGE_MODELS = (
     "grok-imagine-image",
-    "grok-imagine-image-pro",
-    "grok-imagine-image-lite",
+    "grok-imagine-image-quality",
 )
 DEFAULT_API_BASE_URL = "https://api.x.ai/v1"
 DEFAULT_CLI_BASE_URL = "https://cli-chat-proxy.grok.com/v1"

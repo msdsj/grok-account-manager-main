@@ -6,14 +6,10 @@ import {
   Copy,
   Cpu,
   Download,
-  ExternalLink,
-  Github,
   ImageIcon,
   KeyRound,
   Loader2,
   Maximize2,
-  Megaphone,
-  MessageCircle,
   Minimize2,
   Play,
   RefreshCw,
@@ -21,7 +17,6 @@ import {
   Send,
   Sparkles,
   Square,
-  Star,
   Eye,
   EyeOff,
   PlugZap,
@@ -31,7 +26,6 @@ import {
   TestTube2,
   Trash2,
   Users,
-  X,
 } from "lucide-react";
 import { appRoutes, routeForPath, routeForView, type ActiveView } from "./routes";
 
@@ -131,6 +125,9 @@ interface AccountRecord {
   email: string;
   displayName: string;
   authMode: string;
+  providers?: Array<"build" | "web" | "console">;
+  buildAvailable?: boolean;
+  webAvailable?: boolean;
   planType: string;
   hasGrokCodeAccess?: boolean | null;
   userId: string;
@@ -222,22 +219,13 @@ const CHAT_TEST_MODELS = [
 ];
 
 const IMAGE_TEST_MODELS = [
-  "grok-imagine-image-lite",
   "grok-imagine-image",
-  "grok-imagine-image-pro",
+  "grok-imagine-image-quality",
 ];
 
 const IMAGE_SIZES = ["1024x1024", "1792x1024", "1024x1792", "1280x720", "720x1280"];
-const PROJECT_GITHUB_URL = "https://github.com/msdsj/grok-account-manager-main";
 const QQ_GROUP_NUMBER = "972295238";
-const COMMUNITY_QR_SRC = "/community-qr.png";
-const ANNOUNCEMENT_VERSION = "2026-07-23-ui-community";
-const ANNOUNCEMENT_ITEMS = [
-  "补充 CHANGELOG.md 更新日志，整理 FastAPI 重构、账号数据库、Grok CLI 4.5、Chat 对话、图片生成和本地中转改动。",
-  "新增项目更新公告弹窗，后续每次版本更新都会在这里追加一条说明。",
-  "首页新增 QQ 交流群入口，群号 972295238，方便集中反馈账号池、CLI 4.5 和图片生成问题。",
-  "欢迎到 GitHub 项目页点 Star，后续版本会继续围绕账号池测试和本地中转稳定性优化。",
-];
+const STORE_URL = "https://pay.ldxp.cn/item/gecsrk";
 
 async function apiJson<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -343,7 +331,6 @@ export function App() {
   const [activeTestAccountKey, setActiveTestAccountKey] = useState("");
   const [hideEmails, setHideEmails] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [announcementOpen, setAnnouncementOpen] = useState(true);
 
   const [refreshingQuota, setRefreshingQuota] = useState<Set<string>>(new Set());
   const [relayForm, setRelayForm] = useState({
@@ -361,7 +348,7 @@ export function App() {
   const [chatPrompt, setChatPrompt] = useState("用一句话回复 OK，并说明当前模型可用。");
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [chatBusy, setChatBusy] = useState(false);
-  const [imageModel, setImageModel] = useState("grok-imagine-image-lite");
+  const [imageModel, setImageModel] = useState("grok-imagine-image");
   const [imagePrompt, setImagePrompt] = useState("一张干净明亮的小清新控制台界面，七彩玻璃泡泡点缀，柔和自然光");
   const [imageSize, setImageSize] = useState("1024x1024");
   const [imageCount, setImageCount] = useState(1);
@@ -489,19 +476,6 @@ export function App() {
     });
     setRelayFormReady(true);
   }, [relayFormReady, state.relay]);
-
-  const closeAnnouncement = useCallback(() => {
-    setAnnouncementOpen(false);
-  }, []);
-
-  useEffect(() => {
-    if (!announcementOpen) return;
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") closeAnnouncement();
-    };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [announcementOpen, closeAnnouncement]);
 
   const job = state.job;
   const relay = state.relay;
@@ -1282,6 +1256,7 @@ export function App() {
             <tr>
               <th className="select-col"><input type="checkbox" checked={allSelected} disabled={accountsWithKeys.length === 0} aria-label="选择全部账号" onChange={toggleAllAccounts} /></th>
               <th>账号</th>
+              <th>Provider</th>
               <th>注册时间</th>
               <th>CLI 4.5</th>
               <th>Chat 4.20</th>
@@ -1292,12 +1267,13 @@ export function App() {
           </thead>
           <tbody>
             {accountsWithKeys.length === 0 ? (
-              <tr><td colSpan={8}><div className="empty-row">暂无账号</div></td></tr>
+              <tr><td colSpan={9}><div className="empty-row">暂无账号</div></td></tr>
             ) : (
               accountsWithKeys.map((account) => (
                 <tr key={account.rowKey}>
                   <td className="select-col"><input type="checkbox" checked={selectedAccounts.has(account.rowKey)} aria-label={`选择 ${maskEmail(account.email)}`} onChange={() => toggleAccount(account.rowKey)} /></td>
                   <td><div className="email-cell"><strong>{hideEmails ? maskEmail(account.email) : account.email}</strong><span>{account.fileName}</span></div></td>
+                  <td><ProviderBadge account={account} /></td>
                   <td>{account.createdAtLabel || "-"}</td>
                   <td><CapabilityCell ok={hasCli45Capability(account.availability)} tested={Boolean(account.availability)} label="CLI 4.5" /></td>
                   <td><CapabilityCell ok={hasChatCapability(account.availability)} tested={Boolean(account.availability)} label="Chat" /></td>
@@ -1609,6 +1585,7 @@ export function App() {
             <tr>
               <th className="select-col"><input type="checkbox" checked={allSelected} disabled={accountsWithKeys.length === 0} aria-label="选择全部账号" onChange={toggleAllAccounts} /></th>
               <th>邮箱</th>
+              <th>Provider</th>
               <th>Refresh</th>
               <th>可用性</th>
               <th>用户</th>
@@ -1620,12 +1597,13 @@ export function App() {
           </thead>
           <tbody>
             {accountsWithKeys.length === 0 ? (
-              <tr><td colSpan={9}><div className="empty-row">暂无账号</div></td></tr>
+              <tr><td colSpan={10}><div className="empty-row">暂无账号</div></td></tr>
             ) : (
               accountsWithKeys.map((account) => (
                 <tr key={account.rowKey}>
                   <td className="select-col"><input type="checkbox" checked={selectedAccounts.has(account.rowKey)} aria-label={`选择 ${maskEmail(account.email)}`} onChange={() => toggleAccount(account.rowKey)} /></td>
                   <td><div className="email-cell"><strong>{hideEmails ? maskEmail(account.email) : account.email}</strong>{account.error && <span>{account.error}</span>}</div></td>
+                  <td><ProviderBadge account={account} /></td>
                   <td><RefreshTokenBadge account={account} /></td>
                   <td><AvailabilityBadge availability={account.availability} /></td>
                   <td>{account.displayName || account.userId || "-"}</td>
@@ -1645,94 +1623,6 @@ export function App() {
       </div>
     </section>
   );
-
-  const communityPanel = (
-    <section className="community-panel">
-      <div className="community-copy">
-        <span className="eyebrow">PROJECT NOTICE</span>
-        <h2>更新公告与交流群</h2>
-        <p>
-          这个项目会继续围绕账号池检测、Grok CLI 4.5、Chat 对话、图片生成和本地中转稳定性更新。
-          如果项目帮到你，欢迎去 GitHub 帮忙点一个 Star，也可以加入 QQ 群反馈问题。
-        </p>
-        <div className="announcement-list">
-          {ANNOUNCEMENT_ITEMS.map((item) => (
-            <span key={item}><Star size={14} />{item}</span>
-          ))}
-        </div>
-        <div className="community-actions">
-          <a className="primary-btn" href={PROJECT_GITHUB_URL} target="_blank" rel="noreferrer">
-            <Github size={17} />
-            GitHub 点 Star
-          </a>
-          <button className="secondary-btn" type="button" onClick={() => void copyText(QQ_GROUP_NUMBER)}>
-            <MessageCircle size={17} />
-            复制群号
-          </button>
-        </div>
-      </div>
-      <div className="community-qr-card">
-        <img src={COMMUNITY_QR_SRC} alt="QQ 交流群二维码" />
-        <div>
-          <strong>QQ 交流群</strong>
-          <span>{QQ_GROUP_NUMBER}</span>
-        </div>
-      </div>
-    </section>
-  );
-
-  const announcementDialog = announcementOpen ? (
-    <div
-      className="announcement-overlay"
-      role="presentation"
-      onMouseDown={(event) => {
-        if (event.target === event.currentTarget) closeAnnouncement();
-      }}
-    >
-      <section className="announcement-dialog" role="dialog" aria-modal="true" aria-labelledby="announcement-title">
-        <button className="announcement-close" type="button" aria-label="关闭更新公告" onClick={closeAnnouncement}>
-          <X size={18} />
-        </button>
-        <div className="announcement-dialog-head">
-          <span><Megaphone size={15} />更新公告</span>
-          <a href={PROJECT_GITHUB_URL} target="_blank" rel="noreferrer">
-            <Github size={15} />
-            {PROJECT_GITHUB_URL}
-            <ExternalLink size={14} />
-          </a>
-        </div>
-        <div className="announcement-dialog-body">
-          <div>
-            <h2 id="announcement-title">欢迎使用 MSDSJ Grok 控制台</h2>
-            <p>
-              如果这个项目帮到你，欢迎帮忙点一个 Star。后续每次版本更新都会在这里追加一条公告，方便你快速看到新功能和修复内容。
-              <span style={{fontWeight:700,color:'red'}}>当前版本bug可能比较多，版本更新太多了token有一点不够，还在付费上班啦，有没有大哥投喂一下给点奶茶钱去买token，有bug请理解小弟已经尽可能腾出时间去优化去修复了，注册机目前是没啥问题哦！！！！！</span>
-            </p>
-            <div className="announcement-bullets">
-              {ANNOUNCEMENT_ITEMS.map((item) => (
-                <span key={item}><Star size={14} />{item}</span>
-              ))}
-            </div>
-            <div className="community-actions">
-              <a className="primary-btn" href={PROJECT_GITHUB_URL} target="_blank" rel="noreferrer">
-                <Github size={17} />
-                去 GitHub 点 Star
-              </a>
-              <button className="secondary-btn" type="button" onClick={() => void copyText(QQ_GROUP_NUMBER)}>
-                <MessageCircle size={17} />
-                复制群号
-              </button>
-            </div>
-          </div>
-          <div className="announcement-qr">
-            <img src={COMMUNITY_QR_SRC} alt="QQ 交流群二维码" />
-            <strong>加入 QQ 交流群</strong>
-            <span>{QQ_GROUP_NUMBER}</span>
-          </div>
-        </div>
-      </section>
-    </div>
-  ) : null;
 
   const overviewPanel = (
     <>
@@ -1802,9 +1692,6 @@ export function App() {
           </div>
         </div>
       </section>
-
-      {communityPanel}
-
       <div className="overview-grid">
         {relayPanel}
         {logsPanel}
@@ -1825,7 +1712,6 @@ export function App() {
 
   return (
     <>
-    {announcementDialog}
     <main className="app-shell admin-shell">
       <aside className="app-sidebar">
         <div className="sidebar-brand">
@@ -1860,7 +1746,13 @@ export function App() {
             <p>{activeRoute.subtitle}</p>
           </div>
           <div className="topbar-actions">
-            <button className="icon-text-btn" type="button" onClick={() => setAnnouncementOpen(true)}><Megaphone size={17} />公告</button>
+            <div className="topbar-community" aria-label="交流群和店铺链接">
+              <span>QQ 群 <strong>{QQ_GROUP_NUMBER}</strong></span>
+              <button className="small-icon-btn" type="button" aria-label="复制 QQ 群号" title="复制 QQ 群号" onClick={() => void copyText(QQ_GROUP_NUMBER)}>
+                <Copy size={15} />
+              </button>
+              <a href={STORE_URL} target="_blank" rel="noreferrer">店铺链接</a>
+            </div>
             <button className="icon-text-btn" type="button" onClick={() => void refresh()}><RefreshCw size={17} />刷新</button>
             <button className="icon-text-btn" type="button" onClick={() => setHideEmails((current) => !current)}>
               {hideEmails ? <Eye size={17} /> : <EyeOff size={17} />}
@@ -2016,7 +1908,7 @@ function AvailabilityBadge({ availability }: { availability?: AccountAvailabilit
   }
   if (hasImageCapability(availability)) {
     badges.push(
-      <span className="token-badge image" title={availability.imageModel || "grok-imagine-image-lite"} key="image">
+      <span className="token-badge image" title={availability.imageModel || "grok-imagine-image"} key="image">
         生图
       </span>,
     );
@@ -2032,6 +1924,21 @@ function AvailabilityBadge({ availability }: { availability?: AccountAvailabilit
     <span className="token-badge missing" title={availability.error || "不可用"}>
       不可用
     </span>
+  );
+}
+
+function ProviderBadge({ account }: { account: AccountRecord }) {
+  const providers = account.providers || [
+    ...(account.buildAvailable ? ["build" as const] : []),
+    ...(account.webAvailable ? ["web" as const] : []),
+  ];
+  if (providers.length === 0) return <span className="token-badge neutral">未知</span>;
+  return (
+    <div className="availability-badges">
+      {providers.includes("build") && <span className="token-badge premium">Build</span>}
+      {providers.includes("web") && <span className="token-badge ok">Web</span>}
+      {providers.includes("console") && <span className="token-badge image">Console</span>}
+    </div>
   );
 }
 
