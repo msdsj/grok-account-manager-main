@@ -12,6 +12,7 @@ import traceback
 import uuid
 
 from ...core.browser import DrissionBrowserSession, build_chromium_options
+from ...grok.oauth_exchange import CloudflareBlockedError
 from ...mail.sources import build_mailbox_source
 from ...providers.grok import GrokProvider
 from ...sinks.json_credential import JsonCredentialSink
@@ -67,6 +68,11 @@ class CombinedStopEvent:
 
     def is_set(self) -> bool:
         return any(event.is_set() for event in self._events)
+
+    def set(self) -> None:
+        """Propagate an internal stop request to the whole job and current round."""
+        for event in self._events:
+            event.set()
 
 
 class RegistrationJobManager:
@@ -1176,6 +1182,18 @@ class RegistrationJobManager:
                     registered = bool(getattr(provider, "registration_succeeded", False))
                     email = str(getattr(provider, "current_email", "") or "")
                     stage = str(getattr(provider, "current_stage", "") or "runtime_error")
+                    if isinstance(error, CloudflareBlockedError):
+                        self._event(
+                            "error",
+                            f"检测到 Cloudflare 封禁，已自动取消任务：{error}",
+                            worker=worker_index,
+                            round=round_index,
+                            email=email,
+                            stage=stage,
+                        )
+                        # Closing all sessions here prevents another worker from
+                        # waiting on a browser page after the shared stop event is set.
+                        self.stop(wait=False)
                     if "stopped" in str(error).lower() or self._stop_event.is_set():
                         cancelled = not registered
                         ok = registered

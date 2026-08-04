@@ -20,7 +20,11 @@ from .base import RegistrationResult
 
 try:
     from ..grok.client import build_cockpit_grok_credential, fetch_complete_credential
-    from ..grok.oauth_exchange import OAuthTerminalError, exchange_sso_for_oauth_tokens
+    from ..grok.oauth_exchange import (
+        CloudflareBlockedError,
+        OAuthTerminalError,
+        exchange_sso_for_oauth_tokens,
+    )
     GROK_API_AVAILABLE = True
 except ImportError:
     GROK_API_AVAILABLE = False
@@ -58,6 +62,11 @@ class GrokProvider:
             try:
                 return self._run_round_once(session)
             except Exception as error:
+                if isinstance(error, CloudflareBlockedError):
+                    stopper = getattr(self.stop_event, "set", None)
+                    if callable(stopper):
+                        stopper()
+                    raise
                 stopped = bool(self.stop_event and self.stop_event.is_set())
                 pool_exhausted = "邮箱池已耗尽" in str(error)
                 if stopped or pool_exhausted or self.registration_succeeded or attempt >= max_attempts:
@@ -207,6 +216,13 @@ class GrokProvider:
                             else:
                                 oauth_error = "OAuth exchange 未返回 token"
                             print(f"[Grok] {oauth_error}")
+                        except CloudflareBlockedError as error:
+                            oauth_error = str(error)
+                            stopper = getattr(self.stop_event, "set", None)
+                            if callable(stopper):
+                                stopper()
+                            print(f"[Grok] 检测到 Cloudflare 封禁，已请求停止任务: {error}")
+                            raise
                         except OAuthTerminalError as error:
                             oauth_error = str(error)
                             print(f"[Grok] OAuth exchange 已被服务端终止: {error}")
@@ -515,6 +531,21 @@ const pageText = [
     bodyText,
     buttonTexts.join(' '),
 ].join(' ').replace(/\s+/g, '').toLowerCase();
+const blockedPage = (
+    pageText.includes('sorryyouhavebeenblocked') ||
+    pageText.includes('youhavebeenblocked') ||
+    pageText.includes('youareunabletoaccess') ||
+    pageText.includes('unabletoaccessgrok.com') ||
+    (pageText.includes('attentionrequired') && pageText.includes('cloudflare'))
+);
+if (blockedPage) {
+    return {
+        status: 'blocked',
+        url: location.href,
+        title,
+        bodySnippet: bodyText.slice(0, 260),
+    };
+}
 const cloudflareChallenge = (
     pageText.includes('cloudflare') ||
     pageText.includes('clicktoreveal') ||
@@ -582,6 +613,11 @@ return { status: 'clicked', url: location.href };
         if status == "ready":
             return True
 
+        if status == "blocked":
+            raise CloudflareBlockedError(
+                f"注册页检测到 Cloudflare 封禁：{last_state or 'You have been blocked'}"
+            )
+
         if status == "cloudflare":
             cloudflare_seen = True
             last_state = f"Cloudflare 验证页: {last_state}"
@@ -612,6 +648,16 @@ def _click_google_signup_button(session: DrissionBrowserSession, timeout=15, sto
         page = session.refresh_page()
         try:
             clicked = page.run_js(r"""
+const bodyText = (document.body?.innerText || '').replace(/\s+/g, '').toLowerCase();
+if (
+    bodyText.includes('sorryyouhavebeenblocked') ||
+    bodyText.includes('youhavebeenblocked') ||
+    bodyText.includes('youareunabletoaccess') ||
+    bodyText.includes('unabletoaccessgrok.com') ||
+    (bodyText.includes('attentionrequired') && bodyText.includes('cloudflare'))
+) {
+    return 'blocked';
+}
 const candidates = Array.from(document.querySelectorAll('button, a, [role="button"]'));
 const target = candidates.find((node) => {
     const text = [
@@ -635,6 +681,9 @@ return true;
                 time.sleep(0.8)
                 continue
             raise
+
+        if clicked == "blocked":
+            raise CloudflareBlockedError("Google 注册页检测到 Cloudflare 封禁：You have been blocked")
 
         if clicked:
             time.sleep(1)
@@ -747,7 +796,7 @@ def _register_with_google_account(
             elif action == "missing-password":
                 raise RuntimeError("Google 账号池里的密码为空")
             elif action == "blocked":
-                raise RuntimeError("Google 登录被拦截，需要人工验证或账号安全检查")
+                raise CloudflareBlockedError("Google 登录页检测到 Cloudflare 封禁：You have been blocked")
             elif action == "manual":
                 print("[*] Google 登录需要人工处理，等待浏览器完成授权")
 
@@ -885,6 +934,11 @@ function clickNext() {
 if (
     bodyText.includes("couldn't sign you in") ||
     bodyText.includes("this browser or app may not be secure") ||
+    bodyText.includes('sorry, you have been blocked') ||
+    bodyText.includes('you have been blocked') ||
+    bodyText.includes('you are unable to access') ||
+    bodyText.includes('unable to access grok.com') ||
+    (bodyText.includes('attention required') && bodyText.includes('cloudflare')) ||
     bodyText.includes('无法登录') ||
     bodyText.includes('无法验证') ||
     bodyText.includes('异常活动')

@@ -2,9 +2,11 @@ import unittest
 from unittest.mock import Mock, patch
 
 from grok_account_manager.grok.oauth_exchange import (
+    CloudflareBlockedError,
     MAX_CONSECUTIVE_PAGE_ERRORS,
     OAuthTerminalError,
     _drive_device_authorization_and_poll,
+    _drive_device_authorization_page,
     _poll_device_token_once,
 )
 
@@ -87,6 +89,58 @@ class OAuthExchangeTests(unittest.TestCase):
                 self._drive()
 
         self.assertEqual(drive_page.call_count, MAX_CONSECUTIVE_PAGE_ERRORS)
+
+    def test_cloudflare_block_is_terminal(self) -> None:
+        with (
+            patch(
+                "grok_account_manager.grok.oauth_exchange._poll_device_token_once",
+                return_value=("pending", None),
+            ),
+            patch(
+                "grok_account_manager.grok.oauth_exchange._drive_device_authorization_page",
+                return_value="blocked",
+            ),
+        ):
+            with self.assertRaises(CloudflareBlockedError):
+                self._drive()
+
+    def test_login_preference_is_forwarded_to_page_driver(self) -> None:
+        page = Mock()
+        page.run_js.return_value = "idle"
+        _drive_device_authorization_page(
+            page,
+            email="outlook@example.com",
+            password="secret",
+            recovery_email=None,
+            user_code="ABCD",
+            email_code=None,
+            prefer_google_login=False,
+        )
+        self.assertIs(page.run_js.call_args.args[-1], False)
+
+        with (
+            patch(
+                "grok_account_manager.grok.oauth_exchange._poll_device_token_once",
+                return_value=("pending", None),
+            ),
+            patch(
+                "grok_account_manager.grok.oauth_exchange._drive_device_authorization_page",
+                return_value="device-invalid-action",
+            ) as drive_page,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Invalid action"):
+                _drive_device_authorization_and_poll(
+                    session=_Session(page),
+                    oauth_page=page,
+                    device_code="device-code",
+                    user_code="user-code",
+                    token_endpoint="https://auth.x.ai/oauth2/token",
+                    interval=5,
+                    expires_in=30,
+                    prefer_google_login=True,
+                )
+
+        self.assertTrue(drive_page.call_args.kwargs["prefer_google_login"])
 
 
 if __name__ == "__main__":

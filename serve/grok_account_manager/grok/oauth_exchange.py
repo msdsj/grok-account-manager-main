@@ -53,6 +53,10 @@ class OAuthTerminalError(RuntimeError):
     """Device Flow 已被服务端终止，重新申请 code 不会恢复。"""
 
 
+class CloudflareBlockedError(OAuthTerminalError):
+    """Cloudflare 已明确拒绝当前浏览器，继续等待或重试没有意义。"""
+
+
 def _validate_xai_endpoint(raw: str | None, field: str, fallback: str | None = None) -> str:
     value = str(raw or fallback or "").strip()
     if not value:
@@ -267,6 +271,7 @@ def exchange_sso_for_oauth_tokens(
                     dev_token=dev_token,
                     code_getter=code_getter,
                     recovery_email=recovery_email,
+                    prefer_google_login=prefer_google_login,
                     stop_event=stop_event,
                 )
             finally:
@@ -356,6 +361,7 @@ def _drive_device_authorization_and_poll(
     code_getter: Callable[[], str | None] | None = None,
     recovery_email: str | None = None,
     stop_event=None,
+    prefer_google_login: bool = False,
 ) -> OAuthTokens | None:
     deadline = time.monotonic() + expires_in
     next_poll_at = time.monotonic()
@@ -414,6 +420,7 @@ def _drive_device_authorization_and_poll(
                 recovery_email=recovery_email,
                 user_code=user_code,
                 email_code=email_code,
+                prefer_google_login=prefer_google_login,
             )
         except Exception as error:
             consecutive_page_errors += 1
@@ -460,7 +467,9 @@ def _drive_device_authorization_and_poll(
             )
 
         if action == "blocked":
-            raise RuntimeError("授权页被阻止或出现异常活动提示")
+            raise CloudflareBlockedError(
+                "授权页检测到 Cloudflare 封禁（You have been blocked），已终止当前任务"
+            )
 
         if action == "device-consent-ready":
             if not consent_click_sent:
@@ -506,6 +515,7 @@ def _drive_device_authorization_page(
     recovery_email: str | None,
     user_code: str,
     email_code: str | None,
+    prefer_google_login: bool = False,
 ) -> str:
     return str(
         page.run_js(
@@ -515,6 +525,7 @@ const password = arguments[1] || '';
 const recoveryEmail = arguments[2] || '';
 const userCode = arguments[3] || '';
 const emailCode = arguments[4] || '';
+const preferGoogleLogin = Boolean(arguments[5]);
 
 function isVisible(node) {
     if (!node) return false;
@@ -653,6 +664,11 @@ const bodyCompact = bodyText.replace(/\s+/g, '');
 if (
     bodyText.includes("couldn't sign you in") ||
     bodyText.includes("this browser or app may not be secure") ||
+    bodyText.includes('sorry, you have been blocked') ||
+    bodyText.includes('you have been blocked') ||
+    bodyText.includes('you are unable to access') ||
+    bodyText.includes('unable to access grok.com') ||
+    (bodyText.includes('attention required') && bodyText.includes('cloudflare')) ||
     bodyText.includes('无法登录') ||
     bodyText.includes('无法验证') ||
     bodyText.includes('异常活动')
@@ -671,7 +687,12 @@ if (
     return 'authorized-page';
 }
 
-const isXaiHost = host === 'x.ai' || host.endsWith('.x.ai');
+const isXaiHost = (
+    host === 'x.ai' ||
+    host.endsWith('.x.ai') ||
+    host === 'grok.com' ||
+    host.endsWith('.grok.com')
+);
 if (isXaiHost && path.includes('/oauth2/device/approve') && bodyCompact.includes('invalidaction')) {
     return 'device-invalid-action';
 }
@@ -831,8 +852,10 @@ if (userCodeInput && userCode) {
 
 const emailInput = visibleInputs('input[type="email"], input[name="email"], input[autocomplete="email"], input[data-testid="email"]').at(0);
 if (!emailInput) {
-    const googleLabel = clickButton('xai-google-login', ['continuewithgoogle', 'signwithgoogle', 'signinwithgoogle', 'google', '使用google', '继续使用google', '谷歌']);
-    if (googleLabel) return `google-login-click:${googleLabel}`;
+    if (preferGoogleLogin) {
+        const googleLabel = clickButton('xai-google-login', ['continuewithgoogle', 'signwithgoogle', 'signinwithgoogle', 'google', '使用google', '继续使用google', '谷歌']);
+        if (googleLabel) return `google-login-click:${googleLabel}`;
+    }
 
     const emailLabel = clickButton('xai-email-login-mode', ['使用邮箱登录', '邮箱登录', '使用邮箱注册', '邮箱注册', 'email', 'continuewithemail']);
     if (emailLabel) return `email-login-click:${emailLabel}`;
@@ -921,6 +944,7 @@ return 'idle';
             recovery_email or "",
             user_code or "",
             email_code or "",
+            prefer_google_login,
         )
     )
 

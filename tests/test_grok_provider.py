@@ -1,7 +1,8 @@
 import unittest
+import threading
 from unittest.mock import patch
 
-from grok_account_manager.grok.oauth_exchange import OAuthTerminalError
+from grok_account_manager.grok.oauth_exchange import CloudflareBlockedError, OAuthTerminalError
 from grok_account_manager.providers.grok import (
     GrokProvider,
     _fill_code_and_submit,
@@ -176,6 +177,24 @@ class GrokProviderTests(unittest.TestCase):
         run_once.assert_called_once_with(session)
         self.assertEqual(session.restart_count, 0)
 
+    def test_cloudflare_block_is_not_retried_before_registration(self) -> None:
+        provider = GrokProvider()
+        stop_event = threading.Event()
+        provider.stop_event = stop_event
+        session = _RetrySession()
+
+        with patch.object(
+            provider,
+            "_run_round_once",
+            side_effect=CloudflareBlockedError("You have been blocked"),
+        ) as run_once:
+            with self.assertRaises(CloudflareBlockedError):
+                provider.run_round(session)
+
+        self.assertTrue(stop_event.is_set())
+        run_once.assert_called_once_with(session)
+        self.assertEqual(session.restart_count, 0)
+
     def test_otp_submission_requires_profile_page(self) -> None:
         session = _OtpSession()
         with (
@@ -301,6 +320,37 @@ class GrokProviderTests(unittest.TestCase):
         self.assertEqual(exchange.call_count, 1)
         self.assertEqual(result["oauth_status"], "failed")
         self.assertEqual(result["oauth_error"], "access_denied")
+
+    def test_cloudflare_block_stops_oauth_task(self) -> None:
+        provider = GrokProvider()
+        provider.enable_oauth_exchange = True
+        provider.mail_source = _MailSource()
+        provider._interruptible_sleep = lambda _seconds: None
+        stop_event = threading.Event()
+        provider.stop_event = stop_event
+
+        with (
+            patch("grok_account_manager.providers.grok._click_email_signup_button"),
+            patch(
+                "grok_account_manager.providers.grok._fill_email_and_submit",
+                return_value="registered@example.com",
+            ),
+            patch("grok_account_manager.providers.grok._fill_code_and_submit"),
+            patch(
+                "grok_account_manager.providers.grok._fill_profile_and_submit",
+                return_value={"first_name": "Test", "last_name": "User", "password": "secret"},
+            ),
+            patch("grok_account_manager.providers.grok.wait_for_cookie", return_value="browser-sso"),
+            patch(
+                "grok_account_manager.providers.grok.exchange_sso_for_oauth_tokens",
+                side_effect=CloudflareBlockedError("You have been blocked"),
+            ) as exchange,
+        ):
+            with self.assertRaises(CloudflareBlockedError):
+                provider.run_round(_Session())
+
+        self.assertTrue(stop_event.is_set())
+        self.assertEqual(exchange.call_count, 1)
 
 
 if __name__ == "__main__":

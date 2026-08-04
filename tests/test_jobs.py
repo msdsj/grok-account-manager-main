@@ -12,6 +12,7 @@ from grok_account_manager.api.services.pending import (
     PendingResultStore,
 )
 from grok_account_manager.api.services.jobs import (
+    CombinedStopEvent,
     RegistrationJobManager,
     _is_oauth_access_denied,
 )
@@ -330,6 +331,16 @@ class RegistrationJobManagerTests(unittest.TestCase):
 
         self.assertEqual(status, "timeout")
         self.assertIsNone(payload)
+        self.assertTrue(round_stop.is_set())
+
+    def test_combined_stop_event_propagates_internal_cloudflare_stop(self) -> None:
+        global_stop = threading.Event()
+        round_stop = threading.Event()
+        combined = CombinedStopEvent(global_stop, round_stop)
+
+        combined.set()
+
+        self.assertTrue(global_stop.is_set())
         self.assertTrue(round_stop.is_set())
 
     def test_access_denied_classifier_ignores_transport_errors(self) -> None:
