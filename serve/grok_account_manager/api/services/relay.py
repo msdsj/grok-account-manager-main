@@ -465,7 +465,11 @@ class RelayManager:
     ) -> requests.Response:
         if not self.is_running():
             self.start()
-        if self._uses_v2():
+        # The admin API (/api/admin/v1/*) authenticates via the JWT the frontend's own
+        # login flow obtains, not the OpenAI-compatible client key below — injecting the
+        # client key there would just be a harmless-looking but wrong Authorization header.
+        is_admin_api = path.startswith("/api/admin/v1")
+        if self._uses_v2() and not is_admin_api:
             self._ensure_v2_client_key()
         cfg = self._config
         target_url = f"{cfg.base_url}{path}"
@@ -473,7 +477,7 @@ class RelayManager:
             target_url = f"{target_url}?{query}"
 
         forward_headers = _forward_headers(headers or {})
-        if "authorization" not in {key.lower() for key in forward_headers}:
+        if not is_admin_api and "authorization" not in {key.lower() for key in forward_headers}:
             forward_headers["Authorization"] = f"Bearer {cfg.api_key}"
 
         return requests.request(

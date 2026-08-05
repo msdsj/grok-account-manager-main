@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import threading
 import time
 
 from ...grok.account_tester import send_grok_chat, test_grok_account
-from ..config import ACCOUNT_TEST_RESULTS_PATH, CREDENTIALS_DIR, OUTPUT_DIR
+from ...sinks.json_credential import _write_credentials_atomic
+from ..config import ACCOUNT_TEST_RESULTS_PATH, CREDENTIALS_DIR, OUTPUT_DIR, TXT_OUTPUT
 from . import database as account_db
 from .relay import RELAY_MANAGER
 
 _ACCOUNTS_CACHE_LOCK = threading.RLock()
+_CREDENTIAL_FILE_LOCK = threading.RLock()
 _ACCOUNTS_CACHE_SIGNATURE: tuple[tuple[str, int, int], ...] | None = None
 _ACCOUNTS_CACHE_DATA: list[dict] = []
 
@@ -160,17 +163,124 @@ def _merge_account_test_result(account: dict, test_results: dict[str, dict]) -> 
     return account
 
 
-def _sync_credential_files_to_db(files: list[tuple[Path, int, int]]) -> None:
+def _sync_credential_files_to_db(files: list[tuple[Path, int, int]]) -> tuple[set[str], bool]:
+    valid_keys: set[str] = set()
+    complete = True
     for file_path, _, _ in files:
         try:
             data = json.loads(file_path.read_text(encoding="utf-8"))
             items = data if isinstance(data, list) else [data]
             for index, item in enumerate(items):
                 if isinstance(item, dict):
+                    valid_keys.add(account_export_key(file_path, index))
                     account = account_from_credential(item, file_path, index)
                     account_db.upsert_account(account, item, file_path, index)
         except Exception:
-            continue
+            complete = False
+    return valid_keys, complete
+
+
+def _credential_identity_matches(
+    credential: dict,
+    emails: set[str],
+    user_ids: set[str],
+) -> bool:
+    email = str(credential.get("email") or "").strip().lower()
+    user_id = str(credential.get("user_id") or "").strip()
+    return (bool(email) and email in emails) or (bool(user_id) and user_id in user_ids)
+
+
+def _credential_token_values(credential: dict) -> set[str]:
+    values: set[str] = set()
+    for key in ("sso_token", "sso", "credential", "cookie"):
+        value = str(credential.get(key) or "").strip()
+        if value:
+            values.add(value[4:] if value.startswith("sso=") else value)
+    return values
+
+
+def _write_private_lines(path: Path, lines: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        path.chmod(0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = -1
+            handle.write("".join(lines))
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def delete_local_credentials_for_upstream_accounts(upstream_accounts: list[dict]) -> dict:
+    """Permanently remove local credentials represented by grok2api accounts."""
+    emails = {
+        str(item.get("email") or "").strip().lower()
+        for item in upstream_accounts
+        if isinstance(item, dict) and str(item.get("email") or "").strip()
+    }
+    user_ids = {
+        str(item.get("userId") or item.get("user_id") or "").strip()
+        for item in upstream_accounts
+        if isinstance(item, dict) and str(item.get("userId") or item.get("user_id") or "").strip()
+    }
+    if not emails and not user_ids:
+        return {"removed": 0, "matched": 0}
+
+    removed_tokens: set[str] = set()
+    removed_count = 0
+    matched_keys: set[str] = set()
+    with _CREDENTIAL_FILE_LOCK:
+        CREDENTIALS_DIR.mkdir(parents=True, exist_ok=True)
+        for file_path in sorted(CREDENTIALS_DIR.glob("*.json")):
+            try:
+                data = json.loads(file_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            is_list = isinstance(data, list)
+            items = data if is_list else [data]
+            kept: list[dict] = []
+            changed = False
+            for index, item in enumerate(items):
+                if isinstance(item, dict) and _credential_identity_matches(item, emails, user_ids):
+                    removed_count += 1
+                    matched_keys.add(account_export_key(file_path, index))
+                    removed_tokens.update(_credential_token_values(item))
+                    changed = True
+                    continue
+                if isinstance(item, dict):
+                    kept.append(item)
+            if changed:
+                _write_credentials_atomic(file_path, kept)
+
+        if removed_tokens and TXT_OUTPUT.exists():
+            try:
+                lines = TXT_OUTPUT.read_text(encoding="utf-8").splitlines(keepends=True)
+                kept_lines = [
+                    line
+                    for line in lines
+                    if line.rstrip("\r\n").removeprefix("sso=") not in removed_tokens
+                ]
+                if kept_lines != lines:
+                    _write_private_lines(TXT_OUTPUT, kept_lines)
+            except OSError:
+                pass
+
+        files: list[tuple[Path, int, int]] = []
+        for file_path in CREDENTIALS_DIR.glob("*.json"):
+            try:
+                stat = file_path.stat()
+            except OSError:
+                continue
+            files.append((file_path, stat.st_mtime_ns, stat.st_size))
+        valid_keys, complete = _sync_credential_files_to_db(files)
+        if complete:
+            account_db.reconcile_file_backed_accounts(valid_keys)
+        elif matched_keys:
+            account_db.hard_delete_accounts(matched_keys)
+        invalidate_accounts_cache()
+
+    return {"removed": removed_count, "matched": len(emails | user_ids)}
 
 
 def _write_credential_update_to_file(file_path: Path, index: int, updated: dict) -> None:
@@ -225,7 +335,10 @@ def list_accounts() -> list[dict]:
         if signature == _ACCOUNTS_CACHE_SIGNATURE:
             return [dict(account) for account in _ACCOUNTS_CACHE_DATA]
 
-    _sync_credential_files_to_db(files)
+    with _CREDENTIAL_FILE_LOCK:
+        valid_keys, complete = _sync_credential_files_to_db(files)
+        if complete:
+            account_db.reconcile_file_backed_accounts(valid_keys)
     _sync_legacy_test_results_to_db()
 
     test_results = account_db.list_account_test_results()
@@ -410,6 +523,9 @@ def _sync_ref_to_relay(ref: dict) -> None:
 
 
 def _sync_project_pool_to_relay() -> dict:
+    # Reconcile the file-backed local index before exporting, otherwise deleted
+    # records from old credential copies can be imported into grok2api again.
+    list_accounts()
     credentials = account_db.export_credentials()
     try:
         return RELAY_MANAGER.replace_accounts(credentials, pool="basic", prune_unlisted=True)
@@ -617,9 +733,19 @@ def export_all_credentials() -> list[dict]:
 
 
 def delete_accounts(export_keys: list[str]) -> dict:
-    deleted = account_db.soft_delete_accounts(export_keys)
-    invalidate_accounts_cache()
-    return {"deleted": deleted, "accounts": list_accounts()}
+    refs = account_db.get_credential_refs(export_keys)
+    identities = [
+        {
+            "email": ref.get("credential", {}).get("email"),
+            "user_id": ref.get("credential", {}).get("user_id"),
+        }
+        for ref in refs
+    ]
+    result = delete_local_credentials_for_upstream_accounts(identities)
+    if not refs:
+        result["removed"] = account_db.hard_delete_accounts(export_keys)
+        invalidate_accounts_cache()
+    return {"deleted": int(result.get("removed") or 0), "accounts": list_accounts()}
 
 
 def refresh_account_quota(account_id: str) -> dict:

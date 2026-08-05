@@ -367,3 +367,48 @@ def soft_delete_accounts(export_keys: list[str]) -> int:
             (now, now, *keys),
         )
     return int(cursor.rowcount or 0)
+
+
+def reconcile_file_backed_accounts(export_keys: set[str]) -> int:
+    """Remove database rows whose credential file no longer contains them.
+
+    The local account database is an index over JSON credential files, not a
+    second independent source of truth.  Keeping this index reconciled prevents
+    deleted or renamed credential files from being exported back into the relay.
+    """
+    init_db()
+    keys = sorted({str(key or "").strip() for key in export_keys if str(key or "").strip()})
+    with _connection() as conn:
+        if keys:
+            placeholders = ",".join("?" for _ in keys)
+            cursor = conn.execute(
+                f"DELETE FROM accounts WHERE export_key NOT IN ({placeholders})",
+                keys,
+            )
+            conn.execute(
+                f"DELETE FROM account_test_results WHERE export_key NOT IN ({placeholders})",
+                keys,
+            )
+        else:
+            cursor = conn.execute("DELETE FROM accounts")
+            conn.execute("DELETE FROM account_test_results")
+    return int(cursor.rowcount or 0)
+
+
+def hard_delete_accounts(export_keys: list[str] | set[str]) -> int:
+    """Permanently remove selected local account rows and their test results."""
+    init_db()
+    keys = sorted({str(key or "").strip() for key in export_keys if str(key or "").strip()})
+    if not keys:
+        return 0
+    placeholders = ",".join("?" for _ in keys)
+    with _connection() as conn:
+        conn.execute(
+            f"DELETE FROM account_test_results WHERE export_key IN ({placeholders})",
+            keys,
+        )
+        cursor = conn.execute(
+            f"DELETE FROM accounts WHERE export_key IN ({placeholders})",
+            keys,
+        )
+    return int(cursor.rowcount or 0)

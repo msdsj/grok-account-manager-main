@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -23,7 +24,7 @@ def create_app() -> FastAPI:
     init_db()
 
     app = FastAPI(
-        title="MSDSJ Grok Account Manager API",
+        title="Grok 2api API",
         version="0.1.0",
         docs_url="/api/docs",
         redoc_url="/api/redoc",
@@ -57,9 +58,21 @@ def create_app() -> FastAPI:
         JOB_MANAGER.stop(wait=True, timeout=12)
         RELAY_MANAGER.stop()
 
+    @app.on_event("startup")
+    def start_relay_engine() -> None:
+        # grok2api takes tens of seconds to boot (Docker container / go binary), so start
+        # it in the background instead of blocking the FastAPI startup handshake on it.
+        def _boot() -> None:
+            try:
+                RELAY_MANAGER.start()
+            except Exception as error:
+                print(f"[app] grok2api 引擎自动启动失败，将在首次使用时重试: {error}")
+
+        threading.Thread(target=_boot, name="relay-autostart", daemon=True).start()
+
     @app.get("/{request_path:path}", include_in_schema=False, response_model=None)
     def serve_spa(request_path: str):
-        if request_path.startswith(("api/", "v1/", "admin/api")):
+        if request_path.startswith(("api/", "v1/", "admin/api")) or request_path in {"healthz", "readyz"}:
             raise HTTPException(status_code=404, detail="not found")
         if not WEB_DIST_DIR.exists():
             return JSONResponse(

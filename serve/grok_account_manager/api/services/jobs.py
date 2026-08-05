@@ -925,10 +925,15 @@ class RegistrationJobManager:
         last_stage = ""
         last_heartbeat = 0.0
         while thread.is_alive():
+            if self._stop_event.is_set():
+                round_stop_event.set()
+                # A browser/CDP call can remain blocked after its process is killed.
+                # Do not keep the job in "stopping" until the full round timeout.
+                return "stopped", None
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
-            thread.join(timeout=min(2.0, remaining))
+            thread.join(timeout=min(0.5, remaining))
             stage = str(getattr(provider, "current_stage", "") or "")
             email = str(getattr(provider, "current_email", "") or "")
             now = time.monotonic()
@@ -1070,6 +1075,17 @@ class RegistrationJobManager:
                         round_index,
                         round_stop_event,
                     )
+                    if status == "stopped":
+                        cancelled = True
+                        self._event(
+                            "warning",
+                            f"第 {round_index} 轮已被停止",
+                            worker=worker_index,
+                            round=round_index,
+                            email=str(getattr(provider, "current_email", "") or ""),
+                            stage=str(getattr(provider, "current_stage", "") or "stopped"),
+                        )
+                        break
                     if status == "timeout":
                         round_stop_event.set()
                         email = str(getattr(provider, "current_email", "") or "")
@@ -1413,12 +1429,33 @@ class RegistrationJobManager:
                 self._job["status"] = "completed"
                 self._event_locked("success", "任务已全部完成")
             self._job["finishedAt"] = now_ms()
+            registered_this_round = int(self._job.get("registered") or 0)
             self._next_job_start_not_before = time.monotonic() + random.uniform(
                 ROUND_PACING_MIN_SECONDS,
                 ROUND_PACING_MAX_SECONDS,
             )
             self._mail_source = None
             self._oauth_semaphore = None
+
+        if registered_this_round > 0:
+            self._sync_to_relay_async()
+
+    def _sync_to_relay_async(self) -> None:
+        """Best-effort push of newly registered accounts into the grok2api engine.
+
+        Runs off the job thread so a slow/unavailable relay never blocks or fails
+        a registration round; failures are logged and swallowed.
+        """
+
+        def _sync() -> None:
+            try:
+                from .accounts import _sync_project_pool_to_relay
+
+                _sync_project_pool_to_relay()
+            except Exception as error:
+                print(f"[RegistrationJobManager] 自动同步账号到 grok2api 失败: {error}")
+
+        threading.Thread(target=_sync, name="relay-auto-sync", daemon=True).start()
 
 
 JOB_MANAGER = RegistrationJobManager()

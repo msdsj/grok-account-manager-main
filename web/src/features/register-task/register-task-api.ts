@@ -1,0 +1,108 @@
+export type EmailSource = "duckmail" | "outlook";
+
+export type JobStatus = "running" | "stopping" | "completed" | "completed_with_errors" | "stopped";
+
+export interface WorkerState {
+  worker: number;
+  status: string;
+  round: number | null;
+  email: string;
+  stage: string;
+  message: string;
+  fingerprint: string;
+  updatedAt: number;
+}
+
+export interface JobEvent {
+  level: "info" | "warning" | "error";
+  message: string;
+  at: number;
+}
+
+export interface RegistrationJob {
+  id: string;
+  status: JobStatus;
+  total: number;
+  concurrency: number;
+  oauthExchange: boolean;
+  windowsMinimized: boolean;
+  emailSource: string;
+  issued: number;
+  completed: number;
+  failed: number;
+  registered: number;
+  workers: WorkerState[];
+  events: JobEvent[];
+  startedAt: number;
+  finishedAt: number | null;
+}
+
+export interface StartRegistrationInput {
+  total: number;
+  concurrency: number;
+  oauthExchange: boolean;
+  minimizeBrowsers: boolean;
+  emailSource: EmailSource;
+  outlookData?: string;
+  outlookAccountsFile?: string;
+}
+
+async function api<T>(path: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(path, {
+    ...init,
+    headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) },
+  });
+  const payload = (await response.json().catch(() => ({}))) as T & { error?: string };
+  if (!response.ok) {
+    throw new Error(payload.error || `HTTP ${response.status}`);
+  }
+  return payload;
+}
+
+export async function getCurrentJob(): Promise<RegistrationJob | null> {
+  const result = await api<{ job: RegistrationJob | null }>("/api/jobs/current");
+  return result.job;
+}
+
+export async function startRegistration(input: StartRegistrationInput): Promise<RegistrationJob> {
+  const result = await api<{ job: RegistrationJob }>("/api/register", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+  return result.job;
+}
+
+export async function stopRegistration(): Promise<RegistrationJob | null> {
+  const result = await api<{ job: RegistrationJob | null }>("/api/register/stop", { method: "POST" });
+  return result.job;
+}
+
+export async function retryRegistration(): Promise<RegistrationJob> {
+  const result = await api<{ job: RegistrationJob }>("/api/register/retry", { method: "POST" });
+  return result.job;
+}
+
+export async function syncAccountsToPool(): Promise<{ requested: number }> {
+  return api<{ requested: number }>("/api/relay/sync-accounts", {
+    method: "POST",
+    body: JSON.stringify({ exportKeys: [] }),
+  });
+}
+
+function splitAccountFields(entry: string): string[] {
+  const value = entry.trim();
+  if (!value) return [];
+  if (/-{4,}/.test(value)) return value.split(/-{4,}/).map((part) => part.trim());
+  if (value.includes("|")) return value.split("|").map((part) => part.trim());
+  return [value];
+}
+
+export function countOutlookAccounts(data: string): number {
+  const raw = data.trim();
+  if (!raw) return 0;
+  const entries = raw.includes("\n") ? raw.split(/\r?\n/) : raw.split(/\s+/);
+  return entries.filter((entry) => {
+    const parts = splitAccountFields(entry);
+    return (parts.length === 4 || parts.length === 5) && Boolean(parts[0]?.trim()) && Boolean(parts[2]?.trim()) && Boolean(parts[3]?.trim());
+  }).length;
+}
