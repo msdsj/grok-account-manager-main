@@ -23,6 +23,10 @@ class ExportRequest(BaseModel):
     exportKeys: list[str] = Field(default_factory=list)
 
 
+class OutlookMailboxPoolRequest(BaseModel):
+    data: str = Field(default="", max_length=1_000_000)
+
+
 class DeleteAccountsRequest(BaseModel):
     exportKeys: list[str] = Field(default_factory=list)
 

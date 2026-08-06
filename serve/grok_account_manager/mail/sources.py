@@ -27,6 +27,9 @@ OUTLOOK_SCAN_DEPTH = 15
 OUTLOOK_GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
 OUTLOOK_GRAPH_INBOX_KEY = "GRAPH:INBOX"
 OUTLOOK_GRAPH_SCAN_DEPTH = 15
+PERSISTED_OUTLOOK_ACCOUNTS_FILE = (
+    Path(__file__).resolve().parents[3] / "output" / "mailboxes" / "outlook-accounts.txt"
+)
 GOOGLE_IMAP_HOST = "imap.gmail.com"
 GOOGLE_IMAP_PORT = 993
 GOOGLE_SCAN_DEPTH = 15
@@ -412,6 +415,9 @@ def load_outlook_accounts_data(inline_data: str = "", file_path: str = "") -> st
     env_file = os.environ.get("OUTLOOK_ACCOUNTS_FILE", "").strip()
     if env_file:
         return read_outlook_accounts_file(env_file)
+
+    if PERSISTED_OUTLOOK_ACCOUNTS_FILE.exists():
+        return read_outlook_accounts_file(PERSISTED_OUTLOOK_ACCOUNTS_FILE)
     return ""
 
 

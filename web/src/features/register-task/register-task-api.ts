@@ -49,6 +49,16 @@ export interface StartRegistrationInput {
   googleAccountsFile?: string;
 }
 
+export interface OutlookMailboxPool {
+  data: string;
+  count: number;
+  invalid: number;
+  accounts: Array<{
+    email: string;
+    mode: "auto" | "imap" | "graph";
+  }>;
+}
+
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
     ...init,
@@ -88,6 +98,17 @@ export async function syncAccountsToPool(): Promise<{ requested: number }> {
   return api<{ requested: number }>("/api/relay/sync-accounts", {
     method: "POST",
     body: JSON.stringify({ exportKeys: [] }),
+  });
+}
+
+export function getOutlookMailboxPool(): Promise<OutlookMailboxPool> {
+  return api<OutlookMailboxPool>("/api/mailboxes/outlook");
+}
+
+export function saveOutlookMailboxPool(data: string): Promise<Omit<OutlookMailboxPool, "data" | "invalid">> {
+  return api<Omit<OutlookMailboxPool, "data" | "invalid">>("/api/mailboxes/outlook", {
+    method: "PUT",
+    body: JSON.stringify({ data }),
   });
 }
 

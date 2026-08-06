@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Play, RefreshCw, RotateCw, Square } from "lucide-react";
-import { useState } from "react";
+import { FolderOpen, Play, RefreshCw, RotateCw, Save, Square } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 
@@ -17,7 +17,9 @@ import {
   countOutlookAccounts,
   countGoogleAccounts,
   getCurrentJob,
+  getOutlookMailboxPool,
   retryRegistration,
+  saveOutlookMailboxPool,
   startRegistration,
   stopRegistration,
   syncAccountsToPool,
@@ -58,12 +60,33 @@ export function RegisterTaskPage() {
   const [minimizeBrowsers, setMinimizeBrowsers] = useState(true);
   const [outlookData, setOutlookData] = useState("");
   const [googleData, setGoogleData] = useState("");
+  const loadedOutlookPool = useRef(false);
 
   const jobQuery = useQuery({
     queryKey: ["register-job"],
     queryFn: getCurrentJob,
     refetchInterval: 3000,
   });
+
+  const outlookPoolQuery = useQuery({
+    queryKey: ["outlook-mailbox-pool"],
+    queryFn: getOutlookMailboxPool,
+    enabled: emailSource === "outlook",
+    staleTime: Infinity,
+  });
+
+  useEffect(() => {
+    const savedData = outlookPoolQuery.data?.data;
+    if (
+      emailSource === "outlook"
+      && !loadedOutlookPool.current
+      && savedData
+      && !outlookData.trim()
+    ) {
+      setOutlookData(savedData);
+      loadedOutlookPool.current = true;
+    }
+  }, [emailSource, outlookData, outlookPoolQuery.data?.data]);
 
   const invalidate = () => void queryClient.invalidateQueries({ queryKey: ["register-job"] });
 
@@ -99,6 +122,35 @@ export function RegisterTaskPage() {
     onSuccess: (result) => toast.success(t("registerTask.syncCompleted", { count: result.requested })),
     onError: (error) => toast.error(error instanceof Error ? error.message : t("registerTask.syncFailed")),
   });
+
+  const saveOutlookPoolMutation = useMutation({
+    mutationFn: () => saveOutlookMailboxPool(outlookData),
+    onSuccess: (result) => {
+      queryClient.setQueryData(["outlook-mailbox-pool"], {
+        data: outlookData.trim() ? `${outlookData.trim()}\n` : "",
+        count: result.count,
+        invalid: 0,
+        accounts: result.accounts,
+      });
+      loadedOutlookPool.current = true;
+      toast.success(t("registerTask.outlookPoolSaved", { count: result.count }));
+    },
+    onError: (error) => toast.error(error instanceof Error ? error.message : t("registerTask.outlookPoolSaveFailed")),
+  });
+
+  const loadSavedOutlookPool = async () => {
+    try {
+      const result = await outlookPoolQuery.refetch();
+      if (!result.data) {
+        throw new Error(t("registerTask.outlookPoolLoadFailed"));
+      }
+      setOutlookData(result.data.data);
+      loadedOutlookPool.current = true;
+      toast.success(t("registerTask.outlookPoolLoaded", { count: result.data.count }));
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : t("registerTask.outlookPoolLoadFailed"));
+    }
+  };
 
   const job = jobQuery.data ?? null;
   const running = job?.status === "running" || job?.status === "stopping";
@@ -174,6 +226,26 @@ export function RegisterTaskPage() {
                     ? t("registerTask.poolRecognizedCount", { count: outlookAccountCount })
                     : t("registerTask.poolNoneRecognized")}
                 </p>
+                <div className="flex flex-wrap gap-2">
+                  <Button
+                    size="sm"
+                    type="button"
+                    variant="secondary"
+                    disabled={running || outlookPoolQuery.isFetching}
+                    onClick={() => void loadSavedOutlookPool()}
+                  >
+                    <FolderOpen />{t("registerTask.loadOutlookPool")}
+                  </Button>
+                  <Button
+                    size="sm"
+                    type="button"
+                    variant="secondary"
+                    disabled={running || outlookAccountCount === 0 || saveOutlookPoolMutation.isPending}
+                    onClick={() => saveOutlookPoolMutation.mutate()}
+                  >
+                    <Save />{t("registerTask.saveOutlookPool")}
+                  </Button>
+                </div>
               </div>
             ) : null}
             {emailSource === "google" ? (

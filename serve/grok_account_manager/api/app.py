@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
 from .config import CREDENTIALS_DIR, WEB_DIST_DIR
-from .routers import accounts, proxy, register, relay, state
+from .routers import accounts, mailboxes, proxy, register, relay, state
 from .services.database import init_db
 from .services.jobs import JOB_MANAGER
 from .services.relay import RELAY_MANAGER
@@ -41,6 +41,7 @@ def create_app() -> FastAPI:
 
     app.include_router(state.router)
     app.include_router(register.router)
+    app.include_router(mailboxes.router)
     app.include_router(accounts.router)
     app.include_router(relay.router)
     app.include_router(proxy.router)

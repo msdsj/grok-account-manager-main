@@ -8,6 +8,7 @@ from ..core.browser import PROJECT_ROOT
 
 OUTPUT_DIR: Path = PROJECT_ROOT / "output"
 CREDENTIALS_DIR: Path = OUTPUT_DIR / "credentials"
+OUTLOOK_MAILBOX_POOL_PATH: Path = OUTPUT_DIR / "mailboxes" / "outlook-accounts.txt"
 TXT_OUTPUT: Path = OUTPUT_DIR / "sso.txt"
 ACCOUNT_TEST_RESULTS_PATH: Path = OUTPUT_DIR / "account-test-results.json"
 WEB_DIST_DIR: Path = PROJECT_ROOT / "web" / "dist"
