@@ -45,7 +45,9 @@ import {
   convertWebAccountsToBuild,
   detectBuildAccounts,
   exportAccountBatch,
+  exportSelectedCpaAccounts,
   exportSelectedAccounts,
+  exportSelectedSub2ApiAccounts,
   getAccountSummary,
   importAccounts,
   importConsoleAccounts,
@@ -718,6 +720,20 @@ export function AccountsPage() {
     onError: showError,
   });
 
+  const formatExportMutation = useMutation({
+    mutationFn: async (input: { format: "cpa" | "sub2api"; ids: string[] }) => ({
+      ...input,
+      blob: input.format === "cpa"
+        ? await exportSelectedCpaAccounts(provider, input.ids)
+        : await exportSelectedSub2ApiAccounts(provider, input.ids),
+    }),
+    onSuccess: (result) => {
+      downloadAccountExport(result.blob, provider, result.format);
+      toast.success(t(result.format === "cpa" ? "accounts.cpaExported" : "accounts.sub2apiExported"));
+    },
+    onError: showError,
+  });
+
   const batchUpdateMutation = useMutation({
     mutationFn: (enabled: boolean) => updateAccountsEnabled([...selected], enabled, provider),
     onSuccess: () => {
@@ -1250,7 +1266,8 @@ export function AccountsPage() {
     || unbindEgressMutation.isPending
     || cleanupMutation.isPending
     || webConfirmationMutation.isPending
-    || webAccountScriptsMutation.isPending;
+    || webAccountScriptsMutation.isPending
+    || formatExportMutation.isPending;
 
   const detectInvalidItems = detectItems.filter((item) => item.outcome === "invalid");
   const detectVisibleItems = detectMode === "selected" ? detectItems : detectInvalidItems;
@@ -1403,6 +1420,8 @@ export function AccountsPage() {
               <div className="flex flex-wrap items-center gap-1.5">
                 <span className="mr-1 text-xs text-muted-foreground">{t("common.selectedCount", { count: selected.size })}</span>
                 <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={openSelectedExport}><Download />{t("accounts.exportAuth")}</Button>
+                {provider === "grok_build" ? <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => formatExportMutation.mutate({ format: "cpa", ids: [...selected] })}><Download />{t("accounts.exportCpa")}</Button> : null}
+                {provider === "grok_build" ? <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => formatExportMutation.mutate({ format: "sub2api", ids: [...selected] })}><Download />{t("accounts.exportSub2api")}</Button> : null}
                 <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => batchUpdateMutation.mutate(true)}>{t("common.enable")}</Button>
                 <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => batchUpdateMutation.mutate(false)}>{t("common.disable")}</Button>
                 <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => {
@@ -2249,7 +2268,8 @@ function downloadAccountExport(blob: Blob, provider: AccountProvider, suffix: st
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement("a");
   anchor.href = url;
-  anchor.download = `grok2api-${provider.replaceAll("_", "-")}-accounts-${suffix}-${new Date().toISOString().slice(0, 10)}.json`;
+  const extension = blob.type.toLowerCase().includes("zip") ? "zip" : "json";
+  anchor.download = `grok2api-${provider.replaceAll("_", "-")}-accounts-${suffix}-${new Date().toISOString().slice(0, 10)}.${extension}`;
   anchor.click();
   window.setTimeout(() => URL.revokeObjectURL(url), 0);
 }

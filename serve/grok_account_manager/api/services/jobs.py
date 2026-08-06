@@ -1448,12 +1448,21 @@ class RegistrationJobManager:
         """
 
         def _sync() -> None:
-            try:
-                from .accounts import _sync_project_pool_to_relay
+            from .accounts import _sync_project_pool_to_relay
 
-                _sync_project_pool_to_relay()
-            except Exception as error:
-                print(f"[RegistrationJobManager] 自动同步账号到 grok2api 失败: {error}")
+            for attempt in range(1, 4):
+                try:
+                    result = _sync_project_pool_to_relay()
+                    print(
+                        f"[RegistrationJobManager] 已将注册账号同步到新版 grok2api："
+                        f"请求 {result.get('requested', 0)} 个"
+                    )
+                    return
+                except Exception as error:
+                    if attempt < 3:
+                        time.sleep(attempt * 2)
+                        continue
+                    print(f"[RegistrationJobManager] 自动同步账号到新版 grok2api 失败: {error}")
 
         threading.Thread(target=_sync, name="relay-auto-sync", daemon=True).start()
 

@@ -641,6 +641,14 @@ export function exportSelectedAccounts(provider: AccountProvider, ids: string[])
   return apiDownload("/api/admin/v1/accounts/export", { method: "POST", body: { provider, ids } });
 }
 
+export function exportSelectedCpaAccounts(provider: AccountProvider, ids: string[]): Promise<Blob> {
+  return apiDownload("/api/admin/v1/accounts/export-cpa", { method: "POST", body: { provider, ids } });
+}
+
+export function exportSelectedSub2ApiAccounts(provider: AccountProvider, ids: string[]): Promise<Blob> {
+  return apiDownload("/api/admin/v1/accounts/export-sub2api", { method: "POST", body: { provider, ids } });
+}
+
 export function updateAccountsEnabled(ids: string[], enabled: boolean, provider: AccountProvider): Promise<{ updated: number }> {
   return apiRequest("/api/admin/v1/accounts/batch", { method: "PATCH", body: { ids, enabled, provider } }, decodeCountResult<{ updated: number }>("updated"));
 }

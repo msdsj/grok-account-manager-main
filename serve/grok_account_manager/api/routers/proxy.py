@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import json
 import re
+import time
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response
 
+from ...sinks.cpa_credential import build_cpa_download
 from ..services.relay import RELAY_MANAGER
 
 router = APIRouter(tags=["proxy"])
@@ -19,6 +22,11 @@ _BLOCKED_RESPONSE_HEADERS = {
     "connection",
     "content-encoding",
 }
+
+_SUB2API_DATA_TYPE = "sub2api-data"
+_SUB2API_DATA_VERSION = 1
+_GROK_OAUTH_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
+_GROK_CLI_BASE_URL = "https://cli-chat-proxy.grok.com/v1"
 
 
 @router.api_route("/v1", methods=_PROXY_METHODS)
@@ -32,6 +40,8 @@ async def proxy_v1(request: Request, path: str = "") -> Response:
 async def proxy_admin_v1(request: Request, path: str = "") -> Response:
     if request.method == "DELETE" and (path == "accounts" or re.fullmatch(r"accounts/\d+", path)):
         return await _delete_accounts_with_local_cleanup(request, path)
+    if request.method == "POST" and path in {"accounts/export-cpa", "accounts/export-sub2api"}:
+        return await _export_selected_accounts(request, path.rsplit("/", 1)[-1])
     return await _proxy(request, f"/api/admin/v1/{path}".rstrip("/"))
 
 
@@ -63,6 +73,186 @@ async def _proxy_body(request: Request, path: str, body: bytes) -> Response:
     except Exception as error:
         return JSONResponse({"error": str(error)}, status_code=502)
 
+    return _upstream_response(upstream)
+
+
+async def _export_selected_accounts(request: Request, format_name: str) -> Response:
+    """Export the selected upstream accounts in a CPA or Sub2API document."""
+    body = await request.body()
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return _export_error("请求参数不是有效 JSON", 400, "invalidRequest")
+
+    provider = str(payload.get("provider") or "").strip() if isinstance(payload, dict) else ""
+    raw_ids = payload.get("ids") if isinstance(payload, dict) else None
+    if provider not in {"grok_build", "grok_web", "grok_console"} or not isinstance(raw_ids, list):
+        return _export_error("导出请求缺少有效的 provider 或 ids", 400, "invalidRequest")
+    ids = [str(value).strip() for value in raw_ids]
+    if not ids or len(ids) > 10_000 or len(set(ids)) != len(ids) or any(not value.isdigit() or int(value) <= 0 for value in ids):
+        return _export_error("请选择有效的账号", 400, "invalidRequest")
+    if provider != "grok_build":
+        format_label = "CPA" if format_name == "export-cpa" else "Sub2API"
+        return _export_error(
+            f"{format_label} 格式仅支持 Grok Build OAuth 账号",
+            400,
+            "unsupportedExportFormat",
+        )
+
+    upstream = RELAY_MANAGER.proxy_request(
+        "POST",
+        "/api/admin/v1/accounts/export",
+        query=request.url.query,
+        headers={key: value for key, value in request.headers.items()},
+        body=json.dumps({"provider": provider, "ids": ids}).encode("utf-8"),
+        timeout=180,
+    )
+    if not upstream.ok:
+        return _upstream_response(upstream)
+
+    try:
+        document = upstream.json()
+        accounts = document.get("accounts") if isinstance(document, dict) else None
+        if not isinstance(accounts, list) or len(accounts) != len(ids):
+            raise ValueError("新版 grok2api 返回的导出账号数量与所选数量不一致")
+        if any(not isinstance(account, dict) for account in accounts):
+            raise ValueError("新版 grok2api 返回了无效账号凭据")
+        if format_name == "export-cpa":
+            raw, filename, content_type = build_cpa_download(accounts)
+        else:
+            raw, filename, content_type = _build_sub2api_download(provider, accounts)
+    except (ValueError, TypeError, KeyError) as error:
+        return _export_error(str(error), 502, "exportFailed")
+
+    return Response(
+        content=raw,
+        status_code=200,
+        media_type=content_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+            "X-Exported-Accounts": str(len(accounts)),
+        },
+    )
+
+
+def _build_sub2api_download(
+    provider: str,
+    accounts: list[dict],
+    now: float | None = None,
+) -> tuple[bytes, str, str]:
+    """Build a native Sub2API account-data backup for Grok OAuth accounts."""
+    if provider != "grok_build":
+        raise ValueError("Sub2API 格式仅支持 Grok Build OAuth 账号")
+
+    result: list[dict] = []
+    for index, account in enumerate(accounts, start=1):
+        access_token = _text(account.get("access_token"))
+        refresh_token = _text(account.get("refresh_token"))
+        if not access_token or not refresh_token:
+            raise ValueError(
+                f"第 {index} 个账号缺少 access_token 或 refresh_token，无法导出可用的 Sub2API Grok OAuth 账号"
+            )
+
+        email = _text(account.get("email"))
+        user_id = _text(account.get("user_id") or account.get("userId"))
+        credentials: dict[str, str] = {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "token_type": _text(account.get("token_type")) or "Bearer",
+            "client_id": _text(account.get("client_id") or account.get("oidc_client_id")) or _GROK_OAUTH_CLIENT_ID,
+            "base_url": _text(account.get("base_url")) or _GROK_CLI_BASE_URL,
+        }
+        expires_at = _sub2api_rfc3339(account.get("expires_at") or account.get("expires_at_raw"))
+        if expires_at:
+            credentials["expires_at"] = expires_at
+        for key in (
+            "id_token",
+            "scope",
+            "email",
+            "sub",
+            "user_id",
+            "principal_id",
+            "team_id",
+            "subscription_tier",
+            "entitlement_status",
+        ):
+            value = _text(account.get(key))
+            if value:
+                credentials[key] = value
+        if email and "email" not in credentials:
+            credentials["email"] = email
+        if user_id and "user_id" not in credentials:
+            credentials["user_id"] = user_id
+
+        result.append(
+            {
+                "name": _text(account.get("name")) or email or f"Grok Build {index}",
+                "platform": "grok",
+                "type": "oauth",
+                "credentials": credentials,
+                "concurrency": 1,
+                "priority": 0,
+                "auto_pause_on_expired": True,
+            }
+        )
+
+    timestamp = time.time() if now is None else now
+    raw = (
+        json.dumps(
+            {
+                "type": _SUB2API_DATA_TYPE,
+                "version": _SUB2API_DATA_VERSION,
+                "exported_at": _sub2api_rfc3339(timestamp),
+                "proxies": [],
+                "accounts": result,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n"
+    ).encode("utf-8")
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime(timestamp))
+    filename = f"grok2api-{provider.replace('_', '-')}-sub2api-{stamp}.json"
+    return raw, filename, "application/json; charset=utf-8"
+
+
+def _text(value: object) -> str:
+    return str(value or "").strip()
+
+
+def _sub2api_rfc3339(value: object) -> str:
+    """Normalize Grok export timestamps to the RFC3339 strings Sub2API stores."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        timestamp = float(value)
+    else:
+        raw = _text(value)
+        if not raw:
+            return ""
+        try:
+            timestamp = float(raw)
+        except ValueError:
+            try:
+                parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            except ValueError:
+                return raw
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+    if timestamp <= 0:
+        return ""
+    if timestamp > 10_000_000_000:
+        timestamp /= 1000
+    return datetime.fromtimestamp(timestamp, tz=timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _export_error(message: str, status_code: int, code: str) -> JSONResponse:
+    return JSONResponse({"error": {"code": code, "message": message}}, status_code=status_code)
+
+
+def _upstream_response(upstream) -> Response:
     headers = {
         key: value
         for key, value in upstream.headers.items()
