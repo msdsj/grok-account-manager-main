@@ -1,4 +1,4 @@
-export type EmailSource = "duckmail" | "outlook";
+export type EmailSource = "duckmail" | "outlook" | "google";
 
 export type JobStatus = "running" | "stopping" | "completed" | "completed_with_errors" | "stopped";
 
@@ -45,6 +45,8 @@ export interface StartRegistrationInput {
   emailSource: EmailSource;
   outlookData?: string;
   outlookAccountsFile?: string;
+  googleData?: string;
+  googleAccountsFile?: string;
 }
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
@@ -104,5 +106,15 @@ export function countOutlookAccounts(data: string): number {
   return entries.filter((entry) => {
     const parts = splitAccountFields(entry);
     return (parts.length === 4 || parts.length === 5) && Boolean(parts[0]?.trim()) && Boolean(parts[2]?.trim()) && Boolean(parts[3]?.trim());
+  }).length;
+}
+
+export function countGoogleAccounts(data: string): number {
+  const raw = data.trim();
+  if (!raw) return 0;
+  const entries = raw.split(/\r?\n/);
+  return entries.filter((entry) => {
+    const parts = splitAccountFields(entry);
+    return parts.length >= 2 && Boolean(parts[0]?.trim()) && Boolean(parts[1]?.trim());
   }).length;
 }

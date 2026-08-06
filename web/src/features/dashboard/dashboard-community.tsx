@@ -1,6 +1,7 @@
-import { ExternalLink } from "lucide-react";
+import { ExternalLink, Star } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
+import { Button } from "@/components/ui/button";
 import { DashboardPanel } from "@/features/dashboard/dashboard-panel";
 import { CopyButton } from "@/shared/components/copy-button";
 
@@ -46,6 +47,19 @@ export function DashboardCommunity() {
           </div>
           <ExternalLink className="size-5 shrink-0 text-muted-foreground transition-transform group-hover:translate-x-0.5 group-hover:text-foreground" />
         </a>
+      </div>
+      <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-border/70 pt-4">
+        <div className="min-w-0">
+          <p className="text-sm font-medium">{t("community.starTitle")}</p>
+          <p className="mt-1 text-xs text-muted-foreground">{t("community.starHelp")}</p>
+        </div>
+        <Button asChild variant="secondary" size="sm" className="shrink-0">
+          <a href={CUSTOM_PROJECT_URL} target="_blank" rel="noreferrer">
+            <Star className="size-3.5" />
+            {t("community.starAction")}
+            <ExternalLink className="size-3.5" />
+          </a>
+        </Button>
       </div>
     </DashboardPanel>
   );

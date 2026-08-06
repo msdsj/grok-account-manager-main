@@ -61,6 +61,17 @@ const documentation = [
   },
 ] as const;
 
+const ATTRIBUTION_DISMISSED_STORAGE_KEY = "grok2api:attribution-dismissed";
+
+function attributionWasDismissed(): boolean {
+  if (typeof window === "undefined") return false;
+  try {
+    return window.localStorage.getItem(ATTRIBUTION_DISMISSED_STORAGE_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
 export function AppShell() {
   const { t, i18n } = useTranslation();
   const { admin, logout, changePassword } = useAuth();
@@ -68,7 +79,7 @@ export function AppShell() {
   const { setTheme } = useTheme();
   const [mobileOpen, setMobileOpen] = useState(false);
   const [passwordOpen, setPasswordOpen] = useState(false);
-  const [attributionOpen, setAttributionOpen] = useState(true);
+  const [attributionOpen, setAttributionOpen] = useState(() => !attributionWasDismissed());
   const [documentationOpen, setDocumentationOpen] = useState<Record<string, boolean>>({});
   const isMediaWorkspace = ["/creative-console", "/gallery", "/video-gallery"].includes(location.pathname);
 
@@ -91,6 +102,15 @@ export function AppShell() {
       await logout();
     } catch (error) {
       toast.error(error instanceof Error ? error.message : t("errors.generic"));
+    }
+  }
+
+  function closeAttribution(): void {
+    setAttributionOpen(false);
+    try {
+      window.localStorage.setItem(ATTRIBUTION_DISMISSED_STORAGE_KEY, "1");
+    } catch {
+      // Private browsing or disabled storage should not prevent closing the dialog.
     }
   }
 
@@ -278,7 +298,7 @@ export function AppShell() {
           </form>
         </DialogContent>
       </Dialog>
-      <Dialog open={attributionOpen} onOpenChange={setAttributionOpen}>
+      <Dialog open={attributionOpen} onOpenChange={(open) => (open ? setAttributionOpen(true) : closeAttribution())}>
         <DialogContent className="max-w-[560px]">
           <DialogHeader>
             <div className="mb-2 flex size-10 items-center justify-center rounded-lg bg-secondary text-foreground">
@@ -302,7 +322,7 @@ export function AppShell() {
             </div>
           </div>
           <DialogFooter>
-            <Button size="sm" onClick={() => setAttributionOpen(false)}>{t("community.noticeAcknowledge")}</Button>
+            <Button size="sm" onClick={closeAttribution}>{t("community.noticeAcknowledge")}</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

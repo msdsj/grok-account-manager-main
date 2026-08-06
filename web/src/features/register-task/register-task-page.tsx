@@ -15,6 +15,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { DashboardPanel } from "@/features/dashboard/dashboard-panel";
 import {
   countOutlookAccounts,
+  countGoogleAccounts,
   getCurrentJob,
   retryRegistration,
   startRegistration,
@@ -24,11 +25,12 @@ import {
   type JobStatus,
 } from "@/features/register-task/register-task-api";
 
-const EMAIL_SOURCES: EmailSource[] = ["duckmail", "outlook"];
+const EMAIL_SOURCES: EmailSource[] = ["duckmail", "outlook", "google"];
 
 const EMAIL_SOURCE_I18N_KEY: Record<EmailSource, string> = {
   duckmail: "registerTask.emailSourceDuckmail",
   outlook: "registerTask.emailSourceOutlook",
+  google: "registerTask.emailSourceGoogle",
 };
 
 const STATUS_I18N_KEY: Record<JobStatus, string> = {
@@ -55,6 +57,7 @@ export function RegisterTaskPage() {
   const [oauthExchange, setOauthExchange] = useState(true);
   const [minimizeBrowsers, setMinimizeBrowsers] = useState(true);
   const [outlookData, setOutlookData] = useState("");
+  const [googleData, setGoogleData] = useState("");
 
   const jobQuery = useQuery({
     queryKey: ["register-job"],
@@ -73,6 +76,7 @@ export function RegisterTaskPage() {
         minimizeBrowsers,
         emailSource,
         outlookData: emailSource === "outlook" ? outlookData : "",
+        googleData: emailSource === "google" ? googleData : "",
       }),
     onSuccess: () => { toast.success(t("registerTask.started")); invalidate(); },
     onError: (error) => toast.error(error instanceof Error ? error.message : t("registerTask.startFailed")),
@@ -100,10 +104,12 @@ export function RegisterTaskPage() {
   const running = job?.status === "running" || job?.status === "stopping";
   const events = job?.events?.slice().reverse().slice(0, 50) ?? [];
   const outlookAccountCount = countOutlookAccounts(outlookData);
+  const googleAccountCount = countGoogleAccounts(googleData);
   const startDisabled =
     running
     || startMutation.isPending
-    || (emailSource === "outlook" && outlookAccountCount === 0);
+    || (emailSource === "outlook" && outlookAccountCount === 0)
+    || (emailSource === "google" && googleAccountCount === 0);
 
   return (
     <div className="space-y-5">
@@ -166,6 +172,24 @@ export function RegisterTaskPage() {
                 <p className="text-xs text-muted-foreground">
                   {outlookAccountCount > 0
                     ? t("registerTask.poolRecognizedCount", { count: outlookAccountCount })
+                    : t("registerTask.poolNoneRecognized")}
+                </p>
+              </div>
+            ) : null}
+            {emailSource === "google" ? (
+              <div className="space-y-1.5">
+                <Label htmlFor="reg-google-data">{t("registerTask.googlePoolLabel")}</Label>
+                <Textarea
+                  id="reg-google-data"
+                  value={googleData}
+                  disabled={running}
+                  spellCheck={false}
+                  placeholder={t("registerTask.googlePoolPlaceholder")}
+                  onChange={(event) => setGoogleData(event.target.value)}
+                />
+                <p className="text-xs text-muted-foreground">
+                  {googleAccountCount > 0
+                    ? t("registerTask.poolRecognizedCount", { count: googleAccountCount })
                     : t("registerTask.poolNoneRecognized")}
                 </p>
               </div>
