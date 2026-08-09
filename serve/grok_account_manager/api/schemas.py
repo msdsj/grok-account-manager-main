@@ -17,6 +17,16 @@ class RegisterRequest(BaseModel):
     outlookAccountsFile: str = ""
     googleData: str = ""
     googleAccountsFile: str = ""
+    # ``None`` distinguishes an omitted field (auto-detect the configured
+    # default file) from an explicit ``False`` (force direct connection).
+    proxyPoolEnabled: bool | None = None
+    proxyData: str = Field(default="", max_length=1_000_000)
+    proxyFile: str = Field(default="", max_length=4_096)
+
+
+class RegistrationProxyImportRequest(BaseModel):
+    data: str = Field(default="", max_length=1_000_000)
+    replace: bool = False
 
 
 class ExportRequest(BaseModel):

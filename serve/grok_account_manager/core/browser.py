@@ -18,6 +18,7 @@ from DrissionPage import Chromium, ChromiumOptions
 from DrissionPage.errors import PageDisconnectedError
 
 from . import fingerprint as fingerprint_mod
+from .proxy_pool import mask_proxy_server, normalize_proxy_server, redact_proxy_secrets
 
 # 项目根目录（三层上：serve/grok_account_manager/core/browser.py → 项目根）
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -30,6 +31,7 @@ _ACTIVE_BROWSER_PIDS: set[int] = set()
 _STALE_TEMP_PATHS: set[str] = set()
 _BROWSER_START_MAX_ATTEMPTS = 3
 _BROWSER_START_RETRY_DELAY_SECONDS = 0.25
+_PROXY_UNCHANGED = object()
 
 
 def _path_key(path: str | Path) -> str:
@@ -53,6 +55,7 @@ def _validate_browser_isolation(
     browser_user_data_path: str,
     browser_pid: int,
     browser_command: list[str],
+    expected_proxy_server: str | None = None,
 ) -> None:
     """Fail closed unless Chrome is using the exact isolated resources we assigned."""
     problems: list[str] = []
@@ -73,6 +76,7 @@ def _validate_browser_isolation(
     command_profile = _command_path_argument(browser_command, "--user-data-dir")
     command_cache = _command_path_argument(browser_command, "--disk-cache-dir")
     command_port = _command_path_argument(browser_command, "--remote-debugging-port")
+    command_proxy = _command_path_argument(browser_command, "--proxy-server")
     if reported_profile != expected_profile:
         problems.append("DrissionPage 连接的 Profile 与本轮分配目录不一致")
     if not command_profile or _path_key(command_profile) != expected_profile:
@@ -81,6 +85,8 @@ def _validate_browser_isolation(
         problems.append("Chrome 主进程未使用本轮独立缓存目录")
     if command_port != str(debug_port):
         problems.append("Chrome 主进程未使用本轮独立调试端口")
+    if command_proxy != (expected_proxy_server or ""):
+        problems.append("Chrome 主进程未使用本轮指定代理")
     if "--incognito" not in browser_command:
         problems.append("Chrome 主进程未启用独立无痕上下文")
     if browser_pid <= 0:
@@ -336,6 +342,8 @@ def build_chromium_options(
     window_index: int = 0,
     window_count: int = 1,
     start_minimized: bool = False,
+    proxy_server: str | None = None,
+    proxy_url: str | None = None,
 ) -> ChromiumOptions:
     """构造启动参数：自动端口、Turnstile 扩展、强制语言。
 
@@ -344,8 +352,17 @@ def build_chromium_options(
 
     `headless` 为 True 时使用 Chrome 新版 headless 模式（--headless=new）。
     注意：Cloudflare Turnstile 可能检测并拒绝 headless 浏览器，导致注册失败。
+
+    `proxy_server`（或兼容别名 `proxy_url`）为单个
+    HTTP/HTTPS/SOCKS4/SOCKS5 代理地址。每个
+    Chromium 进程只能在启动时绑定一个代理；需要切换时应重启会话并传入
+    新地址。
     """
+    if proxy_server is not None and proxy_url is not None:
+        raise ValueError("proxy_server 与 proxy_url 只能指定一个")
+    selected_proxy = proxy_server if proxy_server is not None else proxy_url
     co = ChromiumOptions()
+    normalized_proxy = normalize_proxy_server(selected_proxy) if selected_proxy else None
 
     # 跨平台 Chrome 路径检测
     chrome_path = _find_chrome_path()
@@ -398,6 +415,12 @@ def build_chromium_options(
         f"--disable-features={','.join(disabled_features)}",
     ]:
         co.set_argument(argument)
+    if normalized_proxy:
+        # Use DrissionPage's native setter so its option state and Chrome's
+        # command line stay in sync. Authentication support remains governed
+        # by Chromium/DrissionPage; the pool only validates the endpoint.
+        co.set_proxy(normalized_proxy)
+    co._grok_proxy_server = normalized_proxy
     # Accept-Language 给一份带后备的列表，避免某些页面对 navigator.language 单值过敏
     accept_languages = f"{lang},{lang.split('-')[0]};q=0.9,en;q=0.8"
     co.set_pref("intl.accept_languages", accept_languages)
@@ -428,6 +451,12 @@ class DrissionBrowserSession:
 
     def __init__(self, options: ChromiumOptions):
         self._options = options
+        configured_proxy = getattr(options, "_grok_proxy_server", None)
+        if configured_proxy is None:
+            configured_proxy = getattr(options, "proxy", None)
+        self._proxy_server = (
+            normalize_proxy_server(configured_proxy) if configured_proxy else None
+        )
         self._browser: Chromium | None = None
         self._page = None
         self._profile_dir: Path | None = None
@@ -600,6 +629,7 @@ class DrissionBrowserSession:
             browser_user_data_path=str(getattr(self._browser, "user_data_path", "") or ""),
             browser_pid=process_id,
             browser_command=browser_command,
+            expected_proxy_server=self._proxy_server,
         )
         try:
             with socket.create_connection(("127.0.0.1", self.debug_port), timeout=1):
@@ -666,7 +696,8 @@ class DrissionBrowserSession:
                 if attempt >= _BROWSER_START_MAX_ATTEMPTS:
                     raise
                 print(
-                    f"[警告] 浏览器启动失败（{attempt}/{_BROWSER_START_MAX_ATTEMPTS}）：{error}；"
+                    "[警告] 浏览器启动失败"
+                    f"（{attempt}/{_BROWSER_START_MAX_ATTEMPTS}）：{redact_proxy_secrets(error)}；"
                     "清理后重试"
                 )
                 time.sleep(_BROWSER_START_RETRY_DELAY_SECONDS * attempt)
@@ -807,11 +838,64 @@ class DrissionBrowserSession:
         with self._lifecycle_lock:
             self._shutdown_browser_locked()
 
-    def restart(self):
+    def _set_proxy_server_locked(self, proxy_server: str | None) -> None:
+        """Update launch options; a running Chromium process is unchanged."""
+        normalized = normalize_proxy_server(proxy_server) if proxy_server else None
+        if normalized:
+            self._options.set_proxy(normalized)
+        else:
+            self._options.remove_argument("--proxy-server")
+            # ChromiumOptions exposes no public clear method for its cached
+            # proxy value. Keep the private option in sync for future callers
+            # that inspect or reuse this options object.
+            if hasattr(self._options, "_proxy"):
+                self._options._proxy = None
+        self._options._grok_proxy_server = normalized
+        self._proxy_server = normalized
+
+    def set_proxy(
+        self,
+        proxy_server: str | None = None,
+        *,
+        proxy_url: str | None = None,
+        restart: bool = False,
+    ) -> "DrissionBrowserSession":
+        """Set the proxy for the next browser start.
+
+        A live browser cannot change its network route in place. Pass
+        ``restart=True`` to atomically shut down the owned process and start a
+        fresh isolated process with the new endpoint.
+        """
+        if proxy_server is not None and proxy_url is not None:
+            raise ValueError("proxy_server 与 proxy_url 只能指定一个")
+        selected_proxy = proxy_server if proxy_server is not None else proxy_url
+        with self._lifecycle_lock:
+            if self._browser is not None:
+                if not restart:
+                    raise RuntimeError("浏览器正在运行，切换代理需要重启")
+                if self._stop_requested:
+                    raise RuntimeError("任务已停止：浏览器会话禁止切换代理")
+                self._set_proxy_server_locked(selected_proxy)
+                self._shutdown_browser_locked()
+                return self._start_with_retry_locked()
+            self._set_proxy_server_locked(selected_proxy)
+            return self
+
+    def restart(
+        self,
+        proxy_server: str | None | object = _PROXY_UNCHANGED,
+        *,
+        proxy_url: str | None | object = _PROXY_UNCHANGED,
+    ):
         """每轮结束都重启整个浏览器实例，避免长时间复用造成的页面/Cookie 污染。"""
+        if proxy_server is not _PROXY_UNCHANGED and proxy_url is not _PROXY_UNCHANGED:
+            raise ValueError("proxy_server 与 proxy_url 只能指定一个")
+        selected_proxy = proxy_server if proxy_server is not _PROXY_UNCHANGED else proxy_url
         with self._lifecycle_lock:
             if self._stop_requested:
                 raise RuntimeError("任务已停止：浏览器会话禁止重新启动")
+            if selected_proxy is not _PROXY_UNCHANGED:
+                self._set_proxy_server_locked(selected_proxy)  # type: ignore[arg-type]
             self._shutdown_browser_locked()
             return self._start_with_retry_locked()
 
@@ -831,8 +915,13 @@ class DrissionBrowserSession:
         status = "已校验" if self.isolation_verified else "未校验"
         return (
             f"环境 {self.environment_id or '-'} · {status} · PID {self.browser_pid or '-'} · "
-            f"CDP {self.debug_port or '-'} · Profile {profile_name}"
+            f"CDP {self.debug_port or '-'} · Profile {profile_name} · 代理 {self.proxy_summary}"
         )
+
+    @property
+    def proxy_summary(self) -> str:
+        """Return a display-safe summary of the currently configured proxy."""
+        return mask_proxy_server(self._proxy_server)
 
     def refresh_page(self):
         """验证码确认后页面会跳转，旧 page 句柄可能断开，统一重新获取当前活动 tab。

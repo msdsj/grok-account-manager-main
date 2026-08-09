@@ -17,6 +17,46 @@ from grok_account_manager.core.browser import (
 
 
 class BrowserIsolationTests(unittest.TestCase):
+    def test_proxy_server_is_forwarded_to_chrome_options(self) -> None:
+        options = build_chromium_options(proxy_url="198.51.100.10:8080")
+
+        self.assertIn("--proxy-server=http://198.51.100.10:8080", options.arguments)
+        self.assertEqual(options.proxy, "http://198.51.100.10:8080")
+        self.assertEqual(options._grok_proxy_server, "http://198.51.100.10:8080")
+
+    def test_proxy_is_required_by_strict_browser_isolation_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as profile, tempfile.TemporaryDirectory() as cache:
+            command = [
+                "chrome",
+                "--remote-debugging-port=43123",
+                f"--user-data-dir={profile}",
+                f"--disk-cache-dir={cache}",
+                "--incognito",
+                "--proxy-server=http://198.51.100.10:8080",
+            ]
+
+            _validate_browser_isolation(
+                profile_dir=Path(profile),
+                cache_dir=Path(cache),
+                debug_port=43123,
+                browser_address="127.0.0.1:43123",
+                browser_user_data_path=profile,
+                browser_pid=1234,
+                browser_command=command,
+                expected_proxy_server="http://198.51.100.10:8080",
+            )
+            with self.assertRaisesRegex(RuntimeError, "指定代理"):
+                _validate_browser_isolation(
+                    profile_dir=Path(profile),
+                    cache_dir=Path(cache),
+                    debug_port=43123,
+                    browser_address="127.0.0.1:43123",
+                    browser_user_data_path=profile,
+                    browser_pid=1234,
+                    browser_command=command,
+                    expected_proxy_server="http://198.51.100.11:8080",
+                )
+
     def test_minimized_browser_option_is_forwarded_to_chrome(self) -> None:
         options = build_chromium_options(start_minimized=True)
 
@@ -164,6 +204,28 @@ class BrowserIsolationTests(unittest.TestCase):
         self.assertEqual(cleanup.call_count, 3)
         self.assertEqual(retry_sleep.call_count, 2)
 
+    def test_start_retry_log_redacts_proxy_credentials(self) -> None:
+        session = DrissionBrowserSession(ChromiumOptions())
+        start_attempt = Mock(
+            side_effect=RuntimeError(
+                "launch failed --proxy-server=http://alice:proxy-password@198.51.100.14:8080"
+            )
+        )
+
+        with (
+            patch.object(session, "_start_locked", start_attempt),
+            patch.object(session, "_shutdown_browser_locked"),
+            patch("grok_account_manager.core.browser.time.sleep"),
+            patch("builtins.print") as printed,
+        ):
+            with self.assertRaises(RuntimeError):
+                session.start()
+
+        output = " ".join(str(call) for call in printed.call_args_list)
+        self.assertNotIn("alice", output)
+        self.assertNotIn("proxy-password", output)
+        self.assertNotIn("198.51.100.14", output)
+
     def test_stop_request_cancels_start_retries(self) -> None:
         session = DrissionBrowserSession(ChromiumOptions())
 
@@ -197,6 +259,41 @@ class BrowserIsolationTests(unittest.TestCase):
         self.assertIs(result, session)
         self.assertEqual(start_attempt.call_count, 2)
         self.assertEqual(cleanup.call_count, 2)
+
+    def test_restart_accepts_proxy_url_and_updates_launch_argument(self) -> None:
+        session = DrissionBrowserSession(ChromiumOptions())
+        start_attempt = Mock(side_effect=[session])
+
+        with (
+            patch.object(session, "_start_locked", start_attempt),
+            patch.object(session, "_shutdown_browser_locked"),
+        ):
+            result = session.restart(proxy_url="198.51.100.12:8080")
+
+        self.assertIs(result, session)
+        self.assertIn("--proxy-server=http://198.51.100.12:8080", session._options.arguments)
+        self.assertEqual(session.proxy_summary, "http://198.***.***.12:8080")
+
+    def test_set_proxy_while_running_requires_explicit_restart(self) -> None:
+        session = DrissionBrowserSession(ChromiumOptions())
+        session._browser = Mock()
+
+        with self.assertRaisesRegex(RuntimeError, "需要重启"):
+            session.set_proxy("198.51.100.13:8080")
+
+    def test_set_proxy_can_restart_into_a_new_launch_configuration(self) -> None:
+        session = DrissionBrowserSession(ChromiumOptions())
+        session._browser = Mock()
+
+        with (
+            patch.object(session, "_start_with_retry_locked", return_value=session),
+            patch.object(session, "_shutdown_browser_locked") as cleanup,
+        ):
+            result = session.set_proxy(proxy_url="198.51.100.14:8080", restart=True)
+
+        self.assertIs(result, session)
+        cleanup.assert_called_once_with()
+        self.assertIn("--proxy-server=http://198.51.100.14:8080", session._options.arguments)
 
     def test_failed_unverified_start_cleans_matching_chrome_process(self) -> None:
         session = DrissionBrowserSession(ChromiumOptions())

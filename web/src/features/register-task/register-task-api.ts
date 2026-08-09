@@ -10,6 +10,7 @@ export interface WorkerState {
   stage: string;
   message: string;
   fingerprint: string;
+  proxy: string;
   updatedAt: number;
 }
 
@@ -27,6 +28,11 @@ export interface RegistrationJob {
   oauthExchange: boolean;
   windowsMinimized: boolean;
   emailSource: string;
+  proxyPoolEnabled: boolean;
+  proxyPoolSource: string;
+  proxyPoolTotal: number;
+  proxyPoolUsed: number;
+  proxyPoolRemaining: number;
   issued: number;
   completed: number;
   failed: number;
@@ -47,6 +53,8 @@ export interface StartRegistrationInput {
   outlookAccountsFile?: string;
   googleData?: string;
   googleAccountsFile?: string;
+  proxyPoolEnabled?: boolean;
+  proxyFile?: string;
 }
 
 export interface OutlookMailboxPool {
@@ -57,6 +65,11 @@ export interface OutlookMailboxPool {
     email: string;
     mode: "auto" | "imap" | "graph";
   }>;
+}
+
+export interface RegistrationProxyPool {
+  count: number;
+  items: string[];
 }
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
@@ -103,6 +116,21 @@ export async function syncAccountsToPool(): Promise<{ requested: number }> {
 
 export function getOutlookMailboxPool(): Promise<OutlookMailboxPool> {
   return api<OutlookMailboxPool>("/api/mailboxes/outlook");
+}
+
+export function getRegistrationProxyPool(): Promise<RegistrationProxyPool> {
+  return api<RegistrationProxyPool>("/api/register/proxies");
+}
+
+export function saveRegistrationProxyPool(data: string, replace = false): Promise<RegistrationProxyPool & { added: number; skipped: number }> {
+  return api<RegistrationProxyPool & { added: number; skipped: number }>("/api/register/proxies", {
+    method: "PUT",
+    body: JSON.stringify({ data, replace }),
+  });
+}
+
+export function clearRegistrationProxyPool(): Promise<RegistrationProxyPool & { removed: number }> {
+  return api<RegistrationProxyPool & { removed: number }>("/api/register/proxies", { method: "DELETE" });
 }
 
 export function saveOutlookMailboxPool(data: string): Promise<Omit<OutlookMailboxPool, "data" | "invalid">> {

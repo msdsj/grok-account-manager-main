@@ -10,8 +10,17 @@ import threading
 import time
 import traceback
 import uuid
+from pathlib import Path
 
 from ...core.browser import DrissionBrowserSession, build_chromium_options
+from ...core.proxy_pool import (
+    ProxyPool,
+    ProxyPoolError,
+    ProxyPoolExhaustedError,
+    load_proxy_file,
+    mask_proxy_server,
+    redact_proxy_secrets,
+)
 from ...grok.oauth_exchange import CloudflareBlockedError
 from ...mail.sources import build_mailbox_source
 from ...providers.grok import GrokProvider
@@ -19,10 +28,12 @@ from ...sinks.json_credential import JsonCredentialSink
 from ...sinks.txt_file import TxtFileSink
 from ..config import (
     CREDENTIALS_DIR,
+    DEFAULT_PROXY_POOL_PATH,
     DEFAULT_MAX_CONCURRENCY,
     DEFAULT_MAX_OAUTH_CONCURRENCY,
     DEFAULT_OAUTH_ACCESS_DENIED_CIRCUIT_THRESHOLD,
     OAUTH_ROUND_TIMEOUT_SECONDS,
+    PROXY_POOL_FILE_ENV,
     REGISTRATION_ROUND_TIMEOUT_SECONDS,
     ROUND_PACING_MAX_SECONDS,
     ROUND_PACING_MIN_SECONDS,
@@ -33,6 +44,7 @@ from ..config import (
 from ..utils import json_default, now_ms, safe_int
 from .accounts import invalidate_accounts_cache
 from .pending import OAUTH_PENDING, PERSISTENCE_FAILED, PendingResultStore
+from .registration_proxy_pool import load_saved_registration_proxies
 
 
 def _fingerprint_summary(session: DrissionBrowserSession) -> str:
@@ -62,6 +74,70 @@ def _is_oauth_access_denied(error: str) -> bool:
     )
 
 
+def _redact_snapshot_value(value):
+    if isinstance(value, dict):
+        return {key: _redact_snapshot_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_snapshot_value(item) for item in value]
+    if isinstance(value, str):
+        return redact_proxy_secrets(value)
+    return value
+
+
+def _build_proxy_pool(
+    *,
+    enabled: bool | None,
+    data: str,
+    file_path: str,
+) -> tuple[ProxyPool | None, str]:
+    """Build one per-job proxy pool without exposing raw endpoints.
+
+    An explicit API value wins over environment/default discovery.  When the
+    caller leaves ``enabled`` unset, a non-empty input, configured environment
+    path, or existing ``~/Downloads/xx.txt`` enables the pool automatically.
+    Explicitly enabling a missing/empty source is reported as a job-start
+    error instead of silently falling back to a direct connection.
+    """
+    inline_data = str(data or "").strip()
+    explicit_file = str(file_path or "").strip()
+    env_file = str(os.environ.get(PROXY_POOL_FILE_ENV, "") or "").strip()
+
+    if inline_data and explicit_file:
+        raise ProxyPoolError("代理池不能同时填写文本和文件路径")
+
+    if enabled is False:
+        return None, ""
+
+    default_path = Path(DEFAULT_PROXY_POOL_PATH).expanduser()
+    saved_proxies: tuple[str, ...] = ()
+    if not inline_data and not explicit_file and not env_file:
+        saved_proxies = load_saved_registration_proxies()
+    auto_enabled = bool(inline_data or explicit_file or env_file or default_path.is_file() or saved_proxies)
+    use_pool = auto_enabled if enabled is None else bool(enabled)
+    if not use_pool:
+        return None, ""
+
+    if inline_data:
+        pool = ProxyPool.from_lines(inline_data.splitlines())
+        source = "inline"
+    elif explicit_file or env_file:
+        raw_path = explicit_file or env_file
+        path = Path(raw_path).expanduser()
+        if not path.is_file():
+            raise ProxyPoolError(f"代理池文件不存在：{path}")
+        pool = ProxyPool.from_file(path)
+        source = "file"
+    else:
+        file_values = load_proxy_file(default_path) if default_path.is_file() else ()
+        combined = (*file_values, *saved_proxies)
+        pool = ProxyPool.from_lines(combined)
+        source = "file+saved" if file_values and saved_proxies else "file" if file_values else "saved"
+
+    if pool.total <= 0:
+        raise ProxyPoolError("代理池没有可用地址")
+    return pool, source
+
+
 class CombinedStopEvent:
     def __init__(self, *events: threading.Event) -> None:
         self._events = events
@@ -84,6 +160,7 @@ class RegistrationJobManager:
         self._job: dict | None = None
         self._sessions: set[DrissionBrowserSession] = set()
         self._mail_source = None
+        self._proxy_pool: ProxyPool | None = None
         self._oauth_semaphore: threading.BoundedSemaphore | None = None
         self._next_job_start_not_before = 0.0
         self._last_config: dict = {}
@@ -138,7 +215,8 @@ class RegistrationJobManager:
         with self._lock:
             if self._job is None:
                 return None
-            return json.loads(json.dumps(self._job, default=json_default))
+            snapshot = json.loads(json.dumps(self._job, default=json_default))
+        return _redact_snapshot_value(snapshot)
 
     def retry(self) -> dict:
         """Start a single-round registration using the last saved config."""
@@ -156,6 +234,9 @@ class RegistrationJobManager:
             outlook_accounts_file=cfg.get("outlook_accounts_file", ""),
             google_data=cfg.get("google_data", ""),
             google_accounts_file=cfg.get("google_accounts_file", ""),
+            proxy_pool_enabled=cfg.get("proxy_pool_enabled"),
+            proxy_data=cfg.get("proxy_data", ""),
+            proxy_file=cfg.get("proxy_file", ""),
         )
 
     def start(
@@ -169,6 +250,9 @@ class RegistrationJobManager:
         outlook_accounts_file: str = "",
         google_data: str = "",
         google_accounts_file: str = "",
+        proxy_pool_enabled: bool | None = None,
+        proxy_data: str = "",
+        proxy_file: str = "",
     ) -> dict:
         total = safe_int(total, default=1, minimum=1, maximum=10_000)
         requested_total = total
@@ -188,6 +272,11 @@ class RegistrationJobManager:
             google_data=google_data,
             google_file=google_accounts_file,
         )
+        proxy_pool, proxy_source = _build_proxy_pool(
+            enabled=proxy_pool_enabled,
+            data=proxy_data,
+            file_path=proxy_file,
+        )
 
         # Outlook/Google 邮箱池里的每个账号只能注册一次；如果请求的总数超过池子大小，
         # 循环取号会导致同一个邮箱被拿去"注册"第二次，这个账号大概率直接失败。
@@ -196,6 +285,12 @@ class RegistrationJobManager:
         pool_capped = bool(pool_count) and total > pool_count
         if pool_capped:
             total = pool_count
+            concurrency = min(concurrency, total)
+
+        proxy_pool_count = proxy_pool.total if proxy_pool is not None else 0
+        proxy_pool_capped = proxy_pool is not None and total > proxy_pool_count
+        if proxy_pool_capped:
+            total = proxy_pool_count
             concurrency = min(concurrency, total)
 
         max_oauth_concurrency = safe_int(
@@ -221,9 +316,13 @@ class RegistrationJobManager:
                 "outlook_accounts_file": outlook_accounts_file,
                 "google_data": google_data,
                 "google_accounts_file": google_accounts_file,
+                "proxy_pool_enabled": proxy_pool is not None,
+                "proxy_data": proxy_data,
+                "proxy_file": proxy_file,
             }
             self._stop_event = threading.Event()
             self._mail_source = mail_source
+            self._proxy_pool = proxy_pool
             self._oauth_semaphore = (
                 threading.BoundedSemaphore(oauth_concurrency) if oauth_concurrency else None
             )
@@ -241,6 +340,11 @@ class RegistrationJobManager:
                 "googleAccountCount": getattr(mail_source, "count", 0)
                 if getattr(mail_source, "name", "") in {"gmail", "google"}
                 else 0,
+                "proxyPoolEnabled": proxy_pool is not None,
+                "proxyPoolSource": proxy_source,
+                "proxyPoolTotal": proxy_pool_count,
+                "proxyPoolUsed": 0,
+                "proxyPoolRemaining": proxy_pool_count,
                 "issued": 0,
                 "completed": 0,
                 "failed": 0,
@@ -266,6 +370,7 @@ class RegistrationJobManager:
                         "stage": "waiting",
                         "message": "等待启动",
                         "fingerprint": "",
+                        "proxy": "直连",
                         "updatedAt": now_ms(),
                     }
                     for index in range(concurrency)
@@ -280,6 +385,11 @@ class RegistrationJobManager:
                     "info",
                     f"refresh_token 阶段最多同时运行 {oauth_concurrency} 个窗口，"
                     "其余窗口会排队以降低同出口 IP 的 OAuth 限速风险",
+                )
+            if proxy_pool is not None:
+                self._event_locked(
+                    "info",
+                    f"代理池已加载 {proxy_pool_count} 个端点，每轮注册随机领取且任务内不复用",
                 )
             if concurrency > 1:
                 self._event_locked(
@@ -297,6 +407,12 @@ class RegistrationJobManager:
                     "warning",
                     f"邮箱池只有 {pool_count} 个可用账号，总数已从 {requested_total} 限制为 {pool_count}，"
                     f"避免同一个邮箱被重复用来注册导致必然失败",
+                )
+            if proxy_pool_capped:
+                self._event_locked(
+                    "warning",
+                    f"代理池只有 {proxy_pool_count} 个可用端点，总数已从 {requested_total} 限制为 {proxy_pool_count}，"
+                    "避免不同账号复用同一出口",
                 )
 
             self._thread = threading.Thread(
@@ -374,7 +490,7 @@ class RegistrationJobManager:
                 else:
                     pending += 1
             except Exception as error:
-                errors.append(str(error))
+                errors.append(redact_proxy_secrets(error))
 
         action = "最小化" if minimized else "恢复"
         level = "warning" if errors else "info"
@@ -406,7 +522,7 @@ class RegistrationJobManager:
                 "id": uuid.uuid4().hex,
                 "time": now_ms(),
                 "level": level,
-                "message": message,
+                "message": redact_proxy_secrets(message),
                 **extra,
             }
         )
@@ -427,6 +543,8 @@ class RegistrationJobManager:
         if worker_state is None:
             worker_state = {"worker": worker_index}
             workers.append(worker_state)
+        if "message" in changes:
+            changes["message"] = redact_proxy_secrets(changes["message"])
         worker_state.update(changes)
         worker_state["updatedAt"] = now_ms()
 
@@ -557,11 +675,20 @@ class RegistrationJobManager:
                     None,
                 )
                 if item is None:
+                    worker_state = next(
+                        (
+                            worker
+                            for worker in self._job.setdefault("workers", [])
+                            if int(worker.get("worker") or 0) == worker_index
+                        ),
+                        {},
+                    )
                     item = {
                         "id": uuid.uuid4().hex,
                         "round": round_index,
                         "worker": worker_index,
                         "email": email,
+                        "proxy": str(worker_state.get("proxy") or "直连"),
                         "registeredAt": now_ms(),
                         "oauthFinalized": False,
                     }
@@ -609,6 +736,7 @@ class RegistrationJobManager:
         oauth_status: str,
         oauth_error: str = "",
     ) -> None:
+        oauth_error = redact_proxy_secrets(oauth_error)
         with self._lock:
             if self._job is None:
                 return
@@ -786,7 +914,7 @@ class RegistrationJobManager:
                     "round": round_index,
                     "worker": worker_index,
                     "stage": stage or "unknown",
-                    "reason": reason,
+                    "reason": redact_proxy_secrets(reason),
                     "timedOut": bool(timed_out),
                 }
             )
@@ -875,21 +1003,93 @@ class RegistrationJobManager:
         provider.mail_source = self._mail_source
         provider.oauth_semaphore = self._oauth_semaphore
         provider.result_callback = self._registration_checkpoint_callback(worker_index, round_index)
+        with self._lock:
+            has_proxy_pool = self._proxy_pool is not None
+        if has_proxy_pool:
+            provider.retry_browser_callback = lambda session: self._restart_for_registration_retry(
+                session,
+                worker_index=worker_index,
+                round_index=round_index,
+            )
         return provider
 
-    def _start_worker_session(self, worker_index: int, chrome_lang: str = "zh-CN") -> DrissionBrowserSession:
+    def _acquire_proxy(self, worker_index: int, round_index: int | None = None) -> str | None:
+        """Claim one endpoint for a registration round and publish only a mask."""
+        with self._lock:
+            proxy_pool = self._proxy_pool
+        if proxy_pool is None:
+            return None
+        try:
+            proxy_server = proxy_pool.acquire()
+        except ProxyPoolExhaustedError as error:
+            self._event(
+                "error",
+                "代理池已耗尽，无法为下一轮分配未使用的出口",
+                worker=worker_index,
+                round=round_index,
+                stage="proxy_acquire",
+            )
+            raise RuntimeError("代理池已耗尽，无法继续注册") from error
+
+        summary = mask_proxy_server(proxy_server)
+        with self._lock:
+            if self._job is not None:
+                self._job["proxyPoolUsed"] = proxy_pool.used
+                self._job["proxyPoolRemaining"] = proxy_pool.remaining
+        self._update_worker_state(
+            worker_index,
+            proxy=summary,
+            stage="proxy_acquire",
+            message=f"已分配独立代理 {summary}",
+        )
+        self._event(
+            "info",
+            f"Worker {worker_index} 已分配独立代理 {summary}",
+            worker=worker_index,
+            round=round_index,
+            stage="proxy_acquire",
+        )
+        return proxy_server
+
+    def _restart_for_registration_retry(
+        self,
+        session: DrissionBrowserSession,
+        *,
+        worker_index: int,
+        round_index: int,
+    ) -> None:
+        """Bind a fresh endpoint before the provider repeats a signup attempt."""
+
+        proxy_server = self._acquire_proxy(worker_index, round_index)
+        session.restart(proxy_server=proxy_server)
+        self._event(
+            "info",
+            f"Worker {worker_index} 已为第 {round_index} 轮重试切换独立代理",
+            worker=worker_index,
+            round=round_index,
+            stage="registration_retry",
+        )
+
+    def _start_worker_session(
+        self,
+        worker_index: int,
+        chrome_lang: str = "zh-CN",
+        proxy_server: str | None = None,
+    ) -> DrissionBrowserSession:
         with self._lock:
             window_count = int((self._job or {}).get("concurrency") or 1)
             minimize_browser = bool((self._job or {}).get("windowsMinimized", True))
-        session = DrissionBrowserSession(
-            build_chromium_options(
-                chrome_lang,
-                headless=False,
-                window_index=worker_index - 1,
-                window_count=window_count,
-                start_minimized=minimize_browser,
-            )
-        )
+        options_kwargs = {
+            "headless": False,
+            "window_index": worker_index - 1,
+            "window_count": window_count,
+            "start_minimized": minimize_browser,
+        }
+        # Keep the no-proxy call shape stable for integrations and existing
+        # tests; only pass the optional keyword when a pool assigned a value.
+        if proxy_server is not None:
+            options_kwargs["proxy_server"] = proxy_server
+        session = DrissionBrowserSession(build_chromium_options(chrome_lang, **options_kwargs))
         self._register_session(session)
         try:
             with self._lock:
@@ -969,6 +1169,8 @@ class RegistrationJobManager:
 
     def _run_worker(self, worker_index: int, oauth_exchange: bool) -> None:
         session: DrissionBrowserSession | None = None
+        current_proxy: str | None = None
+        initial_round_index: int | None = None
         try:
             if self._stop_event.is_set():
                 return
@@ -981,10 +1183,8 @@ class RegistrationJobManager:
                 stage="browser_start",
                 message="正在启动独立浏览器",
             )
-            session = self._start_worker_session(worker_index)
-            if self._stop_event.is_set():
-                session.stop()
-                self._unregister_session(session)
+            initial_round_index = self._next_round()
+            if initial_round_index is None:
                 return
         except Exception as error:
             self._worker_start_failed()
@@ -1001,25 +1201,19 @@ class RegistrationJobManager:
             return
 
         try:
-            fingerprint_summary = _fingerprint_summary(session)
-            self._update_worker_state(
-                worker_index,
-                status="ready",
-                stage="browser_ready",
-                message="独立浏览器已启动",
-                fingerprint=fingerprint_summary.strip("（）"),
-            )
-            self._event(
-                "info",
-                f"Worker {worker_index} 浏览器已启动{fingerprint_summary}",
-                worker=worker_index,
-            )
+            first_round = True
             while True:
                 if self._stop_event.is_set():
                     self._event("info", f"Worker {worker_index} 收到停止信号，退出", worker=worker_index)
                     break
 
-                round_index = self._next_round()
+                if first_round:
+                    round_index = initial_round_index
+                    is_first_round = True
+                    first_round = False
+                else:
+                    round_index = self._next_round()
+                    is_first_round = False
                 if round_index is None:
                     break
 
@@ -1036,6 +1230,7 @@ class RegistrationJobManager:
                     email="",
                     stage="starting",
                     message=f"正在执行第 {round_index} 轮",
+                    proxy=mask_proxy_server(current_proxy),
                 )
                 ok = False
                 cancelled = False
@@ -1051,12 +1246,42 @@ class RegistrationJobManager:
                 )
                 provider.event_callback = self._provider_event_callback(worker_index, round_index)
                 try:
-                    if session is None:
-                        session = self._start_worker_session(worker_index, provider.chrome_lang)
+                    # Each top-level round claims an endpoint before the first
+                    # page request. Later rounds restart the browser with a
+                    # fresh profile and proxy.
+                    if not is_first_round and session is not None:
+                        if self._proxy_pool is not None:
+                            current_proxy = self._acquire_proxy(worker_index, round_index)
+                            session.restart(proxy_server=current_proxy)
+                        else:
+                            session.restart()
                         self._event(
                             "info",
-                            f"Worker {worker_index} 浏览器已重新启动{_fingerprint_summary(session)}",
+                            f"Worker {worker_index} 已切换到本轮独立浏览器{_fingerprint_summary(session)}",
                             worker=worker_index,
+                            round=round_index,
+                        )
+                    if session is None:
+                        if self._proxy_pool is not None and current_proxy is None:
+                            current_proxy = self._acquire_proxy(worker_index, round_index)
+                        session = self._start_worker_session(
+                            worker_index,
+                            provider.chrome_lang,
+                            proxy_server=current_proxy,
+                        )
+                        fingerprint_summary = _fingerprint_summary(session)
+                        self._update_worker_state(
+                            worker_index,
+                            status="ready",
+                            stage="browser_ready",
+                            message="独立浏览器已启动",
+                            fingerprint=fingerprint_summary.strip("（）"),
+                        )
+                        self._event(
+                            "info",
+                            f"Worker {worker_index} 浏览器已启动{fingerprint_summary}",
+                            worker=worker_index,
+                            round=round_index,
                         )
                     with self._lock:
                         round_timeout_seconds = int(
@@ -1132,6 +1357,7 @@ class RegistrationJobManager:
                             pass
                         self._unregister_session(session)
                         session = None
+                        current_proxy = None
                         continue
                     if status == "error":
                         error = payload if isinstance(payload, BaseException) else RuntimeError(str(payload))
@@ -1329,6 +1555,11 @@ class RegistrationJobManager:
                         )
                         traceback.print_exc()
                 finally:
+                    # A failed fresh-browser launch consumed its endpoint, so
+                    # the next round must claim a new one rather than carrying
+                    # the stale value forward.
+                    if session is None:
+                        current_proxy = None
                     self._round_finished(ok, cancelled=cancelled)
                     if self._stop_event.is_set():
                         break
@@ -1339,20 +1570,6 @@ class RegistrationJobManager:
                     try:
                         if session is None:
                             continue
-                        session.restart()
-                        fingerprint_summary = _fingerprint_summary(session)
-                        self._update_worker_state(
-                            worker_index,
-                            status="ready",
-                            stage="browser_restarted",
-                            message="下一轮独立浏览器已就绪",
-                            fingerprint=fingerprint_summary.strip("（）"),
-                        )
-                        self._event(
-                            "info",
-                            f"Worker {worker_index} 已为下一轮重新生成指纹{fingerprint_summary}",
-                            worker=worker_index,
-                        )
                         self._pace_before_next_round(worker_index)
                     except Exception as error:
                         self._event("warning", f"Worker {worker_index} 浏览器重启失败：{error}", worker=worker_index)
@@ -1362,6 +1579,7 @@ class RegistrationJobManager:
                             pass
                         self._unregister_session(session)
                         session = None
+                        current_proxy = None
         finally:
             if session is not None:
                 try:
@@ -1435,6 +1653,7 @@ class RegistrationJobManager:
                 ROUND_PACING_MAX_SECONDS,
             )
             self._mail_source = None
+            self._proxy_pool = None
             self._oauth_semaphore = None
 
         if registered_this_round > 0:

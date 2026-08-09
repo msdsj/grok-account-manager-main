@@ -1,11 +1,12 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { FolderOpen, Play, RefreshCw, RotateCw, Save, Square } from "lucide-react";
+import { FolderOpen, Play, RefreshCw, RotateCw, Save, Square, Trash2, Upload } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -16,10 +17,13 @@ import { DashboardPanel } from "@/features/dashboard/dashboard-panel";
 import {
   countOutlookAccounts,
   countGoogleAccounts,
+  clearRegistrationProxyPool,
+  getRegistrationProxyPool,
   getCurrentJob,
   getOutlookMailboxPool,
   retryRegistration,
   saveOutlookMailboxPool,
+  saveRegistrationProxyPool,
   startRegistration,
   stopRegistration,
   syncAccountsToPool,
@@ -58,6 +62,13 @@ export function RegisterTaskPage() {
   const [emailSource, setEmailSource] = useState<EmailSource>("duckmail");
   const [oauthExchange, setOauthExchange] = useState(true);
   const [minimizeBrowsers, setMinimizeBrowsers] = useState(true);
+  // Undefined keeps the backend's automatic discovery behavior: use the
+  // default file or saved nodes when present, otherwise stay on direct mode.
+  const [proxyPoolEnabled, setProxyPoolEnabled] = useState<boolean | undefined>(undefined);
+  const [proxyFile, setProxyFile] = useState("");
+  const [proxyDialogOpen, setProxyDialogOpen] = useState(false);
+  const [proxyData, setProxyData] = useState("");
+  const [proxyReplace, setProxyReplace] = useState(false);
   const [outlookData, setOutlookData] = useState("");
   const [googleData, setGoogleData] = useState("");
   const loadedOutlookPool = useRef(false);
@@ -73,6 +84,12 @@ export function RegisterTaskPage() {
     queryFn: getOutlookMailboxPool,
     enabled: emailSource === "outlook",
     staleTime: Infinity,
+  });
+
+  const proxyPoolQuery = useQuery({
+    queryKey: ["registration-proxy-pool"],
+    queryFn: getRegistrationProxyPool,
+    staleTime: 10_000,
   });
 
   useEffect(() => {
@@ -100,6 +117,8 @@ export function RegisterTaskPage() {
         emailSource,
         outlookData: emailSource === "outlook" ? outlookData : "",
         googleData: emailSource === "google" ? googleData : "",
+        proxyPoolEnabled,
+        proxyFile,
       }),
     onSuccess: () => { toast.success(t("registerTask.started")); invalidate(); },
     onError: (error) => toast.error(error instanceof Error ? error.message : t("registerTask.startFailed")),
@@ -138,6 +157,26 @@ export function RegisterTaskPage() {
     onError: (error) => toast.error(error instanceof Error ? error.message : t("registerTask.outlookPoolSaveFailed")),
   });
 
+  const saveProxyPoolMutation = useMutation({
+    mutationFn: () => saveRegistrationProxyPool(proxyData, proxyReplace),
+    onSuccess: (result) => {
+      queryClient.setQueryData(["registration-proxy-pool"], result);
+      setProxyData("");
+      setProxyDialogOpen(false);
+      toast.success(t("registerTask.proxyPoolSaved", { count: result.count, added: result.added }));
+    },
+    onError: (error) => toast.error(error instanceof Error ? error.message : t("registerTask.proxyPoolSaveFailed")),
+  });
+
+  const clearProxyPoolMutation = useMutation({
+    mutationFn: clearRegistrationProxyPool,
+    onSuccess: (result) => {
+      queryClient.setQueryData(["registration-proxy-pool"], result);
+      toast.success(t("registerTask.proxyPoolCleared", { count: result.removed }));
+    },
+    onError: (error) => toast.error(error instanceof Error ? error.message : t("registerTask.proxyPoolSaveFailed")),
+  });
+
   const loadSavedOutlookPool = async () => {
     try {
       const result = await outlookPoolQuery.refetch();
@@ -150,6 +189,12 @@ export function RegisterTaskPage() {
     } catch (error) {
       toast.error(error instanceof Error ? error.message : t("registerTask.outlookPoolLoadFailed"));
     }
+  };
+
+  const openProxyDialog = () => {
+    setProxyData("");
+    setProxyReplace(false);
+    setProxyDialogOpen(true);
   };
 
   const job = jobQuery.data ?? null;
@@ -266,6 +311,33 @@ export function RegisterTaskPage() {
                 </p>
               </div>
             ) : null}
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between">
+                <Label htmlFor="reg-proxy-pool">{t("registerTask.proxyPoolLabel")}</Label>
+                <Switch
+                  id="reg-proxy-pool"
+                  checked={proxyPoolEnabled !== false}
+                  disabled={running}
+                  onCheckedChange={(checked) => setProxyPoolEnabled(checked)}
+                />
+              </div>
+              <Input
+                id="reg-proxy-file"
+                value={proxyFile}
+                disabled={running || proxyPoolEnabled === false}
+                placeholder={t("registerTask.proxyFilePlaceholder")}
+                onChange={(event) => setProxyFile(event.target.value)}
+              />
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <p className="text-xs text-muted-foreground">
+                  {t("registerTask.proxyPoolHelp")}
+                  {proxyPoolQuery.data ? ` ${t("registerTask.proxySavedCount", { count: proxyPoolQuery.data.count })}` : ""}
+                </p>
+                <Button type="button" size="sm" variant="secondary" disabled={running} onClick={openProxyDialog}>
+                  <Upload />{t("registerTask.manageProxyPool")}
+                </Button>
+              </div>
+            </div>
             <div className="flex items-center justify-between">
               <Label htmlFor="reg-oauth">{t("registerTask.oauthExchangeLabel")}</Label>
               <Switch id="reg-oauth" checked={oauthExchange} disabled={running} onCheckedChange={setOauthExchange} />
@@ -303,12 +375,22 @@ export function RegisterTaskPage() {
                 <span>{t("registerTask.succeeded", { count: job.registered })}</span>
                 <span>{t("registerTask.failed", { count: job.failed })}</span>
               </div>
+              {job.proxyPoolEnabled ? (
+                <div className="text-xs text-muted-foreground">
+                  {t("registerTask.proxyPoolProgress", {
+                    used: job.proxyPoolUsed,
+                    total: job.proxyPoolTotal,
+                    remaining: job.proxyPoolRemaining,
+                  })}
+                </div>
+              ) : null}
               {job.workers?.length ? (
                 <Table>
                   <TableHeader>
                     <TableRow>
                       <TableHead>#</TableHead>
                       <TableHead>{t("accounts.status")}</TableHead>
+                      <TableHead>{t("registerTask.proxyColumn")}</TableHead>
                       <TableHead>{t("accounts.account")}</TableHead>
                     </TableRow>
                   </TableHeader>
@@ -317,6 +399,7 @@ export function RegisterTaskPage() {
                       <TableRow key={worker.worker}>
                         <TableCell>{worker.worker}</TableCell>
                         <TableCell className="whitespace-nowrap text-xs">{worker.stage || worker.status}</TableCell>
+                        <TableCell className="whitespace-nowrap text-xs text-muted-foreground">{worker.proxy || "直连"}</TableCell>
                         <TableCell className="truncate text-xs text-muted-foreground">{worker.email || worker.message}</TableCell>
                       </TableRow>
                     ))}
@@ -343,6 +426,46 @@ export function RegisterTaskPage() {
           </ul>
         )}
       </DashboardPanel>
+
+      <Dialog open={proxyDialogOpen} onOpenChange={setProxyDialogOpen}>
+        <DialogContent className="max-h-[calc(100svh-2rem)] overflow-y-auto sm:max-w-[620px]">
+          <DialogHeader>
+            <DialogTitle>{t("registerTask.proxyDialogTitle")}</DialogTitle>
+            <DialogDescription>{t("registerTask.proxyDialogDescription")}</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3">
+            <Textarea
+              value={proxyData}
+              onChange={(event) => setProxyData(event.target.value)}
+              disabled={saveProxyPoolMutation.isPending || clearProxyPoolMutation.isPending}
+              spellCheck={false}
+              placeholder={t("registerTask.proxyDialogPlaceholder")}
+              className="min-h-44 font-mono text-xs"
+            />
+            <div className="flex items-center justify-between gap-3">
+              <div className="text-xs text-muted-foreground">
+                {proxyPoolQuery.data
+                  ? t("registerTask.proxySavedList", { count: proxyPoolQuery.data.count })
+                  : t("registerTask.proxySavedLoading")}
+                {proxyPoolQuery.data?.items.length ? `：${proxyPoolQuery.data.items.slice(0, 12).join("、")}` : ""}
+              </div>
+              <div className="flex shrink-0 items-center gap-2">
+                <Label htmlFor="reg-proxy-replace" className="text-xs">{t("registerTask.proxyReplaceLabel")}</Label>
+                <Switch id="reg-proxy-replace" checked={proxyReplace} onCheckedChange={setProxyReplace} disabled={saveProxyPoolMutation.isPending || clearProxyPoolMutation.isPending} />
+              </div>
+            </div>
+          </div>
+          <DialogFooter>
+            <Button type="button" size="sm" variant="secondary" onClick={() => clearProxyPoolMutation.mutate()} disabled={proxyPoolQuery.data?.count === 0 || saveProxyPoolMutation.isPending || clearProxyPoolMutation.isPending}>
+              <Trash2 />{t("registerTask.clearProxyPool")}
+            </Button>
+            <Button type="button" size="sm" variant="secondary" onClick={() => setProxyDialogOpen(false)} disabled={saveProxyPoolMutation.isPending || clearProxyPoolMutation.isPending}>{t("common.cancel")}</Button>
+            <Button type="button" size="sm" onClick={() => saveProxyPoolMutation.mutate()} disabled={!proxyData.trim() || saveProxyPoolMutation.isPending || clearProxyPoolMutation.isPending}>
+              <Save />{t("registerTask.saveProxyPool")}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

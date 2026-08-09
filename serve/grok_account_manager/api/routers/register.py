@@ -4,10 +4,39 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException
 
-from ..schemas import RegisterRequest
+from ..schemas import RegisterRequest, RegistrationProxyImportRequest
 from ..services.jobs import JOB_MANAGER
+from ..services.registration_proxy_pool import (
+    clear_saved_registration_proxies,
+    registration_proxy_pool_snapshot,
+    save_registration_proxy_nodes,
+)
 
 router = APIRouter(tags=["registration"])
+
+
+@router.get("/api/register/proxies")
+def get_registration_proxies() -> dict:
+    try:
+        return registration_proxy_pool_snapshot()
+    except Exception as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+
+@router.put("/api/register/proxies")
+def import_registration_proxies(body: RegistrationProxyImportRequest) -> dict:
+    try:
+        return save_registration_proxy_nodes(body.data, replace=body.replace)
+    except Exception as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+
+@router.delete("/api/register/proxies")
+def clear_registration_proxies() -> dict:
+    try:
+        return clear_saved_registration_proxies()
+    except Exception as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
 
 
 @router.post("/api/register")
@@ -23,6 +52,9 @@ def start_registration(body: RegisterRequest) -> dict:
             outlook_accounts_file=body.outlookAccountsFile,
             google_data=body.googleData,
             google_accounts_file=body.googleAccountsFile,
+            proxy_pool_enabled=body.proxyPoolEnabled,
+            proxy_data=body.proxyData,
+            proxy_file=body.proxyFile,
         )
         return {"job": job}
     except Exception as error:

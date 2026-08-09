@@ -11,6 +11,7 @@ import os
 import random
 import secrets
 import time
+from collections.abc import Callable
 
 from DrissionPage.errors import PageDisconnectedError
 
@@ -44,6 +45,7 @@ class GrokProvider:
     mail_source: MailboxSource | None = None
     event_callback = None
     result_callback = None
+    retry_browser_callback: Callable[[DrissionBrowserSession], None] | None = None
     oauth_semaphore = None
     oauth_cooldown_range = (2.0, 5.0)
     max_registration_attempts = 3
@@ -79,7 +81,11 @@ class GrokProvider:
                     stage="registration_retry",
                 )
                 self._interruptible_sleep(delay)
-                session.restart()
+                retry_callback = self.retry_browser_callback
+                if callable(retry_callback):
+                    retry_callback(session)
+                else:
+                    session.restart()
 
         raise RuntimeError("注册重试结束但没有返回结果")
 

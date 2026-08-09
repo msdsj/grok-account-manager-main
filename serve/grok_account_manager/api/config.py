@@ -9,9 +9,16 @@ from ..core.browser import PROJECT_ROOT
 OUTPUT_DIR: Path = PROJECT_ROOT / "output"
 CREDENTIALS_DIR: Path = OUTPUT_DIR / "credentials"
 OUTLOOK_MAILBOX_POOL_PATH: Path = OUTPUT_DIR / "mailboxes" / "outlook-accounts.txt"
+REGISTRATION_PROXY_POOL_PATH: Path = OUTPUT_DIR / "registration-proxies.json"
 TXT_OUTPUT: Path = OUTPUT_DIR / "sso.txt"
 ACCOUNT_TEST_RESULTS_PATH: Path = OUTPUT_DIR / "account-test-results.json"
 WEB_DIST_DIR: Path = PROJECT_ROOT / "web" / "dist"
+
+# Optional registration egress pool.  The default follows the local Downloads
+# convention used by the control panel; an explicit API field or the
+# ``GROK_ACCOUNT_MANAGER_PROXY_FILE`` environment variable takes precedence.
+DEFAULT_PROXY_POOL_PATH: Path = Path.home() / "Downloads" / "xx.txt"
+PROXY_POOL_FILE_ENV = "GROK_ACCOUNT_MANAGER_PROXY_FILE"
 
 DEFAULT_MAX_CONCURRENCY = 20
 DEFAULT_MAX_OAUTH_CONCURRENCY = 2

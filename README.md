@@ -21,6 +21,7 @@ GitHub：<https://github.com/msdsj/grok-account-manager-main>
 
 - Grok 邮箱注册自动化，注册资料姓名和密码每轮随机生成。
 - 邮箱源支持 DuckMail、Outlook、Gmail/Google 账号池，`----` 和 `|` 两种分隔格式都兼容。
+- 可选注册代理池：每个注册浏览器随机领取一个未使用端点，下一轮重启浏览器时切换到新的端点。
 - 注册页、浏览器启动和 OAuth 短暂网络错误都有有界重试，任务停止后不会继续拉起浏览器。
 - 输出 cockpit-tools 可导入的 GrokAccount JSON 数组，并同步写入本地账号数据库。
 - React 控制台使用侧边栏路由，支持注册任务、账号列表、Grok CLI 4.5 测试、Chat 对话测试、图片生成测试和本地中转。
@@ -60,6 +61,47 @@ uv run grok-account-manager grok --count 1 --sink json
 ```bash
 uv run python -m grok_account_manager grok --count 1 --sink json
 ```
+
+## 注册代理池
+
+CLI 与本地控制台都支持从代理列表为每轮注册分配独立的浏览器出口。未显式指定路径时，会自动检查 `~/Downloads/xx.txt`，并与控制台保存的节点合并去重；也可以在 `.env` 或命令行指定其他文件：
+
+```bash
+GROK_ACCOUNT_MANAGER_PROXY_FILE=~/Downloads/xx.txt
+```
+
+```bash
+uv run grok-account-manager grok --count 10 --proxy-file ~/Downloads/xx.txt --sink json
+```
+
+代理文件使用 UTF-8 编码，每行一个端点；空行、以 `#` 开头的行和行尾注释会忽略。裸 `HOST:PORT` 按 HTTP 代理处理，也支持显式的无认证 `http://` 和 `https://`：
+
+```text
+# proxies.txt
+198.51.100.10:8080
+http://198.51.100.11:8080
+https://198.51.100.12:8443
+```
+
+同一任务中会随机领取端点且不重复使用。注册浏览器首次启动即绑定首个端点；每轮结束后重启浏览器并领取下一个端点，Provider 级重试也会先领取新端点。请求轮数超过可用端点数时，CLI 会按代理池大小收尾，避免复用出口；使用 `--count 0` 时也会在池耗尽后结束。运行日志只显示脱敏后的代理摘要。当前浏览器适配器不支持带用户名/密码或 SOCKS 节点；请保留实际代理文件在本地并加入忽略规则。
+
+### 控制台保存节点
+
+打开本地控制台的“注册任务”，启用“注册代理池”后点击“管理已保存节点”。在弹窗中粘贴每行一个端点，按“保存节点”即可持久化；默认追加并去重，打开“替换现有节点”后会以本次内容覆盖原池，也可以直接清空保存的节点。保存的节点位于 `output/registration-proxies.json`，文件以仅当前用户可读写权限保存，界面与任务日志只显示脱敏摘要。
+
+注册任务的代理来源按以下规则选择：
+
+- 关闭“注册代理池”或 CLI 使用 `--no-proxy`：强制直连。
+- 填写控制台的代理文件路径，或设置 `GROK_ACCOUNT_MANAGER_PROXY_FILE` / CLI `--proxy-file`：只使用该文件。
+- 路径留空：合并 `~/Downloads/xx.txt`（存在时）与“管理已保存节点”中的内容，并按规范地址去重；两者都没有时保持直连。
+
+要显式跳过自动发现或 `.env` 中的代理文件，使用：
+
+```bash
+uv run grok-account-manager grok --count 1 --no-proxy --sink json
+```
+
+每个代理端点是否对应独立公网出口由代理服务本身决定；程序按端点分配，并在浏览器进程重启时应用新的网络设置。
 
 ## Outlook 邮箱源
 
@@ -150,6 +192,7 @@ uv run grok-account-manager-api
 - `output/sso.txt`：使用 `txt` sink 时写入的 SSO 兜底文本。
 - `output/sso-failed.txt`：Sub2API 写入失败时的兜底文本。
 - `output/pending-registration-results.json`：控制台任务的未完成 OAuth checkpoint 和落盘失败恢复队列。
+- `output/registration-proxies.json`：控制台导入的注册节点池，仅当前用户可读写。
 
 `output/` 是运行产物目录，默认不纳入 Git。
 
