@@ -4,9 +4,13 @@ from unittest.mock import patch
 
 from grok_account_manager.grok.oauth_exchange import CloudflareBlockedError, OAuthTerminalError
 from grok_account_manager.providers.grok import (
+    BrowserStepRetryRequested,
     GrokProvider,
+    _dismiss_cookie_banner,
     _fill_code_and_submit,
     _get_turnstile_token,
+    _render_browser_step_overlay,
+    _resubmit_final_profile,
     _wait_for_sso_cookie_with_resubmit,
 )
 
@@ -46,6 +50,8 @@ class _OtpPage:
         self.calls = 0
 
     def run_js(self, _script, *_args):
+        if "onetrust-reject-all-handler" in _script:
+            return "absent"
         self.calls += 1
         return "filled" if self.calls == 1 else "clicked"
 
@@ -70,6 +76,33 @@ class _ProfilePage:
 class _ProfileSession:
     def __init__(self) -> None:
         self.page = _ProfilePage()
+
+    def refresh_page(self):
+        return self.page
+
+
+class _CookiePage:
+    def __init__(self, status: str) -> None:
+        self.status = status
+        self.script = ""
+
+    def run_js(self, script, *_args):
+        self.script = script
+        return self.status
+
+
+class _OverlayPage:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, tuple[object, ...]]] = []
+
+    def run_js(self, script, *args):
+        self.calls.append((script, args))
+        return True
+
+
+class _OverlaySession:
+    def __init__(self) -> None:
+        self.page = _OverlayPage()
 
     def refresh_page(self):
         return self.page
@@ -239,6 +272,63 @@ class GrokProviderTests(unittest.TestCase):
         self.assertEqual(wait_cookie.call_args_list[0].kwargs["timeout"], 30)
         self.assertEqual(wait_cookie.call_args_list[1].kwargs["timeout"], 150)
         resubmit.assert_called_once_with(session.page)
+
+    def test_cookie_banner_prefers_reject_all(self) -> None:
+        page = _CookiePage("dismissed")
+
+        self.assertTrue(_dismiss_cookie_banner(page))
+        self.assertIn("reject all", page.script.lower())
+        self.assertIn("onetrust-reject-all-handler", page.script)
+
+    def test_profile_resubmit_dismisses_cookie_banner_first(self) -> None:
+        page = _ProfilePage()
+        with patch(
+            "grok_account_manager.providers.grok._dismiss_cookie_banner",
+            return_value=True,
+        ) as dismiss:
+            self.assertTrue(_resubmit_final_profile(page))
+
+        dismiss.assert_called_once_with(page)
+
+    def test_browser_step_overlay_has_continue_and_retry_controls(self) -> None:
+        page = _OverlayPage()
+
+        self.assertTrue(_render_browser_step_overlay(
+            page,
+            stage="fill_profile",
+            stage_label="填写账号资料",
+            message="正在填写账号资料",
+            window_label="注册窗口 1 · 第 1 轮",
+        ))
+
+        script, args = page.calls[-1]
+        self.assertIn("继续执行", script)
+        self.assertIn("再次运行", script)
+        self.assertEqual(args, ("fill_profile", "填写账号资料", "正在填写账号资料", "注册窗口 1 · 第 1 轮"))
+
+    def test_browser_retry_action_requests_a_new_registration_round(self) -> None:
+        provider = GrokProvider()
+        provider.current_stage = "fill_profile"
+        page = _OverlayPage()
+
+        with patch(
+            "grok_account_manager.providers.grok._consume_browser_step_action",
+            return_value="retry",
+        ):
+            with self.assertRaises(BrowserStepRetryRequested):
+                provider._handle_browser_overlay_action(page)
+
+    def test_stage_update_renders_overlay_for_its_browser(self) -> None:
+        provider = GrokProvider()
+        session = _OverlaySession()
+        provider._browser_session = session
+        provider.browser_window_label = "注册窗口 2 · 第 4 轮"
+
+        provider._set_stage("fill_email", "正在填写邮箱并发送验证码")
+
+        script, args = session.page.calls[-1]
+        self.assertIn("__grok-registration-step-overlay", script)
+        self.assertEqual(args, ("fill_email", "填写邮箱", "正在填写邮箱并发送验证码", "注册窗口 2 · 第 4 轮"))
 
     def test_oauth_failure_keeps_registered_account(self) -> None:
         provider = GrokProvider()

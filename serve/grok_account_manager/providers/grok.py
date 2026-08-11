@@ -32,6 +32,24 @@ except ImportError:
 
 
 SIGNUP_URL = "https://accounts.x.ai/sign-up?redirect=grok-com"
+BROWSER_STAGE_LABELS = {
+    "starting": "准备开始",
+    "create_mailbox": "创建或领取邮箱",
+    "open_signup": "打开注册页",
+    "click_email_signup": "选择邮箱注册",
+    "fill_email": "填写邮箱",
+    "wait_email_code": "等待邮箱验证码",
+    "fill_profile": "填写账号资料",
+    "wait_sso_cookie": "确认登录状态",
+    "oauth_queue": "等待授权队列",
+    "oauth_exchange": "获取登录凭证",
+    "fetch_credential": "保存账号凭证",
+    "done": "注册完成",
+}
+
+
+class BrowserStepRetryRequested(RuntimeError):
+    """Raised when the user asks the visible browser window to restart its round."""
 
 
 class GrokProvider:
@@ -49,6 +67,7 @@ class GrokProvider:
     oauth_semaphore = None
     oauth_cooldown_range = (2.0, 5.0)
     max_registration_attempts = 3
+    browser_window_label = ""
 
     def run_round(self, session: DrissionBrowserSession) -> RegistrationResult:
         raw_attempts = os.environ.get(
@@ -90,6 +109,7 @@ class GrokProvider:
         raise RuntimeError("注册重试结束但没有返回结果")
 
     def _run_round_once(self, session: DrissionBrowserSession) -> RegistrationResult:
+        self._browser_session = session
         self.current_email = ""
         self.registration_succeeded = False
         self.oauth_exchange_error = ""
@@ -109,10 +129,16 @@ class GrokProvider:
 
         self._set_stage("open_signup", "正在打开 Grok 注册页")
         session.open_url(self.signup_url)
+        self._render_browser_step_overlay("open_signup", "浏览器已打开，正在进入注册页")
 
         if registration_mode == "google":
             self._set_stage("google_register", "正在使用 Google 账号注册")
-            email = _register_with_google_account(session, mailbox, self.stop_event)
+            email = _register_with_google_account(
+                session,
+                mailbox,
+                self.stop_event,
+                action_handler=self._handle_browser_overlay_action,
+            )
             self.current_email = email
             profile = {
                 "email": email,
@@ -120,13 +146,22 @@ class GrokProvider:
             }
         else:
             self._set_stage("click_email_signup", "正在点击邮箱注册入口")
-            _click_email_signup_button(session, stop_event=self.stop_event)
+            _click_email_signup_button(
+                session,
+                stop_event=self.stop_event,
+                action_handler=self._handle_browser_overlay_action,
+            )
 
             if self.stop_event and self.stop_event.is_set():
                 raise RuntimeError("任务已停止")
 
             self._set_stage("fill_email", "正在填写邮箱并发送验证码")
-            email = _fill_email_and_submit(session, mailbox.email, stop_event=self.stop_event)
+            email = _fill_email_and_submit(
+                session,
+                mailbox.email,
+                stop_event=self.stop_event,
+                action_handler=self._handle_browser_overlay_action,
+            )
             self.current_email = email
             self._log("info", f"Grok 已向 {email} 发送验证码，开始读取邮箱")
 
@@ -134,14 +169,24 @@ class GrokProvider:
                 raise RuntimeError("任务已停止")
 
             self._set_stage("wait_email_code", "正在等待邮箱验证码")
-            _fill_code_and_submit(session, email, mailbox, self.stop_event)
+            _fill_code_and_submit(
+                session,
+                email,
+                mailbox,
+                self.stop_event,
+                action_handler=self._handle_browser_overlay_action,
+            )
             self._log("success", "验证码已写入页面，准备填写资料")
 
             if self.stop_event and self.stop_event.is_set():
                 raise RuntimeError("任务已停止")
 
             self._set_stage("fill_profile", "正在填写账号资料")
-            profile = _fill_profile_and_submit(session, stop_event=self.stop_event)
+            profile = _fill_profile_and_submit(
+                session,
+                stop_event=self.stop_event,
+                action_handler=self._handle_browser_overlay_action,
+            )
 
         if self.stop_event and self.stop_event.is_set():
             raise RuntimeError("任务已停止")
@@ -151,6 +196,7 @@ class GrokProvider:
             session,
             self.success_cookie_name,
             stop_event=self.stop_event,
+            action_handler=self._handle_browser_overlay_action,
         )
         grok_clearance = get_grok_clearance(session)
 
@@ -353,6 +399,39 @@ class GrokProvider:
         self.current_stage = stage
         if message:
             self._log("info", f"阶段 {stage}：{message}", stage=stage)
+        self._render_browser_step_overlay(stage, message or stage)
+
+    def _render_browser_step_overlay(self, stage: str, message: str) -> None:
+        session = getattr(self, "_browser_session", None)
+        if session is None:
+            return
+        try:
+            _render_browser_step_overlay(
+                session.refresh_page(),
+                stage=stage,
+                stage_label=BROWSER_STAGE_LABELS.get(stage, stage),
+                message=message,
+                window_label=str(getattr(self, "browser_window_label", "") or ""),
+            )
+        except Exception:
+            # The overlay is observational. A navigation race must not interrupt registration.
+            return
+
+    def _handle_browser_overlay_action(self, page) -> None:
+        action = _consume_browser_step_action(page)
+        if action == "retry":
+            self._log(
+                "warning",
+                "用户在浏览器窗口请求再次运行当前注册流程",
+                stage=self.current_stage,
+            )
+            raise BrowserStepRetryRequested("用户在浏览器窗口请求再次运行")
+        if action == "continue":
+            self._log(
+                "info",
+                "用户在浏览器窗口确认继续执行",
+                stage=self.current_stage,
+            )
 
     def _log(self, level: str, message: str, **extra) -> None:
         callback = self.event_callback
@@ -362,6 +441,190 @@ class GrokProvider:
             callback(level, message, **extra)
         except Exception:
             pass
+
+
+def _dismiss_cookie_banner(page) -> bool:
+    """Dismiss a visible consent banner before it can intercept form clicks."""
+    try:
+        status = str(page.run_js(
+            r"""
+function isVisible(node) {
+    if (!node) return false;
+    const style = window.getComputedStyle(node);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+}
+
+function textOf(node) {
+    return [
+        node.innerText || '',
+        node.textContent || '',
+        node.getAttribute('aria-label') || '',
+        node.getAttribute('title') || '',
+        node.id || '',
+        node.className || '',
+    ].join(' ').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+const explicitReject = [
+    '#onetrust-reject-all-handler',
+    '[data-testid="cookie-reject-all"]',
+    '[data-test-id="cookie-reject-all"]',
+    '[data-testid="reject-all"]',
+    '[data-test-id="reject-all"]',
+].map((selector) => document.querySelector(selector)).find(isVisible);
+
+const candidates = Array.from(document.querySelectorAll(
+    'button, [role="button"], input[type="button"], input[type="submit"], a'
+)).filter(isVisible);
+const rejectLabels = [
+    'reject all', 'rejectall', 'decline all', 'declineall',
+    'essential only', 'necessary only', 'only necessary',
+    '拒绝全部', '拒绝所有', '全部拒绝', '仅必要', '只使用必要',
+];
+const rejectButton = explicitReject || candidates.find((node) => {
+    const text = textOf(node);
+    return rejectLabels.some((label) => text.includes(label));
+});
+
+if (rejectButton) {
+    rejectButton.click();
+    return 'dismissed';
+}
+
+const closeButton = candidates.find((node) => {
+    const text = textOf(node);
+    const isClose = text === 'close' || text === '关闭' || text.includes('close cookie');
+    if (!isClose) return false;
+    let container = node;
+    for (let depth = 0; container && depth < 5; depth += 1, container = container.parentElement) {
+        if (/cookie|consent|privacy|onetrust|trustarc/i.test(textOf(container))) return true;
+    }
+    return false;
+});
+if (closeButton) {
+    closeButton.click();
+    return 'dismissed';
+}
+
+return 'absent';
+            """
+        ) or "")
+    except Exception:
+        # Consent handling is optional and must not make registration fail.
+        return False
+
+    if status == "dismissed":
+        print("[*] 已关闭 Cookie 横幅，继续注册流程。")
+        return True
+    return False
+
+
+def _render_browser_step_overlay(
+    page,
+    *,
+    stage: str,
+    stage_label: str,
+    message: str,
+    window_label: str = "",
+) -> bool:
+    """Render a small, non-blocking status control in one registration browser."""
+    try:
+        return bool(page.run_js(
+            r"""
+const stage = String(arguments[0] || 'working');
+const stageLabel = String(arguments[1] || stage);
+const message = String(arguments[2] || '正在处理');
+const windowLabel = String(arguments[3] || '注册窗口');
+const overlayId = '__grok-registration-step-overlay';
+
+if (!document.documentElement) return false;
+let root = document.getElementById(overlayId);
+if (!root) {
+    root = document.createElement('section');
+    root.id = overlayId;
+    root.setAttribute('role', 'status');
+    root.style.cssText = [
+        'position:fixed', 'top:12px', 'right:12px', 'z-index:2147483647',
+        'width:min(300px, calc(100vw - 24px))', 'box-sizing:border-box',
+        'padding:12px', 'border:1px solid rgba(15,23,42,.18)',
+        'border-radius:8px', 'background:#ffffff', 'color:#172033',
+        'box-shadow:0 14px 32px rgba(15,23,42,.20)',
+        'font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif',
+        'letter-spacing:0',
+    ].join(';');
+    (document.body || document.documentElement).appendChild(root);
+}
+
+if (typeof window.__grokRegistrationStepAction !== 'string') {
+    window.__grokRegistrationStepAction = '';
+}
+
+root.replaceChildren();
+const eyebrow = document.createElement('div');
+eyebrow.textContent = windowLabel;
+eyebrow.style.cssText = 'margin:0 0 3px;color:#64748b;font-size:11px;font-weight:600';
+const title = document.createElement('div');
+title.textContent = message;
+title.style.cssText = 'font-size:14px;font-weight:700;color:#0f172a';
+const detail = document.createElement('div');
+detail.textContent = `当前步骤：${stageLabel}`;
+detail.style.cssText = 'margin-top:3px;color:#526176;font-size:12px';
+const feedback = document.createElement('div');
+feedback.dataset.role = 'feedback';
+feedback.style.cssText = 'min-height:16px;margin-top:7px;color:#526176;font-size:12px';
+const actions = document.createElement('div');
+actions.style.cssText = 'display:flex;gap:8px;margin-top:7px';
+
+function makeButton(label, action, emphasized) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = label;
+    button.dataset.action = action;
+    button.style.cssText = emphasized
+        ? 'border:0;border-radius:6px;background:#0f766e;color:#fff;padding:6px 10px;font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;cursor:pointer'
+        : 'border:1px solid #cbd5e1;border-radius:6px;background:#fff;color:#334155;padding:6px 10px;font:600 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;cursor:pointer';
+    return button;
+}
+
+actions.append(makeButton('继续执行', 'continue', true));
+actions.append(makeButton('再次运行', 'retry', false));
+root.append(eyebrow, title, detail, feedback, actions);
+
+root.onclick = (event) => {
+    const button = event.target instanceof Element ? event.target.closest('button[data-action]') : null;
+    const action = button?.dataset.action;
+    if (!action) return;
+    window.__grokRegistrationStepAction = action;
+    feedback.textContent = action === 'retry' ? '已请求重新运行当前流程。' : '正在继续执行。';
+    if (action === 'continue') root.style.display = 'none';
+};
+
+return true;
+            """,
+            stage,
+            stage_label,
+            message,
+            window_label,
+        ))
+    except Exception:
+        return False
+
+
+def _consume_browser_step_action(page) -> str:
+    """Read and clear a browser-overlay action without relying on cross-origin HTTP."""
+    try:
+        action = str(page.run_js(
+            """
+const action = String(window.__grokRegistrationStepAction || '');
+window.__grokRegistrationStepAction = '';
+return action;
+            """
+        ) or "")
+    except Exception:
+        return ""
+    return action if action in {"continue", "retry"} else ""
 
 
 def _has_profile_form(page) -> bool:
@@ -397,8 +660,11 @@ def _wait_for_profile_after_code(
     return False
 
 
-def _resubmit_final_profile(page) -> bool:
+def _resubmit_final_profile(page, action_handler=None) -> bool:
     """资料页点击后仍未跳转时补交一次；人机验证未就绪时不点击。"""
+    if action_handler is not None:
+        action_handler(page)
+    _dismiss_cookie_banner(page)
     try:
         return bool(page.run_js(
             r"""
@@ -437,8 +703,12 @@ def _wait_for_sso_cookie_with_resubmit(
     cookie_name: str,
     *,
     stop_event=None,
+    action_handler=None,
 ) -> str:
     """先给首次提交 30 秒，仍停在资料页时有条件地补交一次。"""
+    refresh_page = getattr(session, "refresh_page", None)
+    if action_handler is not None and callable(refresh_page):
+        action_handler(refresh_page())
     try:
         return wait_for_cookie(
             session,
@@ -454,8 +724,17 @@ def _wait_for_sso_cookie_with_resubmit(
             page = session.refresh_page()
         except Exception:
             page = None
-        if page is not None and _has_profile_form(page) and _resubmit_final_profile(page):
-            print("[*] 首次提交后仍停在资料页，已补点一次完成注册。")
+        if page is not None:
+            if _dismiss_cookie_banner(page):
+                time.sleep(0.3)
+                page = session.refresh_page()
+            if _has_profile_form(page):
+                if action_handler is None:
+                    resubmitted = _resubmit_final_profile(page)
+                else:
+                    resubmitted = _resubmit_final_profile(page, action_handler=action_handler)
+                if resubmitted:
+                    print("[*] 首次提交后仍停在资料页，已补点一次完成注册。")
 
         try:
             return wait_for_cookie(
@@ -483,7 +762,12 @@ def _is_transient_page_error(error: Exception) -> bool:
     )
 
 
-def _click_email_signup_button(session: DrissionBrowserSession, timeout=10, stop_event=None):
+def _click_email_signup_button(
+    session: DrissionBrowserSession,
+    timeout=10,
+    stop_event=None,
+    action_handler=None,
+):
     """页面打开后，自动点击邮箱注册入口；如果已经进入邮箱页则直接继续。"""
     deadline = time.time() + timeout
     last_state = ""
@@ -492,6 +776,11 @@ def _click_email_signup_button(session: DrissionBrowserSession, timeout=10, stop
         if stop_event and stop_event.is_set():
             raise RuntimeError("任务已停止")
         page = session.refresh_page()
+        if action_handler is not None:
+            action_handler(page)
+        if _dismiss_cookie_banner(page):
+            time.sleep(0.3)
+            continue
         try:
             state = page.run_js(r"""
 function isVisible(node) {
@@ -650,13 +939,23 @@ return { status: 'clicked', url: location.href };
     raise Exception(f'未找到邮箱注册入口（{last_state or "页面未返回可诊断信息"}）')
 
 
-def _click_google_signup_button(session: DrissionBrowserSession, timeout=15, stop_event=None):
+def _click_google_signup_button(
+    session: DrissionBrowserSession,
+    timeout=15,
+    stop_event=None,
+    action_handler=None,
+):
     """页面打开后，自动点击 Google 账号注册按钮。"""
     deadline = time.time() + timeout
     while time.time() < deadline:
         if stop_event and stop_event.is_set():
             raise RuntimeError("任务已停止")
         page = session.refresh_page()
+        if action_handler is not None:
+            action_handler(page)
+        if _dismiss_cookie_banner(page):
+            time.sleep(0.3)
+            continue
         try:
             clicked = page.run_js(r"""
 const bodyText = (document.body?.innerText || '').replace(/\s+/g, '').toLowerCase();
@@ -711,6 +1010,7 @@ def _register_with_google_account(
     mailbox: VerificationMailbox,
     stop_event=None,
     timeout: int = 180,
+    action_handler=None,
 ) -> str:
     email = str(getattr(mailbox, "email", "") or "").strip()
     password = str(getattr(mailbox, "password", "") or "").strip()
@@ -718,7 +1018,11 @@ def _register_with_google_account(
     if not email or not password:
         raise RuntimeError("Google 账号注册需要邮箱和密码")
 
-    _click_google_signup_button(session, stop_event=stop_event)
+    _click_google_signup_button(
+        session,
+        stop_event=stop_event,
+        action_handler=action_handler,
+    )
     page = session.refresh_page()
     deadline = time.time() + timeout
     recovery_done = False
@@ -734,6 +1038,8 @@ def _register_with_google_account(
             raise RuntimeError("任务已停止")
 
         page = session.refresh_page()
+        if action_handler is not None:
+            action_handler(page)
         if _has_xai_session_ready(page):
             print(f"[*] Google 账号授权完成: {email}")
             return email
@@ -1163,12 +1469,23 @@ return 'idle';
     ))
 
 
-def _fill_email_and_submit(session: DrissionBrowserSession, email: str, timeout=15, stop_event=None):
+def _fill_email_and_submit(
+    session: DrissionBrowserSession,
+    email: str,
+    timeout=15,
+    stop_event=None,
+    action_handler=None,
+):
     deadline = time.time() + timeout
     while time.time() < deadline:
         if stop_event and stop_event.is_set():
             raise RuntimeError("任务已停止")
         page = session.refresh_page()
+        if action_handler is not None:
+            action_handler(page)
+        if _dismiss_cookie_banner(page):
+            time.sleep(0.3)
+            continue
         try:
             filled = page.run_js(
                 """
@@ -1310,6 +1627,7 @@ def _fill_code_and_submit(
     mailbox: VerificationMailbox,
     stop_event=None,
     timeout: int = 180,
+    action_handler=None,
 ) -> str:
     code = mailbox.wait_for_code(timeout=timeout, stop_event=stop_event)
     if not code:
@@ -1321,6 +1639,11 @@ def _fill_code_and_submit(
             raise RuntimeError("任务已停止")
 
         page = session.refresh_page()
+        if action_handler is not None:
+            action_handler(page)
+        if _dismiss_cookie_banner(page):
+            time.sleep(0.3)
+            continue
         try:
             filled = page.run_js(
                 """
@@ -1656,7 +1979,12 @@ def _build_profile() -> dict[str, str]:
     return {"given_name": given_name, "family_name": family_name, "password": password}
 
 
-def _fill_profile_and_submit(session: DrissionBrowserSession, timeout: int = 180, stop_event=None) -> dict[str, str]:
+def _fill_profile_and_submit(
+    session: DrissionBrowserSession,
+    timeout: int = 180,
+    stop_event=None,
+    action_handler=None,
+) -> dict[str, str]:
     profile = _build_profile()
     given_name = profile["given_name"]
     family_name = profile["family_name"]
@@ -1669,6 +1997,11 @@ def _fill_profile_and_submit(session: DrissionBrowserSession, timeout: int = 180
         if stop_event and stop_event.is_set():
             raise RuntimeError("任务已停止")
         page = session.refresh_page()
+        if action_handler is not None:
+            action_handler(page)
+        if _dismiss_cookie_banner(page):
+            time.sleep(0.3)
+            continue
         try:
             filled = page.run_js(
                 """
@@ -1880,20 +2213,28 @@ return String(challengeInput.value || '').trim() === String(token || '').trim();
         time.sleep(1.2)
 
         page = session.refresh_page()
+        if action_handler is not None:
+            action_handler(page)
+        if _dismiss_cookie_banner(page):
+            time.sleep(0.3)
+            continue
         try:
-            submit_button = page.ele('tag:button@@text()=完成注册')
-        except Exception:
-            submit_button = None
-
-        if not submit_button:
-            try:
-                clicked = page.run_js(
-                    r"""
+            clicked = page.run_js(
+                r"""
 const challengeInput = document.querySelector('input[name="cf-turnstile-response"]');
 if (challengeInput && !String(challengeInput.value || '').trim()) {
     return false;
 }
-const buttons = Array.from(document.querySelectorAll('button[type="submit"], button'));
+
+function isVisible(node) {
+    if (!node) return false;
+    const style = window.getComputedStyle(node);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+}
+
+const buttons = Array.from(document.querySelectorAll('button[type="submit"], button')).filter(isVisible);
 const submitButton = buttons.find((node) => {
     const text = (node.innerText || node.textContent || '').replace(/\s+/g, '');
     return text === '完成注册' || text.includes('完成注册');
@@ -1901,34 +2242,17 @@ const submitButton = buttons.find((node) => {
 if (!submitButton || submitButton.disabled || submitButton.getAttribute('aria-disabled') === 'true') {
     return false;
 }
+submitButton.scrollIntoView({ block: 'center', inline: 'center' });
 submitButton.focus();
 submitButton.click();
 return true;
-                    """
-                )
-            except Exception as error:
-                if _is_transient_page_error(error):
-                    time.sleep(0.8)
-                    continue
-                raise
-        else:
-            try:
-                challenge_value = page.run_js(
-                    """
-const challengeInput = document.querySelector('input[name="cf-turnstile-response"]');
-return challengeInput ? String(challengeInput.value || '').trim() : 'not-found';
-                    """
-                )
-                if challenge_value == 'not-found' or challenge_value:
-                    submit_button.click()
-                    clicked = True
-                else:
-                    clicked = False
-            except Exception as error:
-                if _is_transient_page_error(error):
-                    time.sleep(0.8)
-                    continue
-                raise
+                """
+            )
+        except Exception as error:
+            if _is_transient_page_error(error):
+                time.sleep(0.8)
+                continue
+            raise
 
         if clicked:
             print(f"[*] 已填写注册资料并点击完成注册: {given_name} {family_name}")

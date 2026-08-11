@@ -1002,6 +1002,7 @@ class RegistrationJobManager:
         provider.stop_event = stop_event
         provider.mail_source = self._mail_source
         provider.oauth_semaphore = self._oauth_semaphore
+        provider.browser_window_label = f"注册窗口 {worker_index} · 第 {round_index} 轮"
         provider.result_callback = self._registration_checkpoint_callback(worker_index, round_index)
         with self._lock:
             has_proxy_pool = self._proxy_pool is not None

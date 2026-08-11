@@ -4,6 +4,14 @@ MSDSJ 的 Grok 账号注册与凭证管理工具。项目提供 Python 自动化
 
 本项目允许免费使用、学习和二次开发。请勿把 `.env`、Outlook refresh token、浏览器 cookie、SSO token 或 `output/` 里的凭证提交到 GitHub。
 
+## 文档
+
+- [完整部署、运行与使用指南](docs/deployment-and-usage.md)：环境准备、CLI、控制台、代理池、本地中转、更新与排错。
+- [更新日志](CHANGELOG.md)：按日期整理的功能变更。
+- [DuckMail 邮箱源](docs/duckmail.md)
+- [Outlook 邮箱池](docs/outlook-mailbox-pool.md)
+- [Grok OAuth Flow](docs/grok-oauth-flow.md)
+
 ## 项目界面
 
 ![MSDSJ Grok 注册机控制台](docs/images/dashboard.png)
