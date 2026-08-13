@@ -605,7 +605,12 @@ class RegistrationJobManager:
             error=error,
         )
 
-    def _registration_checkpoint_callback(self, worker_index: int, round_index: int):
+    def _registration_checkpoint_callback(
+        self,
+        worker_index: int,
+        round_index: int,
+        cancellation_event=None,
+    ):
         with self._lock:
             expected_job_id = str((self._job or {}).get("id") or "")
             oauth_required = bool((self._job or {}).get("oauthExchange"))
@@ -615,7 +620,8 @@ class RegistrationJobManager:
             email = str(result.get("email") or "")
             with self._lock:
                 if (
-                    str((self._job or {}).get("id") or "") != expected_job_id
+                    (cancellation_event is not None and cancellation_event.is_set())
+                    or str((self._job or {}).get("id") or "") != expected_job_id
                     or (self._job or {}).get("status") not in {"running", "stopping"}
                 ):
                     return
@@ -1003,7 +1009,11 @@ class RegistrationJobManager:
         provider.mail_source = self._mail_source
         provider.oauth_semaphore = self._oauth_semaphore
         provider.browser_window_label = f"注册窗口 {worker_index} · 第 {round_index} 轮"
-        provider.result_callback = self._registration_checkpoint_callback(worker_index, round_index)
+        provider.result_callback = self._registration_checkpoint_callback(
+            worker_index,
+            round_index,
+            stop_event,
+        )
         with self._lock:
             has_proxy_pool = self._proxy_pool is not None
         if has_proxy_pool:
@@ -1318,6 +1328,21 @@ class RegistrationJobManager:
                         stage = str(getattr(provider, "current_stage", "") or "timeout")
                         registered = bool(getattr(provider, "registration_succeeded", False))
                         if registered:
+                            checkpoint_result = getattr(provider, "checkpoint_result", None)
+                            checkpoint_exists = any(
+                                str(item.get("job_id") or "") == round_job_id
+                                and int(item.get("round_index") or 0) == round_index
+                                for item in self._pending_store.list()
+                            )
+                            if isinstance(checkpoint_result, dict) and not checkpoint_exists:
+                                # The round cancellation guard blocks daemon threads from
+                                # writing after timeout. If registration completed just
+                                # before that guard was set, persist its already-captured
+                                # checkpoint synchronously from the owning worker.
+                                self._registration_checkpoint_callback(
+                                    worker_index,
+                                    round_index,
+                                )(dict(checkpoint_result))
                             ok = True
                             reason = (
                                 f"账号已注册，但后续阶段超过 {round_timeout_seconds} 秒；"

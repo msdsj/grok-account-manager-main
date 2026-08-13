@@ -16,6 +16,7 @@ from collections.abc import Callable
 from DrissionPage.errors import PageDisconnectedError
 
 from ..core.browser import DrissionBrowserSession, get_grok_clearance, wait_for_cookie
+from ..core.network import build_browser_http_session
 from ..mail.sources import DuckMailSource, MailboxSource, VerificationMailbox
 from .base import RegistrationResult
 
@@ -81,7 +82,10 @@ class GrokProvider:
 
         for attempt in range(1, max_attempts + 1):
             try:
-                return self._run_round_once(session)
+                try:
+                    return self._run_round_once(session)
+                finally:
+                    self._close_http_session()
             except Exception as error:
                 if isinstance(error, CloudflareBlockedError):
                     stopper = getattr(self.stop_event, "set", None)
@@ -110,6 +114,7 @@ class GrokProvider:
 
     def _run_round_once(self, session: DrissionBrowserSession) -> RegistrationResult:
         self._browser_session = session
+        self._http_session = None
         self.current_email = ""
         self.registration_succeeded = False
         self.oauth_exchange_error = ""
@@ -215,6 +220,12 @@ class GrokProvider:
         self.checkpoint_result = dict(result)
         self._emit_result_checkpoint(result)
 
+        if (
+            GROK_API_AVAILABLE
+            and (self.fetch_full_credential or self.enable_oauth_exchange)
+        ):
+            self._http_session = build_browser_http_session(session)
+
         oauth_tokens = None
         oauth_error = ""
         if self.enable_oauth_exchange:
@@ -252,6 +263,7 @@ class GrokProvider:
                                 recovery_email=oauth_recovery_email,
                                 prefer_google_login=registration_mode == "google",
                                 stop_event=self.stop_event,
+                                http_session=self._http_session,
                             )
                             if (
                                 candidate_tokens
@@ -318,12 +330,14 @@ class GrokProvider:
                         sso_token=oauth_tokens["access_token"],
                         profile=profile,
                         oauth_tokens=oauth_tokens,
+                        http_session=self._http_session,
                     )
                 else:
                     full_credential = fetch_complete_credential(
                         email=email,
                         sso_token=sso_value,
                         profile=profile,
+                        http_session=self._http_session,
                     )
             except Exception as error:
                 result["credential_enrichment_error"] = str(error)
@@ -357,6 +371,16 @@ class GrokProvider:
             done_message += "，refresh_token 缺失，凭证不保留"
         self._set_stage("done", done_message)
         return result
+
+    def _close_http_session(self) -> None:
+        http_session = getattr(self, "_http_session", None)
+        self._http_session = None
+        if http_session is None:
+            return
+        try:
+            http_session.close()
+        except Exception:
+            pass
 
     def _emit_result_checkpoint(self, result: RegistrationResult) -> None:
         callback = self.result_callback

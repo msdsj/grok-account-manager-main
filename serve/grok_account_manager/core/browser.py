@@ -923,6 +923,24 @@ class DrissionBrowserSession:
         """Return a display-safe summary of the currently configured proxy."""
         return mask_proxy_server(self._proxy_server)
 
+    @property
+    def proxy_server(self) -> str | None:
+        """Return the normalized endpoint bound to this browser process."""
+        return self._proxy_server
+
+    def get_user_agent(self) -> str:
+        """Return the active Chromium ``navigator.userAgent`` value.
+
+        This is intentionally a read-only helper for the per-round HTTP
+        context.  It never starts a browser that has already been stopped.
+        """
+        try:
+            page = self.page
+            value = page.run_js("return navigator.userAgent;")
+        except Exception:
+            return ""
+        return str(value or "").strip()
+
     def refresh_page(self):
         """验证码确认后页面会跳转，旧 page 句柄可能断开，统一重新获取当前活动 tab。
 

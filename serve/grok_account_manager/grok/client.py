@@ -21,6 +21,33 @@ import uuid
 import requests
 
 
+def _http_client(http_session=None):
+    """Return a per-round requests.Session when supplied, else requests."""
+
+    return http_session if http_session is not None else requests
+
+
+def _user_agent(http_session, fallback: str) -> str:
+    """Use the real browser UA when this call belongs to a browser round."""
+
+    session_dict = (
+        getattr(http_session, "__dict__", {})
+        if http_session is not None
+        else {}
+    )
+    has_browser_marker = (
+        isinstance(session_dict, dict)
+        and "_grok_browser_user_agent" in session_dict
+    )
+    value = session_dict.get("_grok_browser_user_agent") if has_browser_marker else None
+    if not isinstance(value, str) or not value.strip():
+        value = None
+    if value is None and http_session is not None and not has_browser_marker:
+        headers = getattr(http_session, "headers", {})
+        value = headers.get("User-Agent") if hasattr(headers, "get") else None
+    return str(value or fallback).strip()
+
+
 BILLING_URL = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
 CLI_USER_URL = "https://cli-chat-proxy.grok.com/v1/user?include=subscription"
 SUBSCRIPTIONS_URL = "https://grok.com/rest/subscriptions"
@@ -223,7 +250,8 @@ def fetch_complete_credential(
     profile: dict | None = None,
     oauth_tokens: dict | None = None,
     client_version: str = DEFAULT_CLIENT_VERSION,
-    timeout: int = 30
+    timeout: int = 30,
+    http_session=None,
 ) -> GrokCredential:
     """使用 sso cookie 或 OAuth tokens 获取完整的 Grok 凭证信息。
 
@@ -234,6 +262,7 @@ def fetch_complete_credential(
         oauth_tokens: OAuth token 响应（如果有），包含 access_token, refresh_token, id_token 等
         client_version: Grok CLI 客户端版本号
         timeout: 请求超时时间（秒）
+        http_session: 当前注册轮次绑定浏览器代理和 User-Agent 的 HTTP 会话
 
     Returns:
         GrokCredential: 包含完整信息的凭证对象
@@ -255,9 +284,19 @@ def fetch_complete_credential(
 
     # 尝试 Authorization header 方式
     try:
-        billing_data = _fetch_billing(access_token, client_version, timeout)
+        billing_data = _fetch_billing(
+            access_token,
+            client_version,
+            timeout,
+            http_session=http_session,
+        )
         if not billing_data and not has_oauth_tokens:
-            billing_data = _fetch_billing_with_cookie(access_token, client_version, timeout)
+            billing_data = _fetch_billing_with_cookie(
+                access_token,
+                client_version,
+                timeout,
+                http_session=http_session,
+            )
         if billing_data:
             credential["billing_raw"] = billing_data
             _extract_quota_from_billing(credential, billing_data)
@@ -266,7 +305,12 @@ def fetch_complete_credential(
         if e.response.status_code == 401 and not has_oauth_tokens:
             # 401 错误且没有 OAuth tokens，尝试使用 Cookie 方式
             try:
-                billing_data = _fetch_billing_with_cookie(access_token, client_version, timeout)
+                billing_data = _fetch_billing_with_cookie(
+                    access_token,
+                    client_version,
+                    timeout,
+                    http_session=http_session,
+                )
                 if billing_data:
                     credential["billing_raw"] = billing_data
                     _extract_quota_from_billing(credential, billing_data)
@@ -283,7 +327,12 @@ def fetch_complete_credential(
     # 如果 API 调用成功（或有 OAuth tokens），继续获取其他信息
     if api_success or has_oauth_tokens:
         try:
-            user_data = _fetch_user(access_token, client_version, timeout)
+            user_data = _fetch_user(
+                access_token,
+                client_version,
+                timeout,
+                http_session=http_session,
+            )
             if user_data:
                 credential["user_raw"] = user_data
                 _extract_user_info(credential, user_data)
@@ -295,7 +344,8 @@ def fetch_complete_credential(
                 access_token,
                 credential.get("user_id"),
                 client_version,
-                timeout
+                timeout,
+                http_session=http_session,
             )
             if subscription_data:
                 credential["subscription_raw"] = subscription_data
@@ -304,7 +354,11 @@ def fetch_complete_credential(
             print(f"[警告] 获取 subscription 信息失败: {e}")
 
         try:
-            task_usage_data = _fetch_task_usage(access_token, timeout)
+            task_usage_data = _fetch_task_usage(
+                access_token,
+                timeout,
+                http_session=http_session,
+            )
             if task_usage_data:
                 credential["task_usage_raw"] = task_usage_data
                 _extract_task_usage(credential, task_usage_data)
@@ -446,10 +500,16 @@ def _finalize_cockpit_grok_credential(credential: GrokCredential) -> None:
     credential["auth_raw"] = auth_raw
 
 
-def _fetch_billing_with_cookie(access_token: str, client_version: str, timeout: int) -> dict | None:
+def _fetch_billing_with_cookie(
+    access_token: str,
+    client_version: str,
+    timeout: int,
+    *,
+    http_session=None,
+) -> dict | None:
     """使用 Cookie 方式获取账单和配额信息。"""
     try:
-        response = requests.get(
+        response = _http_client(http_session).get(
             BILLING_URL,
             headers={
                 "Cookie": f"sso={access_token}",
@@ -459,7 +519,7 @@ def _fetch_billing_with_cookie(access_token: str, client_version: str, timeout: 
                 "x-grok-client-version": client_version,
                 "x-grok-client-surface": "grok-cli",
                 "x-grok-client-identifier": "grok-account-manager",
-                "User-Agent": f"grok-cli/{client_version}",
+                "User-Agent": _user_agent(http_session, f"grok-cli/{client_version}"),
             },
             timeout=timeout,
         )
@@ -470,10 +530,16 @@ def _fetch_billing_with_cookie(access_token: str, client_version: str, timeout: 
         return None
 
 
-def _fetch_billing(access_token: str, client_version: str, timeout: int) -> dict | None:
+def _fetch_billing(
+    access_token: str,
+    client_version: str,
+    timeout: int,
+    *,
+    http_session=None,
+) -> dict | None:
     """获取账单和配额信息。"""
     try:
-        response = requests.get(
+        response = _http_client(http_session).get(
             BILLING_URL,
             headers={
                 "Authorization": f"Bearer {access_token}",
@@ -483,7 +549,7 @@ def _fetch_billing(access_token: str, client_version: str, timeout: int) -> dict
                 "x-grok-client-version": client_version,
                 "x-grok-client-surface": "grok-cli",
                 "x-grok-client-identifier": "grok-account-manager",
-                "User-Agent": f"grok-cli/{client_version}",
+                "User-Agent": _user_agent(http_session, f"grok-cli/{client_version}"),
             },
             timeout=timeout,
         )
@@ -494,10 +560,16 @@ def _fetch_billing(access_token: str, client_version: str, timeout: int) -> dict
         return None
 
 
-def _fetch_user(access_token: str, client_version: str, timeout: int) -> dict | None:
+def _fetch_user(
+    access_token: str,
+    client_version: str,
+    timeout: int,
+    *,
+    http_session=None,
+) -> dict | None:
     """获取用户信息和订阅。"""
     try:
-        response = requests.get(
+        response = _http_client(http_session).get(
             CLI_USER_URL,
             headers={
                 "Authorization": f"Bearer {access_token}",
@@ -507,7 +579,7 @@ def _fetch_user(access_token: str, client_version: str, timeout: int) -> dict | 
                 "x-grok-client-version": client_version,
                 "x-grok-client-surface": "grok-cli",
                 "x-grok-client-identifier": "grok-account-manager",
-                "User-Agent": f"grok-cli/{client_version}",
+                "User-Agent": _user_agent(http_session, f"grok-cli/{client_version}"),
             },
             timeout=timeout,
         )
@@ -522,7 +594,9 @@ def _fetch_subscriptions(
     access_token: str,
     user_id: str | None,
     client_version: str,
-    timeout: int
+    timeout: int,
+    *,
+    http_session=None,
 ) -> dict | None:
     """获取订阅详情。"""
     try:
@@ -534,12 +608,12 @@ def _fetch_subscriptions(
             "x-grok-client-version": client_version,
             "x-grok-client-surface": "grok-cli",
             "x-grok-client-identifier": "grok-account-manager",
-            "User-Agent": f"grok-cli/{client_version}",
+            "User-Agent": _user_agent(http_session, f"grok-cli/{client_version}"),
         }
         if user_id:
             headers["x-userid"] = user_id
 
-        response = requests.get(
+        response = _http_client(http_session).get(
             SUBSCRIPTIONS_URL,
             headers=headers,
             timeout=timeout,
@@ -551,16 +625,21 @@ def _fetch_subscriptions(
         return None
 
 
-def _fetch_task_usage(access_token: str, timeout: int) -> dict | None:
+def _fetch_task_usage(
+    access_token: str,
+    timeout: int,
+    *,
+    http_session=None,
+) -> dict | None:
     """获取任务使用情况。"""
     try:
-        response = requests.get(
+        response = _http_client(http_session).get(
             TASK_USAGE_URL,
             headers={
                 "Authorization": f"Bearer {access_token}",
                 "Accept": "application/json",
                 "x-xai-token-auth": "xai-grok-cli",
-                "User-Agent": "Grok Build",
+                "User-Agent": _user_agent(http_session, "Grok Build"),
             },
             timeout=timeout,
         )

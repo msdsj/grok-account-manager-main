@@ -333,6 +333,96 @@ class RegistrationJobManagerTests(unittest.TestCase):
         self.assertIsNone(payload)
         self.assertTrue(round_stop.is_set())
 
+    def test_round_timeout_rejects_late_registration_checkpoint(self) -> None:
+        manager = self._manager()
+        with patch("grok_account_manager.api.services.jobs.threading.Thread.start"):
+            manager.start(
+                total=1,
+                concurrency=1,
+                oauth_exchange=False,
+                email_source="duckmail",
+            )
+
+        round_stop = threading.Event()
+        provider = manager._create_provider(
+            False,
+            CombinedStopEvent(manager._stop_event, round_stop),
+            1,
+            1,
+        )
+        callback_attempted = threading.Event()
+
+        def finish_after_timeout(_session):
+            round_stop.wait(timeout=1)
+            provider.result_callback(
+                {
+                    "email": "late@example.com",
+                    "credential": "late-sso",
+                    "oauth_status": "pending",
+                }
+            )
+            callback_attempted.set()
+            return {"email": "late@example.com"}
+
+        provider.run_round = finish_after_timeout
+        with patch.object(manager, "_persist_result") as persist:
+            status, payload = manager._run_round_with_timeout(
+                provider,
+                Mock(),
+                timeout_seconds=0.02,
+                worker_index=1,
+                round_index=1,
+                round_stop_event=round_stop,
+            )
+
+        self.assertEqual(status, "timeout")
+        self.assertIsNone(payload)
+        self.assertTrue(callback_attempted.is_set())
+        persist.assert_not_called()
+        self.assertEqual(self.pending_store.list(), [])
+        self.assertEqual(manager.snapshot()["registered"], 0)
+
+    def test_round_timeout_preserves_checkpoint_captured_before_cancellation(self) -> None:
+        manager = self._manager()
+        with patch("grok_account_manager.api.services.jobs.threading.Thread.start"):
+            manager.start(
+                total=1,
+                concurrency=1,
+                oauth_exchange=True,
+                email_source="duckmail",
+            )
+
+        def create_provider(*_args, **_kwargs):
+            provider = Mock()
+            provider.name = "grok"
+            provider.chrome_lang = "zh-CN"
+            provider.registration_succeeded = True
+            provider.current_email = "captured@example.com"
+            provider.current_stage = "oauth_exchange"
+            provider.checkpoint_result = {
+                "email": "captured@example.com",
+                "credential": "captured-sso",
+                "oauth_status": "pending",
+            }
+            return provider
+
+        session = Mock()
+        session.identity = None
+        session.isolation_summary = "test browser"
+        with (
+            patch.object(manager, "_create_provider", side_effect=create_provider),
+            patch.object(manager, "_run_round_with_timeout", return_value=("timeout", None)),
+            patch.object(manager, "_start_worker_session", return_value=session),
+        ):
+            # Exercise the timeout handoff through the worker's real branch.
+            manager._run_worker(1, True)
+
+        session.stop.assert_called_once_with()
+        pending = self.pending_store.list(OAUTH_PENDING)
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["result"]["credential"], "captured-sso")
+        self.assertEqual(manager.snapshot()["registered"], 1)
+
     def test_combined_stop_event_propagates_internal_cloudflare_stop(self) -> None:
         global_stop = threading.Event()
         round_stop = threading.Event()

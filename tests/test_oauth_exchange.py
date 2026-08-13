@@ -5,9 +5,11 @@ from grok_account_manager.grok.oauth_exchange import (
     CloudflareBlockedError,
     MAX_CONSECUTIVE_PAGE_ERRORS,
     OAuthTerminalError,
+    _discover_oauth_endpoints,
     _drive_device_authorization_and_poll,
     _drive_device_authorization_page,
     _poll_device_token_once,
+    _request_device_code,
 )
 
 
@@ -56,6 +58,61 @@ class OAuthExchangeTests(unittest.TestCase):
 
                 self.assertEqual(status, "transport_error")
                 self.assertIn(str(status_code), str(payload))
+
+    def test_supplied_session_routes_discovery_device_and_poll(self) -> None:
+        discovery_response = Mock()
+        discovery_response.json.return_value = {
+            "device_authorization_endpoint": "https://auth.x.ai/oauth2/device/code",
+            "token_endpoint": "https://auth.x.ai/oauth2/token",
+        }
+        token_response = Mock()
+        token_response.status_code = 400
+        token_response.json.return_value = {"error": "authorization_pending"}
+        device_response = Mock()
+        device_response.json.return_value = {
+            "device_code": "device-code",
+            "user_code": "user-code",
+        }
+        http_session = Mock()
+        http_session.get.return_value = discovery_response
+        http_session.post.side_effect = [device_response, token_response]
+        endpoints = _discover_oauth_endpoints(http_session=http_session)
+        device_data = _request_device_code(
+            endpoints["device_authorization_endpoint"],
+            http_session=http_session,
+        )
+        status, payload = _poll_device_token_once(
+            device_data["device_code"],
+            endpoints["token_endpoint"],
+            http_session=http_session,
+        )
+
+        http_session.get.assert_called_once()
+        self.assertEqual(http_session.post.call_count, 2)
+        self.assertEqual(status, "pending")
+        self.assertIsNone(payload)
+
+    def test_session_discovery_is_not_shared_between_rounds(self) -> None:
+        def session_with_token_endpoint(endpoint: str):
+            response = Mock()
+            response.json.return_value = {
+                "device_authorization_endpoint": "https://auth.x.ai/oauth2/device/code",
+                "token_endpoint": endpoint,
+            }
+            http_session = Mock()
+            http_session.get.return_value = response
+            return http_session
+
+        first_session = session_with_token_endpoint("https://auth.x.ai/oauth2/token")
+        second_session = session_with_token_endpoint("https://login.x.ai/oauth2/token")
+
+        first_result = _discover_oauth_endpoints(http_session=first_session)
+        second_result = _discover_oauth_endpoints(http_session=second_session)
+
+        self.assertEqual(first_result["token_endpoint"], "https://auth.x.ai/oauth2/token")
+        self.assertEqual(second_result["token_endpoint"], "https://login.x.ai/oauth2/token")
+        first_session.get.assert_called_once()
+        second_session.get.assert_called_once()
 
     def test_expired_device_code_can_start_a_fresh_oauth_attempt(self) -> None:
         response = Mock()

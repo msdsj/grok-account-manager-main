@@ -11,12 +11,18 @@ from __future__ import annotations
 
 import time
 from functools import lru_cache
-from typing import Callable, TypedDict
+from typing import Any, Callable, TypedDict
 from urllib.parse import quote, urlparse
 
 import requests
 
 from ..mail.duckmail import get_oai_code
+
+
+def _http_client(http_session: Any = None):
+    """Return the round-pinned HTTP client, or the legacy module client."""
+
+    return http_session if http_session is not None else requests
 
 
 class OAuthTokens(TypedDict, total=False):
@@ -83,15 +89,20 @@ def _positive_int(value, default: int, minimum: int = 1, maximum: int | None = N
 
 
 @lru_cache(maxsize=1)
-def _discover_oauth_endpoints(timeout: int = 30) -> dict[str, str | None]:
+def _discover_oauth_endpoints_cached(timeout: int = 30) -> dict[str, str | None]:
     """读取 OIDC discovery；失败时回退到 cockpit-tools 使用的已知端点。"""
+    return _discover_oauth_endpoints_uncached(requests, timeout=timeout)
+
+
+def _discover_oauth_endpoints_uncached(http_client: Any, timeout: int = 30) -> dict[str, str | None]:
+    """Read OIDC discovery through a caller-selected HTTP client."""
     fallback: dict[str, str | None] = {
         "device_authorization_endpoint": DEVICE_AUTHORIZATION_ENDPOINT,
         "token_endpoint": TOKEN_ENDPOINT,
         "userinfo_endpoint": None,
     }
     try:
-        response = requests.get(
+        response = http_client.get(
             DISCOVERY_URL,
             headers={"Accept": "application/json"},
             timeout=timeout,
@@ -122,11 +133,23 @@ def _discover_oauth_endpoints(timeout: int = 30) -> dict[str, str | None]:
         return fallback
 
 
+def _discover_oauth_endpoints(
+    timeout: int = 30,
+    http_session: Any = None,
+) -> dict[str, str | None]:
+    """Read OIDC endpoints, bypassing the global cache for a round context."""
+
+    if http_session is None:
+        return _discover_oauth_endpoints_cached(timeout)
+    return _discover_oauth_endpoints_uncached(http_session, timeout=timeout)
+
+
 def _request_device_code(
     device_authorization_endpoint: str,
     timeout: int = 30,
+    http_session: Any = None,
 ) -> dict:
-    response = requests.post(
+    response = _http_client(http_session).post(
         device_authorization_endpoint,
         data={
             "client_id": OIDC_CLIENT_ID,
@@ -218,12 +241,13 @@ def exchange_sso_for_oauth_tokens(
     recovery_email: str | None = None,
     prefer_google_login: bool = False,
     stop_event=None,
+    http_session: Any = None,
 ) -> OAuthTokens | None:
     """使用当前浏览器登录态执行 xAI device flow，返回真正的 OAuth tokens。"""
     print("[OAuth Exchange] 开始使用 xAI Device Flow 换取 OAuth tokens...")
 
     try:
-        endpoints = _discover_oauth_endpoints()
+        endpoints = _discover_oauth_endpoints(http_session=http_session)
         device_endpoint = str(
             endpoints.get("device_authorization_endpoint") or DEVICE_AUTHORIZATION_ENDPOINT
         )
@@ -236,7 +260,7 @@ def exchange_sso_for_oauth_tokens(
             if stop_event and stop_event.is_set():
                 raise RuntimeError("任务已停止")
 
-            device_data = _request_device_code(device_endpoint)
+            device_data = _request_device_code(device_endpoint, http_session=http_session)
             user_code = str(device_data["user_code"]).strip()
             verification_url = _verification_url(
                 device_data,
@@ -273,6 +297,7 @@ def exchange_sso_for_oauth_tokens(
                     recovery_email=recovery_email,
                     prefer_google_login=prefer_google_login,
                     stop_event=stop_event,
+                    http_session=http_session,
                 )
             finally:
                 if opened_new_tab:
@@ -300,9 +325,10 @@ def _poll_device_token_once(
     device_code: str,
     token_endpoint: str,
     timeout: int = 30,
+    http_session: Any = None,
 ) -> tuple[str, OAuthTokens | str | None]:
     try:
-        response = requests.post(
+        response = _http_client(http_session).post(
             token_endpoint,
             data={
                 "grant_type": DEVICE_GRANT_TYPE,
@@ -362,6 +388,7 @@ def _drive_device_authorization_and_poll(
     recovery_email: str | None = None,
     stop_event=None,
     prefer_google_login: bool = False,
+    http_session: Any = None,
 ) -> OAuthTokens | None:
     deadline = time.monotonic() + expires_in
     next_poll_at = time.monotonic()
@@ -381,7 +408,11 @@ def _drive_device_authorization_and_poll(
 
         now = time.monotonic()
         if now >= next_poll_at:
-            poll_result, payload = _poll_device_token_once(device_code, token_endpoint)
+            poll_result, payload = _poll_device_token_once(
+                device_code,
+                token_endpoint,
+                http_session=http_session,
+            )
             if poll_result == "complete":
                 return payload if isinstance(payload, dict) else None
             if poll_result == "pending":
