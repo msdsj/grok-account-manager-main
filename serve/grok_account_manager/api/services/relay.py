@@ -31,6 +31,9 @@ V2_DATA_DIR = OUTPUT_DIR / "grok2api-v2-data"
 V2_CONFIG_PATH = OUTPUT_DIR / "grok2api-v2-config.yaml"
 V2_IMAGE = "grok-account-manager-grok2api:local"
 V2_ADMIN_USERNAME = "grok-account-manager"
+DEFAULT_RELAY_PORT = 43871
+LEGACY_RELAY_PORT = 8000
+RELAY_CONTAINER_PORT = 43871
 DEFAULT_GROK2API_PATH = Path(
     os.environ.get("GROK2API_PATH")
     or os.environ.get("GROK_ACCOUNT_MANAGER_GROK2API_PATH")
@@ -53,7 +56,7 @@ CHAT_MODEL_MARKERS = (
 class RelayConfig:
     grok2api_path: str = str(DEFAULT_GROK2API_PATH)
     host: str = "127.0.0.1"
-    port: int = 8000
+    port: int = DEFAULT_RELAY_PORT
     api_key: str = "local-grok-api-key"
     admin_key: str = "grok2api"
 
@@ -74,7 +77,7 @@ class RelayManager:
     def snapshot(self) -> dict:
         config = self._config
         status = self.status()
-        public_base_url = os.environ.get("GROK_ACCOUNT_MANAGER_PUBLIC_BASE_URL", "http://127.0.0.1:8765")
+        public_base_url = os.environ.get("GROK_ACCOUNT_MANAGER_PUBLIC_BASE_URL", "http://127.0.0.1:43187")
         return {
             **status,
             "config": {
@@ -101,7 +104,7 @@ class RelayManager:
             if "host" in patch:
                 current["host"] = str(patch.get("host") or "127.0.0.1").strip() or "127.0.0.1"
             if "port" in patch:
-                current["port"] = _safe_port(patch.get("port"), 8000)
+                current["port"] = _safe_port(patch.get("port"), DEFAULT_RELAY_PORT)
             if "apiKey" in patch:
                 current["api_key"] = str(patch.get("apiKey") or "").strip()
             if "adminKey" in patch:
@@ -156,13 +159,13 @@ class RelayManager:
             self._ensure_v2_runtime(project_dir)
 
             OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-            V2_DATA_DIR.mkdir(parents=True, exist_ok=True)
+            _ensure_v2_data_dir()
 
             env = os.environ.copy()
             env.update(
                 {
                     "SERVER_HOST": self._config.host,
-                    "SERVER_PORT": str(self._config.port),
+                    "SERVER_PORT": str(RELAY_CONTAINER_PORT),
                     "SERVER_WORKERS": "1",
                     "GROK_APP_API_KEY": self._config.api_key,
                     "GROK_APP_APP_KEY": self._config.admin_key,
@@ -413,8 +416,15 @@ class RelayManager:
 
     def _ensure_v2_config(self, project_dir: Path) -> None:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        V2_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        _ensure_v2_data_dir()
         if V2_CONFIG_PATH.exists():
+            try:
+                config_text = V2_CONFIG_PATH.read_text(encoding="utf-8")
+            except OSError as error:
+                raise RuntimeError(f"无法读取已有新版 grok2api 配置：{error}") from error
+            migrated = _rewrite_relay_listen(config_text)
+            if migrated != config_text:
+                _write_private_text(V2_CONFIG_PATH, migrated)
             return
 
         if self._config.admin_key == "grok2api":
@@ -426,8 +436,8 @@ class RelayManager:
             config_text = template_path.read_text(encoding="utf-8")
         except OSError as error:
             raise RuntimeError(f"无法读取新版 grok2api 配置模板：{error}") from error
+        config_text = _rewrite_relay_listen(config_text)
         replacements = {
-            'listen: "127.0.0.1:8000"': 'listen: "0.0.0.0:8000"',
             'jwtSecret: "replace-with-at-least-32-characters"': f'jwtSecret: "{secrets.token_hex(32)}"',
             'credentialEncryptionKey: "replace-with-base64-key"': (
                 f'credentialEncryptionKey: "{base64.b64encode(secrets.token_bytes(32)).decode("ascii")}"'
@@ -524,10 +534,13 @@ class RelayManager:
                 ).expanduser()
                 if not (configured_path / "backend" / "go.mod").exists():
                     configured_path = DEFAULT_GROK2API_PATH
+                configured_port = _safe_port(data.get("port"), DEFAULT_RELAY_PORT)
+                if configured_port == LEGACY_RELAY_PORT:
+                    configured_port = DEFAULT_RELAY_PORT
                 return RelayConfig(
                     grok2api_path=str(configured_path),
                     host=str(data.get("host") or "127.0.0.1"),
-                    port=_safe_port(data.get("port"), 8000),
+                    port=configured_port,
                     api_key=str(data.get("api_key") or data.get("apiKey") or "local-grok-api-key"),
                     admin_key=str(data.get("admin_key") or data.get("adminKey") or "grok2api"),
                 )
@@ -553,12 +566,40 @@ class RelayManager:
                 os.close(file_descriptor)
 
 
+def _ensure_v2_data_dir() -> None:
+    V2_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    # grok2api's container runs as a fixed non-root uid (via su-exec), which won't
+    # match this host account's uid on the bind-mounted volume, so the directory
+    # needs to stay world-writable for the container process to create/open its
+    # sqlite database and media files under it.
+    os.chmod(V2_DATA_DIR, 0o777)
+
+
 def _safe_port(value: Any, default: int) -> int:
     try:
         port = int(value)
     except (TypeError, ValueError):
         port = default
     return max(1, min(65535, port))
+
+
+def _rewrite_relay_listen(config_text: str) -> str:
+    """Keep the mounted grok2api config aligned with the container port."""
+    migrated = config_text.replace(
+        "0.0.0.0:8000",
+        f"0.0.0.0:{RELAY_CONTAINER_PORT}",
+    ).replace(
+        "127.0.0.1:8000",
+        f"0.0.0.0:{RELAY_CONTAINER_PORT}",
+    )
+    lines = migrated.splitlines(keepends=True)
+    for index, line in enumerate(lines):
+        if line.lstrip().startswith("listen:"):
+            ending = "\r\n" if line.endswith("\r\n") else "\n" if line.endswith("\n") else ""
+            indent = line[: len(line) - len(line.lstrip())]
+            lines[index] = f'{indent}listen: "0.0.0.0:{RELAY_CONTAINER_PORT}"{ending}'
+            break
+    return "".join(lines)
 
 
 def _grok2api_v2_command(config: RelayConfig, config_path: Path) -> list[str]:
@@ -570,12 +611,29 @@ def _grok2api_v2_command(config: RelayConfig, config_path: Path) -> list[str]:
         "--name",
         container_name,
         "--publish",
-        f"{config.host}:{config.port}:8000",
+        f"{config.host}:{config.port}:{RELAY_CONTAINER_PORT}",
+        "--health-cmd",
+        f"wget -qO- http://127.0.0.1:{RELAY_CONTAINER_PORT}/healthz >/dev/null || exit 1",
+        "--health-interval",
+        "30s",
+        "--health-timeout",
+        "5s",
+        "--health-retries",
+        "3",
         "--volume",
         f"{config_path}:/run/grok2api/config.yaml:ro",
         "--volume",
         f"{V2_DATA_DIR}:/app/data",
         V2_IMAGE,
+        "/app/grok2api",
+        # grok2api's entrypoint copies /run/grok2api/config.yaml to /app/config.yaml
+        # (chowned to its non-root runtime user) before dropping privileges via
+        # su-exec, so the app process itself must be pointed at the copy, not the
+        # read-only mount, or it may not have permission to read it.
+        "--config",
+        "/app/config.yaml",
+        "--listen",
+        f"0.0.0.0:{RELAY_CONTAINER_PORT}",
     ]
 
 

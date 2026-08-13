@@ -15,6 +15,12 @@
 
 - `.env.example` 增加可选 `GROK2API_PATH`，用于指定新版本地中转源码目录。
 
+### 本地中转（同步 grok2api v3.1.2）
+
+- 对照最新 `chenyme/grok2api`（v3.1.2）源码复核了管理员登录、client-key 创建、账号导入、模型列表等接口，确认现有调用格式仍然兼容，无需改动。
+- 修正 `docker run` 传给 grok2api 容器的 `--config` 路径：容器 entrypoint 会把只读挂载的配置复制到 `/app/config.yaml` 并 chown 给其非 root 运行用户后再通过 `su-exec` 降权启动，本地中转之前仍把该参数指向复制前的只读挂载路径，非 root 用户下可能无权限读取；现在指向复制后的路径。
+- `output/grok2api-v2-data` 挂载目录固定为 `0o777`，避免容器内非 root 运行用户与宿主机账号 uid 不一致导致无法写入 SQLite 数据库和媒体文件。
+
 ### 文档与验证
 
 - 新增完整部署、运行与使用指南，覆盖 CLI、React 控制台、邮箱池、注册代理池、OAuth、账号产物、本地中转、更新、排错和安全边界。
