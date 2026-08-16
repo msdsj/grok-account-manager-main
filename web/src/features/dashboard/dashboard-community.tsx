@@ -9,6 +9,7 @@ const QQ_GROUP_NUMBER = "972295238";
 const STORE_URL = "https://pay.ldxp.cn/item/gecsrk";
 const UPSTREAM_PROJECT_URL = "https://github.com/chenyme/grok2api";
 const CUSTOM_PROJECT_URL = "https://github.com/LXXYSLF/grok-account-manager-main";
+const DONATION_IMAGE_URL = "/sponner/thank-you-qr.jpg";
 
 export function DashboardCommunity() {
   const { t } = useTranslation();
@@ -25,7 +26,7 @@ export function DashboardCommunity() {
           {t("community.attributionCustom")}
         </a>
       </p>
-      <div className="mt-5 grid gap-4 border-t border-border/70 pt-4 sm:grid-cols-2">
+      <div className="mt-5 grid gap-4 border-t border-border/70 pt-4 sm:grid-cols-2 xl:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_300px]">
         <div className="flex min-h-20 items-center justify-between gap-4 border-b border-border/70 pb-4 sm:border-b-0 sm:border-r sm:pb-0 sm:pr-5">
           <div className="min-w-0">
             <p className="text-[11px] font-medium uppercase tracking-[0.08em] text-muted-foreground">{t("community.qqGroup")}</p>
@@ -35,7 +36,7 @@ export function DashboardCommunity() {
           <CopyButton value={QQ_GROUP_NUMBER} copyLabel={t("community.copyGroupNumber")} className="size-9 shrink-0" />
         </div>
         <a
-          className="group flex min-h-20 items-center justify-between gap-4 transition-colors hover:text-foreground"
+          className="group flex min-h-20 min-w-0 items-center justify-between gap-4 transition-colors hover:text-foreground"
           href={STORE_URL}
           target="_blank"
           rel="noreferrer"
@@ -47,6 +48,18 @@ export function DashboardCommunity() {
           </div>
           <ExternalLink className="size-5 shrink-0 text-muted-foreground transition-transform group-hover:translate-x-0.5 group-hover:text-foreground" />
         </a>
+        <div className="flex min-w-0 flex-col gap-3 border-t border-border/70 pt-4 sm:col-span-2 xl:col-span-1 xl:border-l xl:border-t-0 xl:pl-5 xl:pt-0">
+          <div className="min-w-0">
+            <p className="text-[11px] font-medium uppercase tracking-[0.08em] text-muted-foreground">{t("community.donationAction")}</p>
+            <p className="mt-1.5 text-lg font-semibold tracking-tight">{t("community.donationTitle")}</p>
+            <p className="mt-1 text-xs leading-5 text-muted-foreground">{t("community.donationDescription")}</p>
+          </div>
+          <img
+            src={DONATION_IMAGE_URL}
+            alt={t("community.donationImageAlt")}
+            className="h-auto w-full max-w-[280px] rounded-md border bg-white object-contain"
+          />
+        </div>
       </div>
       <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-border/70 pt-4">
         <div className="min-w-0">
