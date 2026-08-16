@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import unittest
 
-from grok_account_manager.api.routers.proxy import _build_sub2api_download
+from grok_account_manager.api.routers.proxy import _build_sub2api_accounts, _build_sub2api_download
 
 
 class Sub2ApiExportTests(unittest.TestCase):
@@ -51,3 +51,19 @@ class Sub2ApiExportTests(unittest.TestCase):
             _build_sub2api_download("grok_web", [])
         with self.assertRaisesRegex(ValueError, "access_token 或 refresh_token"):
             _build_sub2api_download("grok_build", [{"access_token": "access-only"}])
+
+    def test_builds_direct_import_requests_with_default_groups(self) -> None:
+        accounts = _build_sub2api_accounts(
+            "grok_build",
+            [
+                {
+                    "email": "user@example.com",
+                    "access_token": "access-1",
+                    "refresh_token": "refresh-1",
+                }
+            ],
+            group_ids=[9],
+        )
+
+        self.assertEqual(accounts[0]["group_ids"], [9])
+        self.assertTrue(accounts[0]["confirm_mixed_channel_risk"])

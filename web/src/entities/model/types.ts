@@ -3,7 +3,7 @@ export type ModelRouteDTO = {
   publicId: string;
   provider: "grok_build" | "grok_web" | "grok_console";
   upstreamModel: string;
-  capability: "responses" | "chat" | "image" | "image_edit" | "video";
+  capability: "responses" | "chat" | "image" | "image_edit" | "video" | "stt" | "tts" | "realtime";
   origin: "catalog" | "discovered" | "manual";
   enabled: boolean;
   accountIds: string[];

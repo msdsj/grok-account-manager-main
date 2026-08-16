@@ -26,8 +26,8 @@
 | 模式 | 适用场景 | 需要的组件 | 入口 |
 | --- | --- | --- | --- |
 | CLI | 单机执行注册并写入凭证 | Python、uv、Chrome/Chromium | `uv run grok-account-manager grok ...` |
-| 控制台开发模式 | 修改前端或后端时调试 | CLI 组件，加 Node.js 和 pnpm/npm | 后端 `8765`，前端 `5173` |
-| 控制台构建模式 | 本机日常使用 | CLI 组件，加一次前端构建 | `http://127.0.0.1:8765` |
+| 控制台开发模式 | 修改前端或后端时调试 | CLI 组件，加 Node.js 和 pnpm/npm | 后端 `43187`，前端 `43188` |
+| 控制台构建模式 | 本机日常使用 | CLI 组件，加一次前端构建 | `http://127.0.0.1:43187` |
 | 本地中转 | 使用账号池提供 OpenAI 兼容接口 | 控制台组件，加 Docker Desktop 和外部 `grok2api` 检出 | 控制台的“本地中转”页面 |
 
 CLI 注册不依赖 `grok2api`。当前完整 Web 控制台的登录、账号管理和中转页面会通过本地 `grok2api` 实例工作，因此要使用完整控制台，请一并完成[本地中转](#本地中转)配置。
@@ -55,9 +55,9 @@ CLI 注册不依赖 `grok2api`。当前完整 Web 控制台的登录、账号管
 
 | 服务 | 默认地址 | 用途 |
 | --- | --- | --- |
-| FastAPI 后端 | `127.0.0.1:8765` | 注册 API、静态前端、OpenAI 代理入口 |
-| Vite 开发服务器 | `127.0.0.1:5173` | 前端热更新开发服务 |
-| 本地中转 | `127.0.0.1:8000` | 由 `grok2api` 提供的上游服务 |
+| FastAPI 后端 | `127.0.0.1:43187` | 注册 API、静态前端、OpenAI 代理入口 |
+| Vite 开发服务器 | `127.0.0.1:43188` | 前端热更新开发服务 |
+| 本地中转 | `127.0.0.1:43871` | 由 `grok2api` 提供的上游服务 |
 | 可选 Postgres 容器 | 主机端口 `54329` | 预留开发数据库，不是当前默认运行依赖；现有 Compose 默认会发布端口 |
 
 若端口冲突，请优先改启动参数，而不是结束不明进程。例如后端改为 `43190`：
@@ -127,6 +127,31 @@ GROK_ACCOUNT_MANAGER_EMAIL_SOURCE=duckmail
 ```
 
 `DUCKMAIL_API_KEY` 为空时，默认 DuckMail 流程无法创建邮箱。域名必须是你的 DuckMail 服务实际支持的域名。更多说明见 [DuckMail 邮箱源](duckmail.md)。
+
+### Cloud Mail
+
+Cloud Mail 支持 Public Token 和站点账号登录两种认证方式。每轮会在配置域名中选择一个域名创建随机邮箱，只读取该地址且 `emailId` 高于当前游标的新邮件。API 地址末尾可以包含 `/api`。
+
+Public Token 示例：
+
+```dotenv
+GROK_ACCOUNT_MANAGER_EMAIL_SOURCE=cloud_mail
+CLOUD_MAIL_API_BASE=https://mail.example.com
+CLOUD_MAIL_DOMAINS=example.com,example.net
+CLOUD_MAIL_PUBLIC_TOKEN=replace-with-public-token
+```
+
+账号登录示例：
+
+```dotenv
+GROK_ACCOUNT_MANAGER_EMAIL_SOURCE=cloud_mail
+CLOUD_MAIL_API_BASE=https://mail.example.com/api
+CLOUD_MAIL_DOMAINS=example.com
+CLOUD_MAIL_LOGIN_EMAIL=admin@example.com
+CLOUD_MAIL_LOGIN_PASSWORD=replace-with-password
+```
+
+Public Token 非空时优先使用 Public 模式；否则必须同时填写登录邮箱和密码。控制台可以在“注册任务”的邮箱来源中选择 Cloud Mail 并填写相同配置，这些输入只用于当前进程和任务重试，不会写入任务快照。完整说明见 [Cloud Mail 邮箱源](cloud-mail.md)。
 
 ### Outlook 现有账号池
 
@@ -203,7 +228,12 @@ uv run grok-account-manager grok --count 1 --sink json+txt
 | `--sink json+txt` | 同时使用多个输出端 |
 | `--output PATH` | 指定 TXT 输出路径 |
 | `--json-output PATH` | 指定 JSON 输出目录 |
-| `--email-source duckmail/outlook/gmail/google` | 指定邮箱或 Google 注册模式 |
+| `--email-source duckmail/cloud_mail/outlook/gmail/google` | 指定邮箱或 Google 注册模式 |
+| `--cloud-mail-api-base URL` | Cloud Mail 站点地址，末尾可带 `/api` |
+| `--cloud-mail-domains DOMAINS` | Cloud Mail 邮箱域名，使用逗号或换行分隔 |
+| `--cloud-mail-public-token TOKEN` | Cloud Mail Public Token |
+| `--cloud-mail-login-email EMAIL` | Cloud Mail 登录邮箱 |
+| `--cloud-mail-login-password PASSWORD` | Cloud Mail 登录密码 |
 | `--oauth-exchange` | 注册后尝试换取 OAuth `refresh_token` |
 | `--proxy-file PATH` | 指定无认证注册代理列表 |
 | `--no-proxy` | 强制直连并忽略代理池 |
@@ -246,7 +276,7 @@ cd web
 pnpm dev
 ```
 
-打开 `http://127.0.0.1:5173`。Vite 会把 `/api`、`/v1`、`/healthz` 和 `/readyz` 转发到 `http://127.0.0.1:8765`。
+打开 `http://127.0.0.1:43188`。Vite 会把 `/api`、`/v1`、`/healthz` 和 `/readyz` 转发到 `http://127.0.0.1:43187`。
 
 ### 构建后的本地运行
 
@@ -264,7 +294,7 @@ cd ..
 uv run grok-account-manager-api
 ```
 
-打开 `http://127.0.0.1:8765`。此时 FastAPI 会直接提供 `web/dist` 中的前端文件，不需要 Vite 开发服务器。
+打开 `http://127.0.0.1:43187`。此时 FastAPI 会直接提供 `web/dist` 中的前端文件，不需要 Vite 开发服务器。
 
 控制台包含注册任务、账号列表、账号测试、图片/对话测试、代理与中转配置等页面。注册任务启动后可以停止任务，也可以最小化或还原程序启动的浏览器窗口。
 
@@ -349,7 +379,7 @@ GROK2API_PATH=/absolute/path/to/grok2api-main
 
 首次成功准备中转时，项目会在 `output/` 下生成中转配置和数据目录。中转管理员用户名为 `grok-account-manager`；首次生成的管理员密码保存在仅本机可读的 `output/relay-config.json` 的 `admin_key` 字段中。该值是机密，不能截图、提交或发送给他人；应在可信本机上妥善保存并按需更换。
 
-在控制台“本地中转”页面可以检查状态、启动或停止中转、同步本地账号和查看可用模型。中转默认地址为 `http://127.0.0.1:8000`。不要把它、后端端口或中转配置直接映射到公网。
+在控制台“本地中转”页面可以检查状态、启动或停止中转、同步本地账号和查看可用模型。中转默认地址为 `http://127.0.0.1:43871`。不要把它、后端端口或中转配置直接映射到公网。
 
 `docker-compose.yml` 中的 Postgres 服务是后续数据库迁移预留项。当前默认账号数据库是 SQLite，不会因为运行 `docker compose up -d` 自动切换到 Postgres。现有 Compose 使用示例账号并默认发布主机端口 `54329`，只应在可信开发网络中运行；如要启用它，应先修改密码和端口映射策略。
 
@@ -388,20 +418,20 @@ pnpm build
 构建后的服务启动后，可检查：
 
 ```bash
-curl http://127.0.0.1:8765/api/openapi.json
+curl http://127.0.0.1:43187/api/openapi.json
 ```
 
 完整变更记录见 [CHANGELOG.md](../CHANGELOG.md)。
 
 ## 常见问题
 
-### `8765` 或 `5173` 已被占用
+### `43187` 或 `43188` 已被占用
 
 先确认具体监听者：
 
 ```bash
-lsof -nP -iTCP:8765 -sTCP:LISTEN
-lsof -nP -iTCP:5173 -sTCP:LISTEN
+lsof -nP -iTCP:43187 -sTCP:LISTEN
+lsof -nP -iTCP:43188 -sTCP:LISTEN
 ```
 
 优先换本项目端口。后端可使用 `--port`，前端通过 `VITE_DEV_API_TARGET` 指向新的后端端口。不要停止自己无法确认归属的进程。
@@ -410,7 +440,7 @@ lsof -nP -iTCP:5173 -sTCP:LISTEN
 
 按顺序检查：
 
-1. 后端是否运行在 `127.0.0.1:8765`。
+1. 后端是否运行在 `127.0.0.1:43187`。
 2. 开发模式下，`VITE_DEV_API_TARGET` 是否与后端实际地址一致。
 3. 是否已完成 `grok2api` 源码路径和 Docker Desktop 配置。
 4. 查看 `output/backend.log` 与 `output/grok2api-relay.log` 的最后几行，不要把含 token 的整份日志公开。
@@ -424,6 +454,7 @@ lsof -nP -iTCP:5173 -sTCP:LISTEN
 ### 没有收到邮箱验证码
 
 - 检查 `.env` 中 DuckMail 的 API Key 和域名。
+- Cloud Mail 模式确认 API 地址、域名和所选认证方式完整；服务响应需要是 HTTP 200 且 JSON `code` 为 `200`。
 - Outlook/Google 模式确认账号池格式、授权信息和可读收件箱。
 - 账号池记录耗尽时，补充足够行数后再启动新的任务。
 
@@ -433,7 +464,7 @@ OAuth 模式要求拿到有效的 `refresh_token`。如果授权被拒绝、超�
 
 ## 安全清单
 
-- `.env`、`output/`、账号池文件、代理列表和浏览器 Cookie 都是机密。
+- `.env`、Cloud Mail Token/登录密码、`output/`、账号池文件、代理列表和浏览器 Cookie 都是机密。
 - 后端、Vite 和中转默认应保持在 `127.0.0.1`；远程访问请使用 SSH 隧道或受控 VPN，不要直接绑定 `0.0.0.0`。
 - 当前 `docker-compose.yml` 的 Postgres 示例端口会发布到主机接口，运行前应修改示例凭据并确认防火墙和网络边界。
 - 不要提交 `output/relay-config.json`、SQLite 数据库、`grok_credentials.json`、SSO 文本或截图中的管理密码。

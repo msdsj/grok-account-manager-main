@@ -17,6 +17,7 @@ from ...core.proxy_pool import (
     ProxyPool,
     ProxyPoolError,
     ProxyPoolExhaustedError,
+    get_fixed_egress_proxy,
     load_proxy_file,
     mask_proxy_server,
     redact_proxy_secrets,
@@ -25,6 +26,11 @@ from ...grok.oauth_exchange import CloudflareBlockedError
 from ...mail.sources import build_mailbox_source
 from ...providers.grok import GrokProvider
 from ...sinks.json_credential import JsonCredentialSink
+from ...sinks.sub2api import (
+    build_sub2api_oauth_accounts,
+    create_sub2api_accounts,
+    load_sub2api_env_config,
+)
 from ...sinks.txt_file import TxtFileSink
 from ..config import (
     CREDENTIALS_DIR,
@@ -162,6 +168,8 @@ class RegistrationJobManager:
         self._mail_source = None
         self._proxy_pool: ProxyPool | None = None
         self._oauth_semaphore: threading.BoundedSemaphore | None = None
+        self._sub2api_config: tuple[str, str, list[int]] | None = None
+        self._sub2api_import_lock = threading.Lock()
         self._next_job_start_not_before = 0.0
         self._last_config: dict = {}
         self._pending_store = pending_store if pending_store is not None else PendingResultStore()
@@ -228,12 +236,18 @@ class RegistrationJobManager:
             total=1,
             concurrency=1,
             oauth_exchange=cfg.get("oauth_exchange", True),
+            auto_import_sub2api=cfg.get("auto_import_sub2api", False),
             minimize_browsers=cfg.get("minimize_browsers", True),
             email_source=cfg.get("email_source", "duckmail"),
             outlook_data=cfg.get("outlook_data", ""),
             outlook_accounts_file=cfg.get("outlook_accounts_file", ""),
             google_data=cfg.get("google_data", ""),
             google_accounts_file=cfg.get("google_accounts_file", ""),
+            cloud_mail_api_base=cfg.get("cloud_mail_api_base", ""),
+            cloud_mail_public_token=cfg.get("cloud_mail_public_token", ""),
+            cloud_mail_login_email=cfg.get("cloud_mail_login_email", ""),
+            cloud_mail_login_password=cfg.get("cloud_mail_login_password", ""),
+            cloud_mail_domains=cfg.get("cloud_mail_domains", ""),
             proxy_pool_enabled=cfg.get("proxy_pool_enabled"),
             proxy_data=cfg.get("proxy_data", ""),
             proxy_file=cfg.get("proxy_file", ""),
@@ -244,16 +258,27 @@ class RegistrationJobManager:
         total: int,
         concurrency: int,
         oauth_exchange: bool,
+        auto_import_sub2api: bool = False,
         minimize_browsers: bool = True,
         email_source: str = "duckmail",
         outlook_data: str = "",
         outlook_accounts_file: str = "",
         google_data: str = "",
         google_accounts_file: str = "",
+        cloud_mail_api_base: str = "",
+        cloud_mail_public_token: str = "",
+        cloud_mail_login_email: str = "",
+        cloud_mail_login_password: str = "",
+        cloud_mail_domains: str = "",
         proxy_pool_enabled: bool | None = None,
         proxy_data: str = "",
         proxy_file: str = "",
     ) -> dict:
+        auto_import_sub2api = bool(auto_import_sub2api)
+        if auto_import_sub2api and not oauth_exchange:
+            raise ValueError("自动导入 Sub2API 需要开启 refresh_token")
+        sub2api_config = load_sub2api_env_config() if auto_import_sub2api else None
+
         total = safe_int(total, default=1, minimum=1, maximum=10_000)
         requested_total = total
         requested_concurrency = safe_int(concurrency, default=1, minimum=1, maximum=20)
@@ -271,6 +296,11 @@ class RegistrationJobManager:
             outlook_file=outlook_accounts_file,
             google_data=google_data,
             google_file=google_accounts_file,
+            cloud_mail_api_base=cloud_mail_api_base,
+            cloud_mail_public_token=cloud_mail_public_token,
+            cloud_mail_login_email=cloud_mail_login_email,
+            cloud_mail_login_password=cloud_mail_login_password,
+            cloud_mail_domains=cloud_mail_domains,
         )
         proxy_pool, proxy_source = _build_proxy_pool(
             enabled=proxy_pool_enabled,
@@ -310,12 +340,18 @@ class RegistrationJobManager:
 
             self._last_config = {
                 "oauth_exchange": bool(oauth_exchange),
+                "auto_import_sub2api": auto_import_sub2api,
                 "minimize_browsers": bool(minimize_browsers),
                 "email_source": email_source,
                 "outlook_data": outlook_data,
                 "outlook_accounts_file": outlook_accounts_file,
                 "google_data": google_data,
                 "google_accounts_file": google_accounts_file,
+                "cloud_mail_api_base": cloud_mail_api_base,
+                "cloud_mail_public_token": cloud_mail_public_token,
+                "cloud_mail_login_email": cloud_mail_login_email,
+                "cloud_mail_login_password": cloud_mail_login_password,
+                "cloud_mail_domains": cloud_mail_domains,
                 "proxy_pool_enabled": proxy_pool is not None,
                 "proxy_data": proxy_data,
                 "proxy_file": proxy_file,
@@ -323,6 +359,7 @@ class RegistrationJobManager:
             self._stop_event = threading.Event()
             self._mail_source = mail_source
             self._proxy_pool = proxy_pool
+            self._sub2api_config = sub2api_config
             self._oauth_semaphore = (
                 threading.BoundedSemaphore(oauth_concurrency) if oauth_concurrency else None
             )
@@ -332,6 +369,7 @@ class RegistrationJobManager:
                 "total": total,
                 "concurrency": concurrency,
                 "oauthExchange": bool(oauth_exchange),
+                "autoImportSub2Api": auto_import_sub2api,
                 "windowsMinimized": bool(minimize_browsers),
                 "emailSource": getattr(mail_source, "name", email_source),
                 "outlookAccountCount": getattr(mail_source, "count", 0)
@@ -351,6 +389,8 @@ class RegistrationJobManager:
                 "registered": 0,
                 "refreshTokenCompleted": 0,
                 "refreshTokenFailed": 0,
+                "sub2ApiImported": 0,
+                "sub2ApiImportFailed": 0,
                 "oauthAccessDeniedStreak": 0,
                 "oauthCircuitOpen": False,
                 "oauthCircuitReason": "",
@@ -385,6 +425,17 @@ class RegistrationJobManager:
                     "info",
                     f"refresh_token 阶段最多同时运行 {oauth_concurrency} 个窗口，"
                     "其余窗口会排队以降低同出口 IP 的 OAuth 限速风险",
+                )
+            if auto_import_sub2api and sub2api_config is not None:
+                group_ids = sub2api_config[2]
+                group_label = (
+                    f"分组 {','.join(str(value) for value in group_ids)}"
+                    if group_ids
+                    else "未指定分组"
+                )
+                self._event_locked(
+                    "info",
+                    f"Sub2API 自动导入已开启，成功账号将使用{group_label}",
                 )
             if proxy_pool is not None:
                 self._event_locked(
@@ -996,6 +1047,143 @@ class RegistrationJobManager:
                     print(f"[RegistrationJobManager] 清理已保存凭证失败: {error}")
         return oauth_status, oauth_error, True
 
+    def _auto_import_sub2api_result(
+        self,
+        result: dict,
+        *,
+        worker_index: int,
+        round_index: int,
+    ) -> bool | None:
+        """Import one finalized OAuth account without failing the registration round."""
+        with self._lock:
+            job = self._job
+            if job is None or not job.get("autoImportSub2Api"):
+                return None
+            job_id = str(job.get("id") or "")
+            config = self._sub2api_config
+
+        email = str(result.get("email") or "").strip()
+        credential = result.get("full_credential")
+        if not isinstance(credential, dict):
+            error = "账号缺少完整 OAuth 凭证"
+            self._record_sub2api_import_result(
+                success=False,
+                email=email,
+                error=error,
+                worker_index=worker_index,
+                round_index=round_index,
+            )
+            return False
+        if config is None:
+            error = "Sub2API 配置未加载"
+            self._record_sub2api_import_result(
+                success=False,
+                email=email,
+                error=error,
+                worker_index=worker_index,
+                round_index=round_index,
+            )
+            return False
+
+        base_url, api_key, group_ids = config
+        try:
+            accounts = build_sub2api_oauth_accounts(
+                "grok_build",
+                [credential],
+                group_ids=group_ids,
+            )
+            with self._sub2api_import_lock:
+                response = create_sub2api_accounts(
+                    base_url=base_url,
+                    api_key=api_key,
+                    accounts=accounts,
+                    timeout=60,
+                    idempotency_key=f"grok-account-manager-{job_id}-{round_index}",
+                )
+            if int(response.get("success") or 0) != 1:
+                errors = [
+                    str(item.get("error") or "").strip()
+                    for item in response.get("results", [])
+                    if isinstance(item, dict) and not item.get("success")
+                ]
+                raise RuntimeError(next((value for value in errors if value), "Sub2API 未创建账号"))
+        except Exception as error:
+            self._record_sub2api_import_result(
+                success=False,
+                email=email,
+                error=str(error),
+                worker_index=worker_index,
+                round_index=round_index,
+            )
+            return False
+
+        self._record_sub2api_import_result(
+            success=True,
+            email=email,
+            error="",
+            worker_index=worker_index,
+            round_index=round_index,
+        )
+        return True
+
+    def _record_sub2api_import_result(
+        self,
+        *,
+        success: bool,
+        email: str,
+        error: str,
+        worker_index: int,
+        round_index: int,
+    ) -> None:
+        safe_error = redact_proxy_secrets(error)
+        if success:
+            with self._lock:
+                if self._job is None:
+                    return
+                self._job["sub2ApiImported"] = int(self._job.get("sub2ApiImported") or 0) + 1
+                self._update_worker_state_locked(
+                    worker_index,
+                    status="success",
+                    stage="done",
+                    message="账号与 refresh_token 已保存，并已导入 Sub2API",
+                )
+                self._event_locked(
+                    "success",
+                    f"第 {round_index} 轮已自动导入 Sub2API：{email}",
+                    worker=worker_index,
+                    round=round_index,
+                    email=email,
+                    stage="sub2api_import",
+                )
+            return
+
+        with self._lock:
+            if self._job is not None:
+                self._job["sub2ApiImportFailed"] = int(
+                    self._job.get("sub2ApiImportFailed") or 0
+                ) + 1
+                self._update_worker_state_locked(
+                    worker_index,
+                    status="warning",
+                    stage="done",
+                    message=f"账号已保存，Sub2API 导入失败：{safe_error}",
+                )
+                self._event_locked(
+                    "warning",
+                    f"第 {round_index} 轮账号已保存，但 Sub2API 导入失败：{safe_error}",
+                    worker=worker_index,
+                    round=round_index,
+                    email=email,
+                    stage="sub2api_import",
+                )
+        self._record_failed_account(
+            email=email,
+            round_index=round_index,
+            worker_index=worker_index,
+            stage="sub2api_import",
+            reason=safe_error,
+        )
+
     def _create_provider(
         self,
         oauth_exchange: bool,
@@ -1016,7 +1204,7 @@ class RegistrationJobManager:
         )
         with self._lock:
             has_proxy_pool = self._proxy_pool is not None
-        if has_proxy_pool:
+        if has_proxy_pool or get_fixed_egress_proxy():
             provider.retry_browser_callback = lambda session: self._restart_for_registration_retry(
                 session,
                 worker_index=worker_index,
@@ -1029,7 +1217,7 @@ class RegistrationJobManager:
         with self._lock:
             proxy_pool = self._proxy_pool
         if proxy_pool is None:
-            return None
+            return get_fixed_egress_proxy()
         try:
             proxy_server = proxy_pool.acquire()
         except ProxyPoolExhaustedError as error:
@@ -1261,7 +1449,7 @@ class RegistrationJobManager:
                     # page request. Later rounds restart the browser with a
                     # fresh profile and proxy.
                     if not is_first_round and session is not None:
-                        if self._proxy_pool is not None:
+                        if self._proxy_pool is not None or get_fixed_egress_proxy():
                             current_proxy = self._acquire_proxy(worker_index, round_index)
                             session.restart(proxy_server=current_proxy)
                         else:
@@ -1273,7 +1461,9 @@ class RegistrationJobManager:
                             round=round_index,
                         )
                     if session is None:
-                        if self._proxy_pool is not None and current_proxy is None:
+                        if (
+                            self._proxy_pool is not None or get_fixed_egress_proxy()
+                        ) and current_proxy is None:
                             current_proxy = self._acquire_proxy(worker_index, round_index)
                         session = self._start_worker_session(
                             worker_index,
@@ -1410,6 +1600,12 @@ class RegistrationJobManager:
                                 oauth_status=result_oauth_status,
                                 oauth_error=result_oauth_error,
                             )
+                            if result_saved and result_oauth_status == "ready":
+                                self._auto_import_sub2api_result(
+                                    result,
+                                    worker_index=worker_index,
+                                    round_index=round_index,
+                                )
                         self._event(
                             "warning",
                             (
@@ -1433,6 +1629,12 @@ class RegistrationJobManager:
                             oauth_status=oauth_status,
                             oauth_error=oauth_error,
                         )
+                        if result_saved and oauth_status == "ready":
+                            self._auto_import_sub2api_result(
+                                result,
+                                worker_index=worker_index,
+                                round_index=round_index,
+                            )
                         ok = True
                         email = str(result.get("email") or "")
                         self._event(
@@ -1665,10 +1867,14 @@ class RegistrationJobManager:
                 self._job.get("failed", 0) > 0
                 or self._job.get("workerErrors", 0) > 0
                 or self._job.get("refreshTokenFailed", 0) > 0
+                or self._job.get("sub2ApiImportFailed", 0) > 0
                 or bool(self._job.get("failedAccounts"))
             ):
                 self._job["status"] = "completed_with_errors"
-                self._event_locked("warning", "任务完成，但存在注册、refresh_token 或落盘失败")
+                self._event_locked(
+                    "warning",
+                    "任务完成，但存在注册、refresh_token、落盘失败或 Sub2API 导入失败",
+                )
             else:
                 self._job["status"] = "completed"
                 self._event_locked("success", "任务已全部完成")
@@ -1681,6 +1887,7 @@ class RegistrationJobManager:
             self._mail_source = None
             self._proxy_pool = None
             self._oauth_semaphore = None
+            self._sub2api_config = None
 
         if registered_this_round > 0:
             self._sync_to_relay_async()

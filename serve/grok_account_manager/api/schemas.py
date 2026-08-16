@@ -11,12 +11,18 @@ class RegisterRequest(BaseModel):
     total: int = 1
     concurrency: int = 1
     oauthExchange: bool = True
+    autoImportSub2Api: bool = False
     minimizeBrowsers: bool = True
     emailSource: str = "duckmail"
     outlookData: str = ""
     outlookAccountsFile: str = ""
     googleData: str = ""
     googleAccountsFile: str = ""
+    cloudMailApiBase: str = Field(default="", max_length=4_096)
+    cloudMailPublicToken: str = Field(default="", max_length=16_384)
+    cloudMailLoginEmail: str = Field(default="", max_length=320)
+    cloudMailLoginPassword: str = Field(default="", max_length=4_096)
+    cloudMailDomains: str = Field(default="", max_length=100_000)
     # ``None`` distinguishes an omitted field (auto-detect the configured
     # default file) from an explicit ``False`` (force direct connection).
     proxyPoolEnabled: bool | None = None

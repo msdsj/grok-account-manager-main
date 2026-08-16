@@ -649,6 +649,28 @@ export function exportSelectedSub2ApiAccounts(provider: AccountProvider, ids: st
   return apiDownload("/api/admin/v1/accounts/export-sub2api", { method: "POST", body: { provider, ids } });
 }
 
+export type Sub2ApiImportResultDTO = {
+  total: number;
+  succeeded: number;
+  failed: number;
+  groupIds: number[];
+  errors: string[];
+};
+
+export function importSelectedSub2ApiAccounts(provider: AccountProvider, ids: string[]): Promise<Sub2ApiImportResultDTO> {
+  return apiRequest(
+    "/api/admin/v1/accounts/import-sub2api",
+    { method: "POST", body: { provider, ids } },
+    createObjectDecoder("Sub2API import", {
+      total: isNumber,
+      succeeded: isNumber,
+      failed: isNumber,
+      groupIds: isArrayOf(isNumber),
+      errors: isArrayOf(isString),
+    }),
+  );
+}
+
 export function updateAccountsEnabled(ids: string[], enabled: boolean, provider: AccountProvider): Promise<{ updated: number }> {
   return apiRequest("/api/admin/v1/accounts/batch", { method: "PATCH", body: { ids, enabled, provider } }, decodeCountResult<{ updated: number }>("updated"));
 }

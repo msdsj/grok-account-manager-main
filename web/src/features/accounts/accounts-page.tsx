@@ -1,6 +1,6 @@
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ArrowRight, ClipboardPaste, Compass, Download, ExternalLink, FileUp, Link, MoreHorizontal, Pencil, Plus, RefreshCw, RotateCw, Search, SquareTerminal, Trash2, TriangleAlert, Webhook } from "lucide-react";
+import { ArrowRight, ClipboardPaste, CloudUpload, Compass, Download, ExternalLink, FileUp, Link, MoreHorizontal, Pencil, Plus, RefreshCw, RotateCw, Search, SquareTerminal, Trash2, TriangleAlert, Webhook } from "lucide-react";
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { useForm, useWatch } from "react-hook-form";
 import { useTranslation } from "react-i18next";
@@ -51,6 +51,7 @@ import {
   getAccountSummary,
   importAccounts,
   importConsoleAccounts,
+  importSelectedSub2ApiAccounts,
   importWebAccounts,
   listAccounts,
   pollDeviceAuthorization,
@@ -734,6 +735,22 @@ export function AccountsPage() {
     onError: showError,
   });
 
+  const sub2apiImportMutation = useMutation({
+    mutationFn: (ids: string[]) => importSelectedSub2ApiAccounts(provider, ids),
+    onSuccess: (result) => {
+      const details = result.errors.length > 0 ? { description: result.errors.join("；") } : undefined;
+      if (result.failed === 0) {
+        clearSelection();
+        toast.success(t("accounts.sub2apiImported", result));
+      } else if (result.succeeded > 0) {
+        toast.warning(t("accounts.sub2apiImportedPartial", result), details);
+      } else {
+        toast.error(t("accounts.sub2apiImportFailed", result), details);
+      }
+    },
+    onError: showError,
+  });
+
   const batchUpdateMutation = useMutation({
     mutationFn: (enabled: boolean) => updateAccountsEnabled([...selected], enabled, provider),
     onSuccess: () => {
@@ -1267,7 +1284,8 @@ export function AccountsPage() {
     || cleanupMutation.isPending
     || webConfirmationMutation.isPending
     || webAccountScriptsMutation.isPending
-    || formatExportMutation.isPending;
+    || formatExportMutation.isPending
+    || sub2apiImportMutation.isPending;
 
   const detectInvalidItems = detectItems.filter((item) => item.outcome === "invalid");
   const detectVisibleItems = detectMode === "selected" ? detectItems : detectInvalidItems;
@@ -1422,6 +1440,7 @@ export function AccountsPage() {
                 <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={openSelectedExport}><Download />{t("accounts.exportAuth")}</Button>
                 {provider === "grok_build" ? <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => formatExportMutation.mutate({ format: "cpa", ids: [...selected] })}><Download />{t("accounts.exportCpa")}</Button> : null}
                 {provider === "grok_build" ? <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => formatExportMutation.mutate({ format: "sub2api", ids: [...selected] })}><Download />{t("accounts.exportSub2api")}</Button> : null}
+                {provider === "grok_build" ? <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => sub2apiImportMutation.mutate([...selected])}>{sub2apiImportMutation.isPending ? <Spinner /> : <CloudUpload />}{t(sub2apiImportMutation.isPending ? "accounts.importingSub2api" : "accounts.importSub2api")}</Button> : null}
                 <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => batchUpdateMutation.mutate(true)}>{t("common.enable")}</Button>
                 <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => batchUpdateMutation.mutate(false)}>{t("common.disable")}</Button>
                 <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => {

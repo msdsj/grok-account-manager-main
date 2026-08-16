@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from datetime import datetime, timezone
@@ -11,6 +12,11 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response
 
 from ...sinks.cpa_credential import build_cpa_download
+from ...sinks.sub2api import (
+    build_sub2api_oauth_accounts,
+    create_sub2api_accounts,
+    parse_sub2api_group_ids,
+)
 from ..services.relay import RELAY_MANAGER
 
 router = APIRouter(tags=["proxy"])
@@ -25,8 +31,6 @@ _BLOCKED_RESPONSE_HEADERS = {
 
 _SUB2API_DATA_TYPE = "sub2api-data"
 _SUB2API_DATA_VERSION = 1
-_GROK_OAUTH_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
-_GROK_CLI_BASE_URL = "https://cli-chat-proxy.grok.com/v1"
 
 
 @router.api_route("/v1", methods=_PROXY_METHODS)
@@ -40,6 +44,8 @@ async def proxy_v1(request: Request, path: str = "") -> Response:
 async def proxy_admin_v1(request: Request, path: str = "") -> Response:
     if request.method == "DELETE" and (path == "accounts" or re.fullmatch(r"accounts/\d+", path)):
         return await _delete_accounts_with_local_cleanup(request, path)
+    if request.method == "POST" and path == "accounts/import-sub2api":
+        return await _import_selected_sub2api_accounts(request)
     if request.method == "POST" and path in {"accounts/export-cpa", "accounts/export-sub2api"}:
         return await _export_selected_accounts(request, path.rsplit("/", 1)[-1])
     return await _proxy(request, f"/api/admin/v1/{path}".rstrip("/"))
@@ -99,14 +105,17 @@ async def _export_selected_accounts(request: Request, format_name: str) -> Respo
             "unsupportedExportFormat",
         )
 
-    upstream = RELAY_MANAGER.proxy_request(
-        "POST",
-        "/api/admin/v1/accounts/export",
-        query=request.url.query,
-        headers={key: value for key, value in request.headers.items()},
-        body=json.dumps({"provider": provider, "ids": ids}).encode("utf-8"),
-        timeout=180,
-    )
+    try:
+        upstream = RELAY_MANAGER.proxy_request(
+            "POST",
+            "/api/admin/v1/accounts/export",
+            query=request.url.query,
+            headers={key: value for key, value in request.headers.items()},
+            body=json.dumps({"provider": provider, "ids": ids}).encode("utf-8"),
+            timeout=180,
+        )
+    except Exception as error:
+        return _export_error(f"读取本地账号凭据失败：{error}", 502, "accountExportFailed")
     if not upstream.ok:
         return _upstream_response(upstream)
 
@@ -137,6 +146,87 @@ async def _export_selected_accounts(request: Request, format_name: str) -> Respo
     )
 
 
+async def _import_selected_sub2api_accounts(request: Request) -> Response:
+    """Import selected Grok Build OAuth accounts into the configured Sub2API."""
+    body = await request.body()
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return _export_error("请求参数不是有效 JSON", 400, "invalidRequest")
+
+    provider = str(payload.get("provider") or "").strip() if isinstance(payload, dict) else ""
+    raw_ids = payload.get("ids") if isinstance(payload, dict) else None
+    if provider != "grok_build" or not isinstance(raw_ids, list):
+        return _export_error("Sub2API 直连导入仅支持 Grok Build OAuth 账号", 400, "unsupportedImportFormat")
+    ids = [str(value).strip() for value in raw_ids]
+    if not ids or len(ids) > 10_000 or len(set(ids)) != len(ids) or any(not value.isdigit() or int(value) <= 0 for value in ids):
+        return _export_error("请选择有效的账号", 400, "invalidRequest")
+
+    try:
+        upstream = RELAY_MANAGER.proxy_request(
+            "POST",
+            "/api/admin/v1/accounts/export",
+            query=request.url.query,
+            headers={key: value for key, value in request.headers.items()},
+            body=json.dumps({"provider": provider, "ids": ids}).encode("utf-8"),
+            timeout=180,
+        )
+    except Exception as error:
+        return _export_error(f"读取本地账号凭据失败：{error}", 502, "accountExportFailed")
+    if not upstream.ok:
+        return _upstream_response(upstream)
+
+    try:
+        document = upstream.json()
+        accounts = document.get("accounts") if isinstance(document, dict) else None
+        if not isinstance(accounts, list) or len(accounts) != len(ids):
+            raise ValueError("新版 grok2api 返回的导出账号数量与所选数量不一致")
+        if any(not isinstance(account, dict) for account in accounts):
+            raise ValueError("新版 grok2api 返回了无效账号凭据")
+    except ValueError as error:
+        return _export_error(str(error), 400, "invalidAccountCredentials")
+
+    try:
+        group_ids = parse_sub2api_group_ids(os.environ.get("SUB2API_DEFAULT_GROUP_IDS", ""))
+    except ValueError as error:
+        return _export_error(str(error), 400, "sub2apiNotConfigured")
+
+    try:
+        sub2api_accounts = _build_sub2api_accounts(provider, accounts, group_ids=group_ids)
+    except ValueError as error:
+        return _export_error(str(error), 400, "invalidAccountCredentials")
+
+    try:
+        result = create_sub2api_accounts(
+            base_url=os.environ.get("SUB2API_BASE_URL", ""),
+            api_key=os.environ.get("SUB2API_ADMIN_API_KEY", ""),
+            accounts=sub2api_accounts,
+            timeout=60,
+        )
+    except ValueError as error:
+        return _export_error(str(error), 400, "sub2apiNotConfigured")
+    except Exception as error:
+        return _export_error(str(error), 502, "sub2apiImportFailed")
+
+    errors = [
+        _text(item.get("error"))
+        for item in result.get("results", [])
+        if isinstance(item, dict) and not item.get("success") and _text(item.get("error"))
+    ]
+
+    return JSONResponse(
+        {
+            "data": {
+                "total": len(sub2api_accounts),
+                "succeeded": int(result["success"]),
+                "failed": int(result["failed"]),
+                "groupIds": group_ids,
+                "errors": errors[:5],
+            }
+        }
+    )
+
+
 def _build_sub2api_download(
     provider: str,
     accounts: list[dict],
@@ -146,57 +236,7 @@ def _build_sub2api_download(
     if provider != "grok_build":
         raise ValueError("Sub2API 格式仅支持 Grok Build OAuth 账号")
 
-    result: list[dict] = []
-    for index, account in enumerate(accounts, start=1):
-        access_token = _text(account.get("access_token"))
-        refresh_token = _text(account.get("refresh_token"))
-        if not access_token or not refresh_token:
-            raise ValueError(
-                f"第 {index} 个账号缺少 access_token 或 refresh_token，无法导出可用的 Sub2API Grok OAuth 账号"
-            )
-
-        email = _text(account.get("email"))
-        user_id = _text(account.get("user_id") or account.get("userId"))
-        credentials: dict[str, str] = {
-            "access_token": access_token,
-            "refresh_token": refresh_token,
-            "token_type": _text(account.get("token_type")) or "Bearer",
-            "client_id": _text(account.get("client_id") or account.get("oidc_client_id")) or _GROK_OAUTH_CLIENT_ID,
-            "base_url": _text(account.get("base_url")) or _GROK_CLI_BASE_URL,
-        }
-        expires_at = _sub2api_rfc3339(account.get("expires_at") or account.get("expires_at_raw"))
-        if expires_at:
-            credentials["expires_at"] = expires_at
-        for key in (
-            "id_token",
-            "scope",
-            "email",
-            "sub",
-            "user_id",
-            "principal_id",
-            "team_id",
-            "subscription_tier",
-            "entitlement_status",
-        ):
-            value = _text(account.get(key))
-            if value:
-                credentials[key] = value
-        if email and "email" not in credentials:
-            credentials["email"] = email
-        if user_id and "user_id" not in credentials:
-            credentials["user_id"] = user_id
-
-        result.append(
-            {
-                "name": _text(account.get("name")) or email or f"Grok Build {index}",
-                "platform": "grok",
-                "type": "oauth",
-                "credentials": credentials,
-                "concurrency": 1,
-                "priority": 0,
-                "auto_pause_on_expired": True,
-            }
-        )
+    result = _build_sub2api_accounts(provider, accounts)
 
     timestamp = time.time() if now is None else now
     raw = (
@@ -216,6 +256,16 @@ def _build_sub2api_download(
     stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime(timestamp))
     filename = f"grok2api-{provider.replace('_', '-')}-sub2api-{stamp}.json"
     return raw, filename, "application/json; charset=utf-8"
+
+
+def _build_sub2api_accounts(
+    provider: str,
+    accounts: list[dict],
+    *,
+    group_ids: list[int] | None = None,
+) -> list[dict]:
+    """Keep the existing router helper backed by the shared Sub2API mapper."""
+    return build_sub2api_oauth_accounts(provider, accounts, group_ids=group_ids)
 
 
 def _text(value: object) -> str:

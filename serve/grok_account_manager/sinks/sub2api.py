@@ -4,7 +4,7 @@
 - 路径：POST {base_url}/api/v1/admin/accounts/batch
 - 请求体：{"accounts": [CreateAccountRequest...]}（见 sub2api/backend/internal/handler/admin/account_handler.go:1157）
 - 鉴权：x-api-key: <admin api key>
-- 响应：{"success": int, "failed": int, "results": [...]}（部分成功部分失败也是 200）
+- 响应：兼容顶层结果和当前 {"code": 0, "data": {...}} 包装
 
 约束（与 plan 一致）：
 - type 字段受 oneof=oauth setup-token apikey upstream bedrock 限制，没有 cookie。
@@ -16,12 +16,235 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import requests
 
 from ..providers.base import RegistrationResult
+
+GROK_OAUTH_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
+GROK_CLI_BASE_URL = "https://cli-chat-proxy.grok.com/v1"
+
+
+def parse_sub2api_group_ids(raw: str) -> list[int]:
+    """Parse the comma-separated default group IDs used by Sub2API imports."""
+    group_ids: list[int] = []
+    for item in str(raw or "").split(","):
+        value = item.strip()
+        if not value:
+            continue
+        try:
+            group_id = int(value)
+        except ValueError as error:
+            raise ValueError("SUB2API_DEFAULT_GROUP_IDS 必须是逗号分隔的数字 ID") from error
+        if group_id <= 0:
+            raise ValueError("SUB2API_DEFAULT_GROUP_IDS 必须使用大于 0 的数字 ID")
+        if group_id not in group_ids:
+            group_ids.append(group_id)
+    return group_ids
+
+
+def load_sub2api_env_config() -> tuple[str, str, list[int]]:
+    """Load and validate the external Sub2API connection settings."""
+    base_url = str(os.environ.get("SUB2API_BASE_URL") or "").strip().rstrip("/")
+    api_key = str(os.environ.get("SUB2API_ADMIN_API_KEY") or "").strip()
+    if not base_url:
+        raise ValueError("未配置 SUB2API_BASE_URL")
+    if not api_key:
+        raise ValueError("未配置 SUB2API_ADMIN_API_KEY")
+    group_ids = parse_sub2api_group_ids(
+        os.environ.get("SUB2API_DEFAULT_GROUP_IDS", "")
+    )
+    return base_url, api_key, group_ids
+
+
+def build_sub2api_oauth_accounts(
+    provider: str,
+    accounts: list[dict[str, Any]],
+    *,
+    group_ids: list[int] | None = None,
+) -> list[dict[str, Any]]:
+    """Map Grok Build OAuth credentials to Sub2API account requests."""
+    if provider != "grok_build":
+        raise ValueError("Sub2API 格式仅支持 Grok Build OAuth 账号")
+
+    result: list[dict[str, Any]] = []
+    for index, account in enumerate(accounts, start=1):
+        access_token = _text(account.get("access_token"))
+        refresh_token = _text(account.get("refresh_token"))
+        if not access_token or not refresh_token:
+            raise ValueError(
+                f"第 {index} 个账号缺少 access_token 或 refresh_token，无法导入可用的 Sub2API Grok OAuth 账号"
+            )
+
+        email = _text(account.get("email"))
+        user_id = _text(account.get("user_id") or account.get("userId"))
+        credentials: dict[str, str] = {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "token_type": _text(account.get("token_type")) or "Bearer",
+            "client_id": _text(account.get("client_id") or account.get("oidc_client_id"))
+            or GROK_OAUTH_CLIENT_ID,
+            "base_url": _text(account.get("base_url")) or GROK_CLI_BASE_URL,
+        }
+        expires_at = normalize_sub2api_rfc3339(
+            account.get("expires_at") or account.get("expires_at_raw")
+        )
+        if expires_at:
+            credentials["expires_at"] = expires_at
+        for key in (
+            "id_token",
+            "scope",
+            "email",
+            "sub",
+            "user_id",
+            "principal_id",
+            "team_id",
+            "subscription_tier",
+            "entitlement_status",
+        ):
+            value = _text(account.get(key))
+            if value:
+                credentials[key] = value
+        if email and "email" not in credentials:
+            credentials["email"] = email
+        if user_id and "user_id" not in credentials:
+            credentials["user_id"] = user_id
+
+        item: dict[str, Any] = {
+            "name": _text(account.get("name")) or email or f"Grok Build {index}",
+            "platform": "grok",
+            "type": "oauth",
+            "credentials": credentials,
+            "concurrency": 1,
+            "priority": 0,
+            "auto_pause_on_expired": True,
+        }
+        if group_ids is not None:
+            item["group_ids"] = list(group_ids)
+            item["confirm_mixed_channel_risk"] = True
+        result.append(item)
+    return result
+
+
+def normalize_sub2api_rfc3339(value: object) -> str:
+    """Normalize timestamps to the RFC3339 strings stored by Sub2API."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        timestamp = float(value)
+    else:
+        raw = _text(value)
+        if not raw:
+            return ""
+        try:
+            timestamp = float(raw)
+        except ValueError:
+            try:
+                parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            except ValueError:
+                return raw
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return (
+                parsed.astimezone(timezone.utc)
+                .replace(microsecond=0)
+                .isoformat()
+                .replace("+00:00", "Z")
+            )
+
+    if timestamp <= 0:
+        return ""
+    if timestamp > 10_000_000_000:
+        timestamp /= 1000
+    return (
+        datetime.fromtimestamp(timestamp, tz=timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
+def create_sub2api_accounts(
+    *,
+    base_url: str,
+    api_key: str,
+    accounts: list[dict[str, Any]],
+    timeout: int = 30,
+    idempotency_key: str = "",
+) -> dict[str, Any]:
+    """Create accounts through the Sub2API admin batch endpoint."""
+    normalized_base_url = str(base_url or "").strip().rstrip("/")
+    normalized_api_key = str(api_key or "").strip()
+    if not normalized_base_url:
+        raise ValueError("未配置 SUB2API_BASE_URL")
+    if not normalized_api_key:
+        raise ValueError("未配置 SUB2API_ADMIN_API_KEY")
+    if not accounts:
+        raise ValueError("没有可导入的 Sub2API 账号")
+
+    headers = {
+        "x-api-key": normalized_api_key,
+        "Content-Type": "application/json",
+    }
+    normalized_idempotency_key = str(idempotency_key or "").strip()
+    if normalized_idempotency_key:
+        headers["Idempotency-Key"] = normalized_idempotency_key
+
+    response = requests.post(
+        f"{normalized_base_url}/api/v1/admin/accounts/batch",
+        headers=headers,
+        json={"accounts": accounts},
+        timeout=timeout,
+    )
+    try:
+        payload = response.json()
+    except ValueError as error:
+        raise RuntimeError(f"Sub2API 返回了无效 JSON（HTTP {response.status_code}）") from error
+
+    if not response.ok:
+        message = _sub2api_response_message(payload) or f"HTTP {response.status_code}"
+        raise RuntimeError(f"Sub2API 请求失败：{message}")
+    if not isinstance(payload, dict):
+        raise RuntimeError("Sub2API 返回了无效批量导入结果")
+
+    code = payload.get("code")
+    if code not in (None, 0, "0"):
+        message = _sub2api_response_message(payload) or f"业务状态码 {code}"
+        raise RuntimeError(f"Sub2API 请求失败：{message}")
+
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    success = _non_negative_int(data.get("success"), "success")
+    failed = _non_negative_int(data.get("failed"), "failed")
+    results = data.get("results")
+    if not isinstance(results, list):
+        results = []
+    if success + failed != len(accounts):
+        raise RuntimeError("Sub2API 返回的成功和失败数量与提交账号数不一致")
+    return {"success": success, "failed": failed, "results": results}
+
+
+def _non_negative_int(value: Any, field: str) -> int:
+    try:
+        result = int(value)
+    except (TypeError, ValueError) as error:
+        raise RuntimeError(f"Sub2API 返回的 {field} 数量无效") from error
+    if result < 0:
+        raise RuntimeError(f"Sub2API 返回的 {field} 数量无效")
+    return result
+
+
+def _sub2api_response_message(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    message = payload.get("message") or payload.get("error")
+    if isinstance(message, dict):
+        message = message.get("message") or message.get("error")
+    return str(message or "").strip()
+
+
+def _text(value: object) -> str:
+    return str(value or "").strip()
 
 
 class Sub2ApiSink:
@@ -56,19 +279,13 @@ class Sub2ApiSink:
         if not self._buf:
             return
 
-        url = f"{self.base_url}/api/v1/admin/accounts/batch"
         try:
-            resp = requests.post(
-                url,
-                headers={
-                    "x-api-key": self.api_key,
-                    "Content-Type": "application/json",
-                },
-                json={"accounts": self._buf},
+            payload = create_sub2api_accounts(
+                base_url=self.base_url,
+                api_key=self.api_key,
+                accounts=self._buf,
                 timeout=self.timeout,
             )
-            resp.raise_for_status()
-            payload = resp.json()
             success = int(payload.get("success", 0))
             failed = int(payload.get("failed", 0))
             results = payload.get("results", []) or []

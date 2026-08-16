@@ -1,7 +1,7 @@
 """使用 xAI Device OAuth Flow 换取 Grok OAuth tokens。
 
 cockpit-tools 的 Grok refresh_token 获取流程走的是 xAI device flow，而不是
-PKCE loopback callback。这里复用注册完成后的同一个无痕浏览器登录态，打开
+PKCE loopback callback。这里复用注册完成后的同一个独立浏览器登录态，打开
 device 授权页并自动推进登录。xAI 最终 consent 必须用浏览器真实鼠标事件点击
 提交按钮，才能把按钮自身的 action 一起提交；直接调用 form.requestSubmit() 会得到
 Invalid action。授权完成后轮询 token endpoint 获取 OAuth tokens。
@@ -53,6 +53,8 @@ DEFAULT_INTERVAL_SECONDS = 5
 MAX_LOGIN_SECONDS = 30 * 60
 MAX_CONSECUTIVE_POLL_TRANSPORT_ERRORS = 3
 MAX_CONSECUTIVE_PAGE_ERRORS = 6
+DISCOVERY_TIMEOUT_SECONDS = 8
+DEVICE_CODE_TIMEOUT_SECONDS = 15
 
 
 class OAuthTerminalError(RuntimeError):
@@ -247,7 +249,10 @@ def exchange_sso_for_oauth_tokens(
     print("[OAuth Exchange] 开始使用 xAI Device Flow 换取 OAuth tokens...")
 
     try:
-        endpoints = _discover_oauth_endpoints(http_session=http_session)
+        endpoints = _discover_oauth_endpoints(
+            timeout=DISCOVERY_TIMEOUT_SECONDS,
+            http_session=http_session,
+        )
         device_endpoint = str(
             endpoints.get("device_authorization_endpoint") or DEVICE_AUTHORIZATION_ENDPOINT
         )
@@ -260,7 +265,22 @@ def exchange_sso_for_oauth_tokens(
             if stop_event and stop_event.is_set():
                 raise RuntimeError("任务已停止")
 
-            device_data = _request_device_code(device_endpoint, http_session=http_session)
+            print(f"[OAuth Exchange] 正在请求 Device Code: {device_endpoint}")
+            try:
+                device_data = _request_device_code(
+                    device_endpoint,
+                    timeout=DEVICE_CODE_TIMEOUT_SECONDS,
+                    http_session=http_session,
+                )
+            except requests.exceptions.Timeout as error:
+                raise RuntimeError(
+                    "xAI Device Code 请求超时，授权页不会打开；请检查本轮是否真正使用了可访问 "
+                    "auth.x.ai 的代理或出口"
+                ) from error
+            except requests.exceptions.RequestException as error:
+                raise RuntimeError(
+                    f"xAI Device Code 请求失败，授权页不会打开：{error}"
+                ) from error
             user_code = str(device_data["user_code"]).strip()
             verification_url = _verification_url(
                 device_data,
@@ -278,7 +298,10 @@ def exchange_sso_for_oauth_tokens(
                 maximum=MAX_LOGIN_SECONDS,
             )
 
-            print(f"[OAuth Exchange] Device Code 已生成 ({attempt}/{max_attempts})")
+            print(
+                f"[OAuth Exchange] Device Code 已生成 ({attempt}/{max_attempts})，"
+                f"User Code: {user_code}"
+            )
             print("[OAuth Exchange] 正在浏览器中打开授权页面")
             oauth_page, opened_new_tab = _open_oauth_url(session, verification_url)
             try:

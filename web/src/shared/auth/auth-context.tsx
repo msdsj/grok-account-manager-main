@@ -13,31 +13,45 @@ import {
 } from "@/shared/api/client";
 import { AuthContext, type AuthStatus } from "@/shared/auth/auth-state";
 
+const sessionRestoreRetryDelaysMs = [250, 750, 1_500];
+
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [admin, setAdmin] = useState<AdminDTO | null>(null);
   const [status, setStatus] = useState<AuthStatus>("restoring");
 
   const restoreSession = useCallback(async (): Promise<void> => {
     setStatus("restoring");
-    const refreshResult = await refreshAccessToken();
-    if (refreshResult === "invalid") {
-      setAdmin(null);
-      setStatus("anonymous");
-      return;
-    }
-    if (refreshResult === "unavailable") {
+    for (let attempt = 0; attempt <= sessionRestoreRetryDelaysMs.length; attempt += 1) {
+      const refreshResult = await refreshAccessToken();
+      if (refreshResult === "invalid") {
+        setAdmin(null);
+        setStatus("anonymous");
+        return;
+      }
+
+      if (refreshResult === "refreshed") {
+        try {
+          const value = await apiRequest("/api/admin/v1/me", { retryAuth: false }, decodeAdminDTO);
+          setAdmin(value);
+          setStatus("authenticated");
+          return;
+        } catch (error) {
+          setAccessToken(null);
+          setAdmin(null);
+          if (error instanceof ApiError && error.status === 401) {
+            setStatus("anonymous");
+            return;
+          }
+        }
+      }
+
+      if (attempt < sessionRestoreRetryDelaysMs.length) {
+        await new Promise<void>((resolve) => window.setTimeout(resolve, sessionRestoreRetryDelaysMs[attempt]));
+        continue;
+      }
+
       setStatus("unavailable");
       return;
-    }
-
-    try {
-      const value = await apiRequest("/api/admin/v1/me", { retryAuth: false }, decodeAdminDTO);
-      setAdmin(value);
-      setStatus("authenticated");
-    } catch (error) {
-      setAccessToken(null);
-      setAdmin(null);
-      setStatus(error instanceof ApiError && error.status === 401 ? "anonymous" : "unavailable");
     }
   }, []);
 

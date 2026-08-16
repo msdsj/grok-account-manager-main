@@ -489,9 +489,10 @@ class RelayManager:
             self.start()
         self._ensure_v2_client_key()
         web_accounts = _credentials_to_v2_web_accounts(credentials)
+        console_accounts = _credentials_to_v2_console_accounts(credentials)
         build_accounts = _credentials_to_v2_build_accounts(credentials)
-        if not web_accounts and not build_accounts:
-            raise ValueError("没有找到可同步的 Grok Web 或 Grok Build 凭据")
+        if not web_accounts and not console_accounts and not build_accounts:
+            raise ValueError("没有找到可同步的 Grok Web、Grok Console 或 Grok Build 凭据")
         results: dict[str, dict] = {}
         if web_accounts:
             document = {"provider": "grok_web", "accounts": web_accounts}
@@ -500,13 +501,28 @@ class RelayManager:
                 "grok-account-manager-web.json",
                 document,
             )
+        if console_accounts:
+            document = {"provider": "grok_console", "accounts": console_accounts}
+            results["console"] = self._v2_upload_accounts(
+                "/api/admin/v1/accounts/console/import",
+                "grok-account-manager-console.json",
+                document,
+            )
         if build_accounts:
             results["build"] = self._v2_upload_accounts(
                 "/api/admin/v1/accounts/import",
                 "grok-account-manager-build.json",
                 {"accounts": build_accounts},
             )
-        return {"requested": len(web_accounts) + len(build_accounts), "result": results}
+        return {
+            "requested": len(web_accounts) + len(console_accounts) + len(build_accounts),
+            "result": results,
+            "counts": {
+                "web": len(web_accounts),
+                "console": len(console_accounts),
+                "build": len(build_accounts),
+            },
+        }
 
     def _v2_upload_accounts(self, path: str, filename: str, document: dict) -> dict:
         response = requests.post(
@@ -700,6 +716,30 @@ def _credentials_to_v2_web_accounts(credentials: list[dict]) -> list[dict[str, s
             account["cloudflare_cookies"] = cookies
         accounts.append(account)
 
+    return accounts
+
+
+def _credentials_to_v2_console_accounts(credentials: list[dict]) -> list[dict[str, str]]:
+    """Convert browser SSO credentials for the separate Console account pool."""
+    accounts: list[dict[str, str]] = []
+    seen_tokens: set[str] = set()
+    for item in credentials:
+        if not isinstance(item, dict):
+            continue
+        token = _credential_to_token(item)
+        if not token or token in seen_tokens:
+            continue
+        seen_tokens.add(token)
+        account = {
+            "name": str(item.get("display_name") or item.get("email") or f"Grok Console {len(accounts) + 1}"),
+            "email": str(item.get("email") or ""),
+            "user_id": str(item.get("user_id") or ""),
+            "sso_token": token,
+        }
+        cookies = str(item.get("grok_cf_cookies") or item.get("cloudflare_cookies") or "").strip()
+        if cookies:
+            account["cloudflare_cookies"] = cookies
+        accounts.append(account)
     return accounts
 
 

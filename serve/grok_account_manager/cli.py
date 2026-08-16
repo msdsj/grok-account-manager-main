@@ -22,12 +22,13 @@ from .core.proxy_pool import (
     ProxyPool,
     ProxyPoolError,
     ProxyPoolExhaustedError,
+    get_fixed_egress_proxy,
     load_proxy_file,
     mask_proxy_server,
 )
 from .api.services.registration_proxy_pool import load_saved_registration_proxies
 from .sinks.base import Sink
-from .sinks.sub2api import Sub2ApiSink
+from .sinks.sub2api import Sub2ApiSink, parse_sub2api_group_ids
 from .sinks.txt_file import TxtFileSink
 from .sinks.json_credential import JsonCredentialSink
 
@@ -74,7 +75,7 @@ def _make_sink(args: argparse.Namespace) -> Sink:
             base_url = os.environ.get("SUB2API_BASE_URL", "")
             api_key = os.environ.get("SUB2API_ADMIN_API_KEY", "")
             groups_raw = os.environ.get("SUB2API_DEFAULT_GROUP_IDS", "")
-            group_ids = [int(x) for x in groups_raw.split(",") if x.strip()]
+            group_ids = parse_sub2api_group_ids(groups_raw)
             sinks.append(
                 Sub2ApiSink(
                     base_url=base_url,
@@ -175,9 +176,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--email-source",
-        choices=["duckmail", "outlook", "gmail", "google"],
+        choices=["duckmail", "outlook", "gmail", "google", "cloud_mail"],
         default=os.environ.get("GROK_ACCOUNT_MANAGER_EMAIL_SOURCE", "duckmail"),
-        help="邮箱来源：duckmail、outlook、gmail 或 google；google 表示走 Google 账号注册按钮",
+        help="邮箱来源：duckmail、outlook、gmail、google 或 cloud_mail；google 表示走 Google 账号注册按钮",
     )
     parser.add_argument(
         "--outlook-accounts-file",
@@ -198,6 +199,31 @@ def main() -> None:
         "--google-accounts",
         default=os.environ.get("GOOGLE_ACCOUNTS", ""),
         help="Google 账号池原文，支持多行；gmail 模式建议填 邮箱----应用专用密码",
+    )
+    parser.add_argument(
+        "--cloud-mail-api-base",
+        default=os.environ.get("CLOUD_MAIL_API_BASE", ""),
+        help="Cloud Mail 站点地址，例如 https://mail.example.com",
+    )
+    parser.add_argument(
+        "--cloud-mail-public-token",
+        default=os.environ.get("CLOUD_MAIL_PUBLIC_TOKEN", ""),
+        help="Cloud Mail Public Token；未配置时使用登录邮箱和密码",
+    )
+    parser.add_argument(
+        "--cloud-mail-login-email",
+        default=os.environ.get("CLOUD_MAIL_LOGIN_EMAIL", ""),
+        help="Cloud Mail 登录邮箱",
+    )
+    parser.add_argument(
+        "--cloud-mail-login-password",
+        default=os.environ.get("CLOUD_MAIL_LOGIN_PASSWORD", ""),
+        help="Cloud Mail 登录密码",
+    )
+    parser.add_argument(
+        "--cloud-mail-domains",
+        default=os.environ.get("CLOUD_MAIL_DOMAINS", ""),
+        help="Cloud Mail 邮箱域名，多个域名使用逗号或换行分隔",
     )
     args = parser.parse_args()
 
@@ -231,16 +257,22 @@ def main() -> None:
         outlook_file=args.outlook_accounts_file,
         google_data=args.google_accounts,
         google_file=args.google_accounts_file,
+        cloud_mail_api_base=args.cloud_mail_api_base,
+        cloud_mail_public_token=args.cloud_mail_public_token,
+        cloud_mail_login_email=args.cloud_mail_login_email,
+        cloud_mail_login_password=args.cloud_mail_login_password,
+        cloud_mail_domains=args.cloud_mail_domains,
     )
     sink = _make_sink(args)
 
-    initial_proxy = proxy_pool.acquire() if proxy_pool is not None else None
+    initial_proxy = proxy_pool.acquire() if proxy_pool is not None else get_fixed_egress_proxy()
     if initial_proxy:
         print(f"[*] 首轮使用代理 {mask_proxy_server(initial_proxy)}")
 
-    if proxy_pool is not None:
+    fixed_egress_proxy = get_fixed_egress_proxy()
+    if proxy_pool is not None or fixed_egress_proxy:
         def restart_with_fresh_proxy(active_session: DrissionBrowserSession) -> None:
-            retry_proxy = proxy_pool.acquire()
+            retry_proxy = proxy_pool.acquire() if proxy_pool is not None else fixed_egress_proxy
             print(f"[*] 本轮重试使用代理 {mask_proxy_server(retry_proxy)}")
             active_session.restart(proxy_url=retry_proxy)
 
@@ -282,10 +314,10 @@ def main() -> None:
                 is_last = target_count > 0 and rounds_done >= target_count
                 if not is_last:
                     try:
-                        next_proxy = proxy_pool.acquire() if proxy_pool is not None else None
+                        next_proxy = proxy_pool.acquire() if proxy_pool is not None else fixed_egress_proxy
                         if next_proxy:
                             print(f"[*] 下一轮使用代理 {mask_proxy_server(next_proxy)}")
-                        if proxy_pool is not None:
+                        if proxy_pool is not None or fixed_egress_proxy:
                             session.restart(proxy_url=next_proxy)
                         else:
                             session.restart()

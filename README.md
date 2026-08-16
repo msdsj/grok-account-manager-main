@@ -1,14 +1,16 @@
 # grok-account-manager
  
-MSDSJ 的 Grok 账号注册与凭证管理工具。项目提供 Python 自动化注册流程和 React 本地控制台，支持 DuckMail 域名邮箱、Outlook 账号池接码、GrokAccount JSON 凭证归档，以及可选推送到外部 Sub2API 实例。
+Grok 账号注册与凭证管理工具。项目提供 Python 自动化注册流程和 React 本地控制台，支持 DuckMail、Cloud Mail、Outlook/Google 邮箱接码、GrokAccount JSON 凭证归档，以及可选推送到外部 Sub2API 实例。
 
-本项目允许免费使用、学习和二次开发。请勿把 `.env`、Outlook refresh token、浏览器 cookie、SSO token 或 `output/` 里的凭证提交到 GitHub。
+本项目允许免费使用、学习和二次开发。请勿把 `.env`、邮箱服务 Token/密码、Outlook refresh token、浏览器 cookie、SSO token 或 `output/` 里的凭证提交到 GitHub。
 
 ## 文档
 
 - [完整部署、运行与使用指南](docs/deployment-and-usage.md)：环境准备、CLI、控制台、代理池、本地中转、更新与排错。
+- [快速使用教程](docs/getting-started.md)：从安装到启动前后端、运行注册任务和提交前安全检查。
 - [更新日志](CHANGELOG.md)：按日期整理的功能变更。
 - [DuckMail 邮箱源](docs/duckmail.md)
+- [Cloud Mail 邮箱源](docs/cloud-mail.md)
 - [Outlook 邮箱池](docs/outlook-mailbox-pool.md)
 - [Grok OAuth Flow](docs/grok-oauth-flow.md)
 
@@ -28,7 +30,7 @@ GitHub：<https://github.com/msdsj/grok-account-manager-main>
 ## 功能
 
 - Grok 邮箱注册自动化，注册资料姓名和密码每轮随机生成。
-- 邮箱源支持 DuckMail、Outlook、Gmail/Google 账号池，`----` 和 `|` 两种分隔格式都兼容。
+- 邮箱源支持 DuckMail、Cloud Mail、Outlook、Gmail/Google；账号池兼容 `----` 和 `|` 两种分隔格式。
 - 可选注册代理池：每个注册浏览器随机领取一个未使用端点，下一轮重启浏览器时切换到新的端点。
 - 注册页、浏览器启动和 OAuth 短暂网络错误都有有界重试，任务停止后不会继续拉起浏览器。
 - 输出 cockpit-tools 可导入的 GrokAccount JSON 数组，并同步写入本地账号数据库。
@@ -51,7 +53,7 @@ uv sync
 cp .env.example .env
 ```
 
-编辑 `.env`，至少配置 DuckMail：
+编辑 `.env`，选择并配置一种邮箱源。默认 DuckMail 示例：
 
 ```bash
 DUCKMAIL_API_KEY=your_duckmail_api_key
@@ -110,6 +112,42 @@ uv run grok-account-manager grok --count 1 --no-proxy --sink json
 ```
 
 每个代理端点是否对应独立公网出口由代理服务本身决定；程序按端点分配，并在浏览器进程重启时应用新的网络设置。
+
+## Cloud Mail 邮箱源
+
+支持 maillab/cloud-mail 兼容 API。每轮会创建一个随机邮箱，并通过 Public Token 或站点账号登录读取该地址的新邮件。API 地址末尾可以包含 `/api`，多个域名使用逗号或换行分隔。
+
+Public Token 配置：
+
+```dotenv
+GROK_ACCOUNT_MANAGER_EMAIL_SOURCE=cloud_mail
+CLOUD_MAIL_API_BASE=https://mail.example.com
+CLOUD_MAIL_DOMAINS=example.com,example.net
+CLOUD_MAIL_PUBLIC_TOKEN=replace-with-public-token
+```
+
+账号登录配置：
+
+```dotenv
+GROK_ACCOUNT_MANAGER_EMAIL_SOURCE=cloud_mail
+CLOUD_MAIL_API_BASE=https://mail.example.com/api
+CLOUD_MAIL_DOMAINS=example.com
+CLOUD_MAIL_LOGIN_EMAIL=admin@example.com
+CLOUD_MAIL_LOGIN_PASSWORD=replace-with-password
+```
+
+CLI 也可以直接传入同名参数：
+
+```bash
+uv run grok-account-manager grok --count 1 \
+  --email-source cloud_mail \
+  --cloud-mail-api-base https://mail.example.com \
+  --cloud-mail-domains example.com \
+  --cloud-mail-public-token replace-with-public-token \
+  --sink json
+```
+
+完整协议、认证方式和安全说明见 [Cloud Mail 邮箱源](docs/cloud-mail.md)。
 
 ## Outlook 邮箱源
 
@@ -170,7 +208,7 @@ npm install
 npm run dev
 ```
 
-打开 `http://127.0.0.1:5173`。前端开发服务器会把 `/api`、`/v1` 和 `/admin/api` 代理到 FastAPI 后端。
+打开 `http://127.0.0.1:43188`。前端开发服务器会把 `/api`、`/v1`、`/healthz` 和 `/readyz` 代理到 FastAPI 后端。
 
 并发注册时每个 worker 使用独立临时 Chrome profile、独立调试端口和独立的稳定浏览器指纹，窗口会错峰启动。注册页面可按所选并发数同时运行；为降低同一出口 IP 对 xAI Device OAuth 的突发限速，`refresh_token` 阶段默认最多同时运行 2 个窗口，其余窗口会在各自浏览器中排队：
 
@@ -191,7 +229,7 @@ cd ..
 uv run grok-account-manager-api
 ```
 
-然后打开 `http://127.0.0.1:8765`。旧命令 `uv run grok-account-manager-web` 仍然可用，内部指向同一个 FastAPI 入口。
+然后打开 `http://127.0.0.1:43187`。旧命令 `uv run grok-account-manager-web` 仍然可用，内部指向同一个 FastAPI 入口。
 
 ## 输出文件
 
@@ -242,8 +280,9 @@ serve/grok_account_manager/
     services/             # 任务调度、账号数据库、中转站进程管理
   cli.py                  # CLI 参数解析和轮次调度
   core/browser.py         # Chromium 启停、扩展加载、cookie 等待
+  mail/cloud_mail.py      # Cloud Mail 创建邮箱与接码
   mail/duckmail.py        # DuckMail 接码
-  mail/sources.py         # DuckMail / Outlook / Gmail / Google 邮箱源
+  mail/sources.py         # 邮箱源工厂及 Outlook / Gmail / Google 实现
   grok/client.py          # GrokAccount JSON 构建与额度 API
   grok/oauth_exchange.py  # xAI OAuth Device Flow
   providers/grok.py       # Grok 注册页面自动化
@@ -271,4 +310,4 @@ cd web && npm run build
 - [Sub2API](https://github.com/Wei-Shaw/sub2api)：可选的账号下游管理 API，本项目仅通过其 Admin API 写入账号。
 - Turnstile MouseEvent patch 思路来自仓库内 `extensions/turnstile_patch/` 所保留的扩展说明。
 
-本项目与 xAI、Grok、Microsoft、Outlook、DuckMail、cockpit-tools、Kiro-account-manager、Sub2API 官方均无隶属关系。使用者需要自行遵守相关服务条款、当地法律和开源许可证要求。
+本项目与 xAI、Grok、Microsoft、Outlook、DuckMail、Cloud Mail、cockpit-tools、Kiro-account-manager、Sub2API 官方均无隶属关系。使用者需要自行遵守相关服务条款、当地法律和开源许可证要求。

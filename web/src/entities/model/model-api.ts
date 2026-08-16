@@ -21,7 +21,7 @@ const modelRouteValidator = hasShape({
   publicId: isString,
   provider: isOneOf("grok_build", "grok_web", "grok_console"),
   upstreamModel: isString,
-  capability: isOneOf("responses", "chat", "image", "image_edit", "video"),
+  capability: isOneOf("responses", "chat", "image", "image_edit", "video", "stt", "tts", "realtime"),
   origin: isOneOf("catalog", "discovered", "manual"),
   enabled: isBoolean,
   accountIds: isArrayOf(isString),
@@ -35,7 +35,7 @@ const modelRouteValidator = hasShape({
 });
 const decodeModelRoute = createObjectDecoder<ModelRouteDTO>("model route", {
   id: isString, publicId: isString, provider: isOneOf("grok_build", "grok_web", "grok_console"), upstreamModel: isString,
-  capability: isOneOf("responses", "chat", "image", "image_edit", "video"), origin: isOneOf("catalog", "discovered", "manual"),
+  capability: isOneOf("responses", "chat", "image", "image_edit", "video", "stt", "tts", "realtime"), origin: isOneOf("catalog", "discovered", "manual"),
   enabled: isBoolean, accountIds: isArrayOf(isString), bindingMode: isBoolean, supportedAccounts: isNumber,
   syncedAccounts: isNumber, totalAccounts: isNumber, capabilityKnown: isBoolean, available: isBoolean, lastSyncedAt: isOptional(isString),
 });

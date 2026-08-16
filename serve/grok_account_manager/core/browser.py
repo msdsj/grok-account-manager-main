@@ -88,7 +88,7 @@ def _validate_browser_isolation(
     if command_proxy != (expected_proxy_server or ""):
         problems.append("Chrome 主进程未使用本轮指定代理")
     if "--incognito" not in browser_command:
-        problems.append("Chrome 主进程未启用独立无痕上下文")
+        problems.append("Chrome 主进程未启用无痕模式")
     if browser_pid <= 0:
         problems.append("无法取得 Chrome 主进程 PID")
 
@@ -377,7 +377,7 @@ def build_chromium_options(
         co.headless(True)
         print("[警告] 已启用 headless 模式，Turnstile 验证可能失败")
     else:
-        print("[*] 使用可见无痕浏览器模式（推荐）")
+        print("[*] 使用可见无痕浏览器模式（每轮独立临时 Profile）")
 
     # 启动参数先给出位置，启动后 BrowserSession 会再通过 CDP 强制应用一次。
     left, top, window_width, window_height = calculate_window_bounds(
@@ -409,9 +409,6 @@ def build_chromium_options(
         "--disable-default-apps",
         "--disable-sync",
         "--metrics-recording-only",
-        # Blink 在被 CDP 驱动时默认把 navigator.webdriver 置为 true，这是最常见的
-        # 反爬信号之一；这个 flag 从根上关掉它，而不是靠页面里再打补丁去掩盖。
-        "--disable-blink-features=AutomationControlled",
         f"--disable-features={','.join(disabled_features)}",
     ]:
         co.set_argument(argument)
@@ -987,7 +984,7 @@ class DrissionBrowserSession:
                 time.sleep(0.4)
                 continue
 
-            # Chromium 在 --incognito 下由现有 tab 执行 window.open，才能保证新页与
+            # Chromium 在 --incognito 下由现有 tab 执行 window.open，保证新页与
             # 注册页位于同一个浏览器上下文并共享刚取得的 sso cookie。
             for source in tabs:
                 try:

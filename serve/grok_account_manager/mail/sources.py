@@ -16,6 +16,7 @@ from typing import Callable, Protocol
 
 import requests
 
+from .cloud_mail import CloudMailSource
 from .duckmail import extract_verification_code, get_email_and_token, get_oai_code
 
 MICROSOFT_CONSUMERS_TOKEN_URL = "https://login.microsoftonline.com/consumers/oauth2/v2.0/token"
@@ -616,6 +617,11 @@ def build_mailbox_source(
     outlook_file: str = "",
     google_data: str = "",
     google_file: str = "",
+    cloud_mail_api_base: str = "",
+    cloud_mail_public_token: str = "",
+    cloud_mail_login_email: str = "",
+    cloud_mail_login_password: str = "",
+    cloud_mail_domains: str = "",
 ) -> MailboxSource:
     source = (email_source or "duckmail").strip().lower()
     if source == "duckmail":
@@ -628,6 +634,14 @@ def build_mailbox_source(
         data = load_google_accounts_data(google_data, google_file)
         accounts = parse_google_accounts(data)
         return GoogleAccountPool(accounts, name=source)
+    if source == "cloud_mail":
+        return CloudMailSource(
+            api_base=cloud_mail_api_base,
+            public_token=cloud_mail_public_token,
+            login_email=cloud_mail_login_email,
+            login_password=cloud_mail_login_password,
+            domains=cloud_mail_domains,
+        )
     raise ValueError(f"未知邮箱源: {email_source}")
 
 

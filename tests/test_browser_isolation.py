@@ -63,6 +63,12 @@ class BrowserIsolationTests(unittest.TestCase):
         self.assertIn("--start-minimized", options.arguments)
         self.assertTrue(options._grok_start_minimized)
 
+    def test_browser_uses_incognito_profile_context(self) -> None:
+        options = build_chromium_options()
+
+        self.assertIn("--incognito", options.arguments)
+        self.assertNotIn("--disable-blink-features=AutomationControlled", options.arguments)
+
     def test_window_can_be_minimized_and_restored_to_assigned_bounds(self) -> None:
         options = ChromiumOptions()
         options._grok_window_bounds = (10, 20, 800, 600)

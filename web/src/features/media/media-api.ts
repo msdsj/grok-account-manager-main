@@ -3,6 +3,7 @@ import { apiRequest, type PaginatedDTO } from "@/shared/api/client";
 import {
   createObjectDecoder,
   createPaginatedDecoder,
+  createValidatedDecoder,
   decodeCountResult,
   hasShape,
   isNumber,
@@ -96,4 +97,31 @@ export function getVideoStats(): Promise<VideoStatsDTO> {
 
 export function deleteVideos(ids: string[]): Promise<{ deleted: number }> {
   return apiRequest("/api/admin/v1/media/videos", { method: "DELETE", body: { ids } }, decodeCountResult<{ deleted: number }>("deleted"));
+}
+
+// Temporary inputs stay out of the gallery and only expose a short-lived file ID.
+export type MediaInputDTO = {
+  fileId: string;
+  kind: string;
+  mimeType: string;
+  sizeBytes: number;
+  expiresAt: string;
+};
+
+const decodeMediaInput = createValidatedDecoder<MediaInputDTO>("media input", hasShape({
+  fileId: isString,
+  kind: isString,
+  mimeType: isString,
+  sizeBytes: isNumber,
+  expiresAt: isString,
+}));
+
+export function importVideoInputFromURL(url: string): Promise<MediaInputDTO> {
+  return apiRequest("/api/admin/v1/media/inputs/import", { method: "POST", body: { url } }, decodeMediaInput);
+}
+
+export function uploadMediaInput(file: File): Promise<MediaInputDTO> {
+  const body = new FormData();
+  body.append("file", file, file.name);
+  return apiRequest("/api/admin/v1/media/inputs/upload", { method: "POST", body }, decodeMediaInput);
 }

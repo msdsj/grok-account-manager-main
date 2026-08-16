@@ -12,6 +12,7 @@ import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { DashboardPanel } from "@/features/dashboard/dashboard-panel";
 import {
@@ -31,10 +32,11 @@ import {
   type JobStatus,
 } from "@/features/register-task/register-task-api";
 
-const EMAIL_SOURCES: EmailSource[] = ["duckmail", "outlook", "google"];
+const EMAIL_SOURCES: EmailSource[] = ["duckmail", "cloud_mail", "outlook", "google"];
 
 const EMAIL_SOURCE_I18N_KEY: Record<EmailSource, string> = {
   duckmail: "registerTask.emailSourceDuckmail",
+  cloud_mail: "registerTask.emailSourceCloudMail",
   outlook: "registerTask.emailSourceOutlook",
   google: "registerTask.emailSourceGoogle",
 };
@@ -61,6 +63,7 @@ export function RegisterTaskPage() {
   const [concurrency, setConcurrency] = useState(1);
   const [emailSource, setEmailSource] = useState<EmailSource>("duckmail");
   const [oauthExchange, setOauthExchange] = useState(true);
+  const [autoImportSub2Api, setAutoImportSub2Api] = useState(false);
   const [minimizeBrowsers, setMinimizeBrowsers] = useState(true);
   // Undefined keeps the backend's automatic discovery behavior: use the
   // default file or saved nodes when present, otherwise stay on direct mode.
@@ -71,6 +74,12 @@ export function RegisterTaskPage() {
   const [proxyReplace, setProxyReplace] = useState(false);
   const [outlookData, setOutlookData] = useState("");
   const [googleData, setGoogleData] = useState("");
+  const [cloudMailApiBase, setCloudMailApiBase] = useState("");
+  const [cloudMailDomains, setCloudMailDomains] = useState("");
+  const [cloudMailAuthMode, setCloudMailAuthMode] = useState<"public" | "login">("public");
+  const [cloudMailPublicToken, setCloudMailPublicToken] = useState("");
+  const [cloudMailLoginEmail, setCloudMailLoginEmail] = useState("");
+  const [cloudMailLoginPassword, setCloudMailLoginPassword] = useState("");
   const loadedOutlookPool = useRef(false);
 
   const jobQuery = useQuery({
@@ -113,10 +122,16 @@ export function RegisterTaskPage() {
         total,
         concurrency,
         oauthExchange,
+        autoImportSub2Api,
         minimizeBrowsers,
         emailSource,
         outlookData: emailSource === "outlook" ? outlookData : "",
         googleData: emailSource === "google" ? googleData : "",
+        cloudMailApiBase: emailSource === "cloud_mail" ? cloudMailApiBase : "",
+        cloudMailDomains: emailSource === "cloud_mail" ? cloudMailDomains : "",
+        cloudMailPublicToken: emailSource === "cloud_mail" && cloudMailAuthMode === "public" ? cloudMailPublicToken : "",
+        cloudMailLoginEmail: emailSource === "cloud_mail" && cloudMailAuthMode === "login" ? cloudMailLoginEmail : "",
+        cloudMailLoginPassword: emailSource === "cloud_mail" && cloudMailAuthMode === "login" ? cloudMailLoginPassword : "",
         proxyPoolEnabled,
         proxyFile,
       }),
@@ -202,11 +217,20 @@ export function RegisterTaskPage() {
   const events = job?.events?.slice().reverse().slice(0, 50) ?? [];
   const outlookAccountCount = countOutlookAccounts(outlookData);
   const googleAccountCount = countGoogleAccounts(googleData);
+  const cloudMailReady = Boolean(
+    cloudMailApiBase.trim()
+    && cloudMailDomains.trim()
+    && (
+      (cloudMailAuthMode === "public" && cloudMailPublicToken.trim())
+      || (cloudMailAuthMode === "login" && cloudMailLoginEmail.trim() && cloudMailLoginPassword.trim())
+    ),
+  );
   const startDisabled =
     running
     || startMutation.isPending
     || (emailSource === "outlook" && outlookAccountCount === 0)
-    || (emailSource === "google" && googleAccountCount === 0);
+    || (emailSource === "google" && googleAccountCount === 0)
+    || (emailSource === "cloud_mail" && !cloudMailReady);
 
   return (
     <div className="space-y-5">
@@ -311,6 +335,80 @@ export function RegisterTaskPage() {
                 </p>
               </div>
             ) : null}
+            {emailSource === "cloud_mail" ? (
+              <div className="space-y-3 border-y py-3">
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <div className="space-y-1.5">
+                    <Label htmlFor="reg-cloud-mail-api">{t("registerTask.cloudMailApiBaseLabel")}</Label>
+                    <Input
+                      id="reg-cloud-mail-api"
+                      value={cloudMailApiBase}
+                      disabled={running}
+                      placeholder={t("registerTask.cloudMailApiBasePlaceholder")}
+                      onChange={(event) => setCloudMailApiBase(event.target.value)}
+                    />
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label htmlFor="reg-cloud-mail-domains">{t("registerTask.cloudMailDomainsLabel")}</Label>
+                    <Input
+                      id="reg-cloud-mail-domains"
+                      value={cloudMailDomains}
+                      disabled={running}
+                      placeholder={t("registerTask.cloudMailDomainsPlaceholder")}
+                      onChange={(event) => setCloudMailDomains(event.target.value)}
+                    />
+                  </div>
+                </div>
+                <div className="space-y-2">
+                  <Label>{t("registerTask.cloudMailAuthModeLabel")}</Label>
+                  <Tabs value={cloudMailAuthMode} onValueChange={(value) => setCloudMailAuthMode(value as "public" | "login")}>
+                    <TabsList>
+                      <TabsTrigger value="public" disabled={running}>{t("registerTask.cloudMailAuthPublic")}</TabsTrigger>
+                      <TabsTrigger value="login" disabled={running}>{t("registerTask.cloudMailAuthLogin")}</TabsTrigger>
+                    </TabsList>
+                  </Tabs>
+                </div>
+                {cloudMailAuthMode === "public" ? (
+                  <div className="space-y-1.5">
+                    <Label htmlFor="reg-cloud-mail-token">{t("registerTask.cloudMailPublicTokenLabel")}</Label>
+                    <Input
+                      id="reg-cloud-mail-token"
+                      type="password"
+                      autoComplete="off"
+                      value={cloudMailPublicToken}
+                      disabled={running}
+                      onChange={(event) => setCloudMailPublicToken(event.target.value)}
+                    />
+                  </div>
+                ) : (
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <div className="space-y-1.5">
+                      <Label htmlFor="reg-cloud-mail-email">{t("registerTask.cloudMailLoginEmailLabel")}</Label>
+                      <Input
+                        id="reg-cloud-mail-email"
+                        type="email"
+                        autoComplete="username"
+                        value={cloudMailLoginEmail}
+                        disabled={running}
+                        onChange={(event) => setCloudMailLoginEmail(event.target.value)}
+                      />
+                    </div>
+                    <div className="space-y-1.5">
+                      <Label htmlFor="reg-cloud-mail-password">{t("registerTask.cloudMailLoginPasswordLabel")}</Label>
+                      <Input
+                        id="reg-cloud-mail-password"
+                        type="password"
+                        autoComplete="current-password"
+                        value={cloudMailLoginPassword}
+                        disabled={running}
+                        onChange={(event) => setCloudMailLoginPassword(event.target.value)}
+                      />
+                    </div>
+                  </div>
+                )}
+                <p className="text-xs text-muted-foreground">{t("registerTask.cloudMailHelp")}</p>
+              </div>
+            ) : null}
             <div className="space-y-1.5">
               <div className="flex items-center justify-between">
                 <Label htmlFor="reg-proxy-pool">{t("registerTask.proxyPoolLabel")}</Label>
@@ -340,7 +438,24 @@ export function RegisterTaskPage() {
             </div>
             <div className="flex items-center justify-between">
               <Label htmlFor="reg-oauth">{t("registerTask.oauthExchangeLabel")}</Label>
-              <Switch id="reg-oauth" checked={oauthExchange} disabled={running} onCheckedChange={setOauthExchange} />
+              <Switch
+                id="reg-oauth"
+                checked={oauthExchange}
+                disabled={running}
+                onCheckedChange={(checked) => {
+                  setOauthExchange(checked);
+                  if (!checked) setAutoImportSub2Api(false);
+                }}
+              />
+            </div>
+            <div className="flex items-center justify-between">
+              <Label htmlFor="reg-sub2api">{t("registerTask.autoImportSub2ApiLabel")}</Label>
+              <Switch
+                id="reg-sub2api"
+                checked={autoImportSub2Api}
+                disabled={running || !oauthExchange}
+                onCheckedChange={setAutoImportSub2Api}
+              />
             </div>
             <div className="flex items-center justify-between">
               <Label htmlFor="reg-minimize">{t("registerTask.minimizeBrowsersLabel")}</Label>
@@ -371,9 +486,12 @@ export function RegisterTaskPage() {
           {job ? (
             <div className="space-y-3 text-sm">
               <div className="text-muted-foreground">{t("registerTask.progress", { completed: job.completed, total: job.total })}</div>
-              <div className="flex gap-4 text-muted-foreground">
+              <div className="flex flex-wrap gap-x-4 gap-y-1 text-muted-foreground">
                 <span>{t("registerTask.succeeded", { count: job.registered })}</span>
                 <span>{t("registerTask.failed", { count: job.failed })}</span>
+                {job.autoImportSub2Api ? (
+                  <span>{t("registerTask.sub2ApiProgress", { succeeded: job.sub2ApiImported, failed: job.sub2ApiImportFailed })}</span>
+                ) : null}
               </div>
               {job.proxyPoolEnabled ? (
                 <div className="text-xs text-muted-foreground">

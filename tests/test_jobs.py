@@ -297,6 +297,7 @@ class RegistrationJobManagerTests(unittest.TestCase):
         manager = self._manager()
         manager._last_config = {
             "oauth_exchange": True,
+            "auto_import_sub2api": True,
             "minimize_browsers": False,
             "email_source": "duckmail",
         }
@@ -305,6 +306,98 @@ class RegistrationJobManagerTests(unittest.TestCase):
             manager.retry()
 
         self.assertFalse(start.call_args.kwargs["minimize_browsers"])
+        self.assertTrue(start.call_args.kwargs["auto_import_sub2api"])
+
+    def test_auto_import_requires_oauth(self) -> None:
+        manager = self._manager()
+
+        with self.assertRaisesRegex(ValueError, "需要开启 refresh_token"):
+            manager.start(
+                total=1,
+                concurrency=1,
+                oauth_exchange=False,
+                auto_import_sub2api=True,
+                email_source="duckmail",
+            )
+
+    def test_auto_imports_finalized_oauth_account(self) -> None:
+        manager = self._manager()
+        manager._job = {
+            "id": "job-1",
+            "autoImportSub2Api": True,
+            "sub2ApiImported": 0,
+            "sub2ApiImportFailed": 0,
+            "workers": [{"worker": 1}],
+            "events": [],
+            "failedAccounts": [],
+        }
+        manager._sub2api_config = ("https://fast.example.test", "admin-key", [9])
+        result = {
+            "email": "ready@example.com",
+            "full_credential": {
+                "email": "ready@example.com",
+                "access_token": "access",
+                "refresh_token": "refresh",
+            },
+        }
+
+        with patch(
+            "grok_account_manager.api.services.jobs.create_sub2api_accounts",
+            return_value={"success": 1, "failed": 0, "results": []},
+        ) as create:
+            imported = manager._auto_import_sub2api_result(
+                result,
+                worker_index=1,
+                round_index=3,
+            )
+
+        self.assertTrue(imported)
+        self.assertEqual(manager._job["sub2ApiImported"], 1)
+        self.assertEqual(manager._job["sub2ApiImportFailed"], 0)
+        account = create.call_args.kwargs["accounts"][0]
+        self.assertEqual(account["type"], "oauth")
+        self.assertEqual(account["group_ids"], [9])
+        self.assertEqual(
+            create.call_args.kwargs["idempotency_key"],
+            "grok-account-manager-job-1-3",
+        )
+
+    def test_auto_import_failure_is_recorded_without_raising(self) -> None:
+        manager = self._manager()
+        manager._job = {
+            "id": "job-2",
+            "autoImportSub2Api": True,
+            "sub2ApiImported": 0,
+            "sub2ApiImportFailed": 0,
+            "workers": [{"worker": 1}],
+            "events": [],
+            "failedAccounts": [],
+        }
+        manager._sub2api_config = ("https://fast.example.test", "admin-key", [9])
+        result = {
+            "email": "ready@example.com",
+            "full_credential": {
+                "email": "ready@example.com",
+                "access_token": "access",
+                "refresh_token": "refresh",
+            },
+        }
+
+        with patch(
+            "grok_account_manager.api.services.jobs.create_sub2api_accounts",
+            side_effect=RuntimeError("duplicate account"),
+        ):
+            imported = manager._auto_import_sub2api_result(
+                result,
+                worker_index=1,
+                round_index=4,
+            )
+
+        self.assertFalse(imported)
+        self.assertEqual(manager._job["sub2ApiImported"], 0)
+        self.assertEqual(manager._job["sub2ApiImportFailed"], 1)
+        self.assertEqual(manager._job["failedAccounts"][0]["stage"], "sub2api_import")
+        self.assertIn("duplicate account", manager._job["events"][-1]["message"])
 
     def test_round_timeout_requests_cooperative_stop(self) -> None:
         manager = self._manager()

@@ -87,6 +87,7 @@ export async function generateImage(input: {
   count: number;
   aspectRatio: string;
   resolution: string;
+  quality?: "low" | "medium";
   signal?: AbortSignal;
 }): Promise<ImageResult[]> {
   const payload = await publicApiRequest(
@@ -100,6 +101,7 @@ export async function generateImage(input: {
         n: input.count,
         aspect_ratio: input.aspectRatio,
         resolution: input.resolution,
+        ...(input.quality ? { quality: input.quality } : {}),
         response_format: "url",
         stream: false,
       },
@@ -116,6 +118,9 @@ export async function createVideo(input: {
   model: string;
   prompt: string;
   imageURL?: string;
+  imageFileID?: string;
+  referenceImages?: Array<{ url?: string; fileId?: string }>;
+  referenceVoiceIds?: string[];
   duration: number;
   aspectRatio: string;
   resolution: string;
@@ -128,7 +133,14 @@ export async function createVideo(input: {
     aspect_ratio: input.aspectRatio,
     resolution: input.resolution,
   };
-  if (input.imageURL) body.image = { url: input.imageURL };
+  if (input.imageFileID) body.image = { file_id: input.imageFileID };
+  else if (input.imageURL) body.image = { url: input.imageURL };
+  if (input.referenceImages && input.referenceImages.length > 0) {
+    body.reference_images = input.referenceImages.map((item) => item.fileId ? { file_id: item.fileId } : { url: item.url });
+  }
+  if (input.referenceVoiceIds && input.referenceVoiceIds.length > 0) {
+    body.reference_audios = input.referenceVoiceIds.map((voiceId) => ({ voice_id: voiceId }));
+  }
   const payload = await publicApiRequest(
     input.apiKey,
     "/videos/generations",
@@ -138,6 +150,49 @@ export async function createVideo(input: {
   if (!requestId) {
     throw new CreativeApiError(200, "The video response did not contain a request ID", "invalid_response");
   }
+  return requestId;
+}
+
+export async function editVideo(input: {
+  apiKey: string;
+  model: string;
+  prompt: string;
+  videoURL?: string;
+  videoFileID?: string;
+  signal?: AbortSignal;
+}): Promise<string> {
+  const payload = await publicApiRequest(input.apiKey, "/videos/edits", {
+    method: "POST",
+    body: {
+      model: input.model,
+      prompt: input.prompt,
+      video: input.videoFileID ? { file_id: input.videoFileID } : { url: input.videoURL },
+    },
+    signal: input.signal,
+  });
+  const requestId = readVideoRequestID(payload);
+  if (!requestId) throw new CreativeApiError(200, "The video response did not contain a request ID", "invalid_response");
+  return requestId;
+}
+
+export async function extendVideo(input: {
+  apiKey: string;
+  model: string;
+  prompt: string;
+  videoURL?: string;
+  videoFileID?: string;
+  duration?: number;
+  signal?: AbortSignal;
+}): Promise<string> {
+  const body: Record<string, unknown> = {
+    model: input.model,
+    prompt: input.prompt,
+    video: input.videoFileID ? { file_id: input.videoFileID } : { url: input.videoURL },
+  };
+  if (typeof input.duration === "number") body.duration = input.duration;
+  const payload = await publicApiRequest(input.apiKey, "/videos/extensions", { method: "POST", body, signal: input.signal });
+  const requestId = readVideoRequestID(payload);
+  if (!requestId) throw new CreativeApiError(200, "The video response did not contain a request ID", "invalid_response");
   return requestId;
 }
 
@@ -153,6 +208,34 @@ export async function getVideo(input: {
   );
   const status = readVideoStatus(payload);
   return status.video ? { ...status, video: { ...status.video, url: resolveMediaURL(status.video.url) } } : status;
+}
+
+export type VoiceInfo = {
+  voiceId: string;
+  name: string;
+  language?: string;
+};
+
+export async function listVoices(input: {
+  apiKey: string;
+  model?: string;
+  signal?: AbortSignal;
+}): Promise<VoiceInfo[]> {
+  const query = input.model ? `?model=${encodeURIComponent(input.model)}` : "";
+  const payload = await publicApiRequest(input.apiKey, `/tts/voices${query}`, { method: "GET", signal: input.signal });
+  if (!isRecord(payload) || !Array.isArray(payload.voices)) {
+    throw new CreativeApiError(200, "The voice list response was invalid", "invalid_response");
+  }
+  return payload.voices.map((item) => {
+    if (!isRecord(item) || typeof item.voice_id !== "string") {
+      throw new CreativeApiError(200, "The voice list response was invalid", "invalid_response");
+    }
+    return {
+      voiceId: item.voice_id,
+      name: typeof item.name === "string" ? item.name : item.voice_id,
+      language: typeof item.language === "string" ? item.language : undefined,
+    };
+  });
 }
 
 async function publicApiRequest(apiKey: string, path: string, options: RequestOptions): Promise<unknown> {

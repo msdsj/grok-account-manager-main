@@ -17,9 +17,9 @@ written under `output/` and should not be treated as source.
 - `uv run grok-account-manager grok --count 1 --sink json+txt`: run one local
   registration round and write JSON plus TXT outputs.
 - `uv run grok-account-manager-api`: start the FastAPI backend on
-  `127.0.0.1:8765`; the legacy `grok-account-manager-web` alias points here too.
+  `127.0.0.1:43187`; the legacy `grok-account-manager-web` alias points here too.
 - `cd web && npm install`: install frontend dependencies.
-- `cd web && npm run dev`: start the React dev server on `127.0.0.1:5173`.
+- `cd web && npm run dev`: start the React dev server on `127.0.0.1:43188`.
 - `cd web && npm run build`: run TypeScript checks and produce the Vite build.
 
 ## Coding Style & Naming Conventions

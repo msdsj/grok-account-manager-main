@@ -8,6 +8,7 @@ not log the raw endpoint (proxy credentials, when present, are sensitive).
 from __future__ import annotations
 
 import ipaddress
+import os
 import random
 import re
 import threading
@@ -23,6 +24,12 @@ _PROXY_ARGUMENT_PATTERN = re.compile(r"(?i)(--proxy-server(?:=|\s+))[^\s'\"<>]+"
 _PROXY_CREDENTIAL_URL_PATTERN = re.compile(
     r"(?i)(?:https?|socks[45])://[^\s/@]*@[^\s/\"'<>()]+"
 )
+
+# Deployments where the host itself has no route to the registration/mail
+# targets (e.g. a mainland China VPS behind a local outbound proxy) need every
+# round to go through the same egress, unlike the rotating "registration
+# proxy pool" below whose whole point is to never reuse an endpoint.
+EGRESS_PROXY_ENV_VAR = "GROK_ACCOUNT_MANAGER_EGRESS_PROXY"
 
 
 class ProxyPoolError(ValueError):
@@ -223,11 +230,27 @@ class ProxyPool:
         return tuple(mask_proxy_server(proxy) for proxy in self._proxies)
 
 
+def get_fixed_egress_proxy() -> str | None:
+    """Return the always-on egress proxy from the environment, if configured.
+
+    Unlike :class:`ProxyPool`, this endpoint is reused for every round; it
+    exists for hosts that cannot reach the registration/mail targets at all
+    without a local outbound proxy, not for exit-IP rotation.
+    """
+
+    raw = os.environ.get(EGRESS_PROXY_ENV_VAR, "").strip()
+    if not raw:
+        return None
+    return normalize_proxy_server(raw)
+
+
 __all__ = [
+    "EGRESS_PROXY_ENV_VAR",
     "ProxyPool",
     "ProxyPoolError",
     "ProxyPoolExhaustedError",
     "SUPPORTED_PROXY_SCHEMES",
+    "get_fixed_egress_proxy",
     "load_proxy_file",
     "mask_proxy_server",
     "normalize_proxy_server",

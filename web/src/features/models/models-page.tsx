@@ -51,7 +51,7 @@ export function ModelsPage() {
     publicId: z.string().min(1, t("errors.required")),
     provider: z.enum(["grok_build", "grok_web", "grok_console"]),
     upstreamModel: z.string().min(1, t("errors.required")),
-    capability: z.enum(["responses", "chat", "image", "image_edit", "video"]),
+    capability: z.enum(["responses", "chat", "image", "image_edit", "video", "stt", "tts", "realtime"]),
     enabled: z.boolean(),
     bindingMode: z.boolean(),
     accountIds: z.array(z.string()),
@@ -329,7 +329,16 @@ export function ModelsPage() {
                     <Label>{t("models.capability")}</Label>
                     <Select value={selectedCapability} disabled>
                       <SelectTrigger><SelectValue /></SelectTrigger>
-                      <SelectContent><SelectItem value="responses">Responses</SelectItem></SelectContent>
+                      <SelectContent>
+                        <SelectItem value="responses">Responses</SelectItem>
+                        <SelectItem value="chat">Chat</SelectItem>
+                        <SelectItem value="image">Image</SelectItem>
+                        <SelectItem value="image_edit">Image edit</SelectItem>
+                        <SelectItem value="video">Video</SelectItem>
+                        <SelectItem value="stt">STT</SelectItem>
+                        <SelectItem value="tts">TTS</SelectItem>
+                        <SelectItem value="realtime">Realtime</SelectItem>
+                      </SelectContent>
                     </Select>
                   </div>
                   <div className="space-y-2 sm:col-span-2"><Label htmlFor="model-upstream-id">{t("models.upstream")}</Label><Input id="model-upstream-id" {...form.register("upstreamModel")} />{form.formState.errors.upstreamModel ? <p className="text-xs text-destructive">{form.formState.errors.upstreamModel.message}</p> : null}</div>

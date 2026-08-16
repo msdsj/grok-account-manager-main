@@ -1,4 +1,4 @@
-export type EmailSource = "duckmail" | "outlook" | "google";
+export type EmailSource = "duckmail" | "outlook" | "google" | "cloud_mail";
 
 export type JobStatus = "running" | "stopping" | "completed" | "completed_with_errors" | "stopped";
 
@@ -26,6 +26,9 @@ export interface RegistrationJob {
   total: number;
   concurrency: number;
   oauthExchange: boolean;
+  autoImportSub2Api: boolean;
+  sub2ApiImported: number;
+  sub2ApiImportFailed: number;
   windowsMinimized: boolean;
   emailSource: string;
   proxyPoolEnabled: boolean;
@@ -47,12 +50,18 @@ export interface StartRegistrationInput {
   total: number;
   concurrency: number;
   oauthExchange: boolean;
+  autoImportSub2Api: boolean;
   minimizeBrowsers: boolean;
   emailSource: EmailSource;
   outlookData?: string;
   outlookAccountsFile?: string;
   googleData?: string;
   googleAccountsFile?: string;
+  cloudMailApiBase?: string;
+  cloudMailPublicToken?: string;
+  cloudMailLoginEmail?: string;
+  cloudMailLoginPassword?: string;
+  cloudMailDomains?: string;
   proxyPoolEnabled?: boolean;
   proxyFile?: string;
 }

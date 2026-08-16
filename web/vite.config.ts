@@ -15,12 +15,12 @@ export default defineConfig({
     },
   },
   server: {
-    port: 5173,
+    port: 43188,
     proxy: {
-      "/api": process.env.VITE_DEV_API_TARGET ?? "http://127.0.0.1:8765",
-      "/v1": process.env.VITE_DEV_API_TARGET ?? "http://127.0.0.1:8765",
-      "/healthz": process.env.VITE_DEV_API_TARGET ?? "http://127.0.0.1:8765",
-      "/readyz": process.env.VITE_DEV_API_TARGET ?? "http://127.0.0.1:8765",
+      "/api": process.env.VITE_DEV_API_TARGET ?? "http://127.0.0.1:43187",
+      "/v1": process.env.VITE_DEV_API_TARGET ?? "http://127.0.0.1:43187",
+      "/healthz": process.env.VITE_DEV_API_TARGET ?? "http://127.0.0.1:43187",
+      "/readyz": process.env.VITE_DEV_API_TARGET ?? "http://127.0.0.1:43187",
     },
   },
   build: {

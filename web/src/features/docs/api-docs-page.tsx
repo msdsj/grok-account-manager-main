@@ -102,7 +102,7 @@ const endpoints: Record<string, EndpointDefinition> = {
     ],
     noteKeys: ["docs.reference.noteImageCount", "docs.reference.noteImageStorage"],
     request: (model) => ({ model, prompt: "A minimal red chair in a bright studio", n: 1, response_format: "url" }),
-    response: { created: 1783860000, data: [{ url: "http://127.0.0.1:8000/v1/media/images/example" }] },
+    response: { created: 1783860000, data: [{ url: "http://127.0.0.1:43871/v1/media/images/example" }] },
   },
   "image/edits": {
     key: "image/edits", category: "Image", title: "Image edits", method: "POST", path: "/images/edits",
@@ -116,7 +116,7 @@ const endpoints: Record<string, EndpointDefinition> = {
     ],
     noteKeys: ["docs.reference.noteEditJSON", "docs.reference.noteEditSources", "docs.reference.noteImageStorage"],
     request: (model) => ({ model, prompt: "Change the chair to black", image: { url: "https://example.com/chair.png" }, n: 1, response_format: "url" }),
-    response: { created: 1783860000, data: [{ url: "http://127.0.0.1:8000/v1/media/images/example" }] },
+    response: { created: 1783860000, data: [{ url: "http://127.0.0.1:43871/v1/media/images/example" }] },
   },
   "video/generations": {
     key: "video/generations", category: "Video", title: "Video generations", method: "POST", path: "/videos/generations",
