@@ -1,0 +1,78 @@
+name: grok2api
+
+services:
+  grok2api:
+    container_name: grok2api
+    image: "${GROK2API_IMAGE:-ghcr.io/chenyme/grok2api:latest}"
+    ports:
+      - "${GROK2API_PORT:-8000}:8000"
+    environment:
+      TZ: "${TZ:-Asia/Shanghai}"
+      # 非空时覆盖 config.yaml 的 PostgreSQL DSN，并自动启用 postgres。
+      GROK2API_DATABASE_URL: "${GROK2API_DATABASE_URL:-}"
+      GROK2API_QUALITY_GUARD_DIR: /var/lib/grok2api-quality-guard
+    volumes:
+      - "${GROK2API_CONFIG:-./config.yaml}:/run/grok2api/config.yaml:ro"
+      - grok2api-data:/app/data
+      - quality_guard_state:/var/lib/grok2api-quality-guard
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    security_opt:
+      - no-new-privileges:true
+
+  # ================================ WARP ================================
+  # 如果出口 IP 不干净，可取消以下注释使用 WARP 作为落地代理。
+  # 启用后，在管理端“设置 -> 出口代理”中新增 socks5://warp:1080。
+
+  # warp:
+  #   container_name: warp
+  #   image: caomingjun/warp:latest
+  #   profiles: ["warp"]
+  #   restart: unless-stopped
+  #   ports:
+  #     - "127.0.0.1:1080:1080"
+  #   environment:
+  #     - WARP_SLEEP=2
+  #   cap_add:
+  #     - NET_ADMIN
+
+  # ================================ FLARESOLVERR ================================
+  # 在管理端将 Clearance 模式设为 FlareSolverr 或按需刷新，并使用 http://flaresolverr:8191。
+  # 启动命令：docker compose --profile flaresolverr up -d
+  # Podman：podman compose --profile flaresolverr up -d
+
+  # flaresolverr:
+  #   container_name: flaresolverr
+  #   image: ghcr.io/flaresolverr/flaresolverr:latest
+  #   profiles: ["flaresolverr"]
+  #   environment:
+  #     TZ: Asia/Shanghai
+  #     LOG_LEVEL: info
+  #   restart: unless-stopped
+
+  # ================================ EGRESS QUALITY GUARD ================================
+  # 可选的 Grok Build 出口质量守护 sidecar。默认不启动，也不会产生探测请求。
+  # 启用前在 config.yaml 中配置 qualityGuard，然后执行：
+  # docker compose --profile quality-guard up -d --build
+
+  egress-quality-guard:
+    container_name: grok2api-egress-quality-guard
+    profiles: ["quality-guard"]
+    build:
+      context: .
+      dockerfile: tools/egress-quality-guard/Dockerfile
+    depends_on:
+      grok2api:
+        condition: service_healthy
+    volumes:
+      - quality_guard_state:/var/lib/grok2api-quality-guard
+    restart: "on-failure:5"
+    init: true
+    stop_grace_period: 30s
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  grok2api-data:
+  quality_guard_state:

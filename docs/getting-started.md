@@ -10,7 +10,7 @@
 - [uv](https://docs.astral.sh/uv/)
 - Node.js `20+` 和 pnpm `11+`
 - Google Chrome 或 Chromium
-- 如果使用本地中转，再启动 Docker Desktop，并准备兼容的 `grok2api` 源码
+- 如果使用本地中转，再启动 Docker Desktop；网关源码已经包含在本仓库
 
 默认端口如下：
 
@@ -129,19 +129,15 @@ uv run grok-account-manager grok --count 1 --sink json --oauth-exchange
 
 同一时间不要让 CLI 和控制台同时争用相同的邮箱池、浏览器或输出文件。
 
-## 7. 可选：本地 Grok2API 中转
+## 7. 可选：本地网关中转
 
 中转不是 CLI 注册的必需依赖。要使用控制台里的账号测试、模型、图片/视频和 OpenAI 兼容接口：
 
 1. 启动 Docker Desktop。
-2. 准备兼容的 `grok2api` 源码，并在 `.env` 设置其绝对路径：
+2. 启动 FastAPI 后端。首次启动会从仓库内置的 `gateway/` 源码自动构建 `grok-account-manager-gateway:local`。
+3. 在控制台的“本地中转”页面检查状态、同步账号和查看模型。
 
-   ```dotenv
-   GROK2API_PATH=/absolute/path/to/grok2api-main
-   ```
-
-3. 启动 FastAPI 后端。后端会按中转配置准备 Docker 容器。
-4. 在控制台的“本地中转”页面检查状态、同步账号和查看模型。
+不需要下载、配置或启动任何外部 grok2api 项目。
 
 中转配置、管理员密钥和账号数据会写入 `output/`，不要提交或公开。当前默认账号数据库是 SQLite，不需要为了启动注册任务执行 `docker compose up`。
 
@@ -165,7 +161,7 @@ lsof -nP -iTCP:43187 -sTCP:LISTEN
 lsof -nP -iTCP:43188 -sTCP:LISTEN
 ```
 
-如果前端显示无法连接，先确认后端端口和 `VITE_DEV_API_TARGET` 一致，再查看 `output/backend.log` 或 `output/grok2api-relay.log` 的最后几行。日志中可能包含敏感信息，不要整份上传。
+如果前端显示无法连接，先确认后端端口和 `VITE_DEV_API_TARGET` 一致，再查看 `output/grok2api-relay.log` 的最后几行。日志中可能包含敏感信息，不要整份上传。
 
 ## 10. 提交前安全检查
 

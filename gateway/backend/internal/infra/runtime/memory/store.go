@@ -1,0 +1,422 @@
+package memory
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"sync"
+	"time"
+
+	"github.com/chenyme/grok2api/backend/internal/domain/account"
+	"github.com/chenyme/grok2api/backend/internal/repository"
+)
+
+const (
+	maxEntries        = 10000
+	maxDeviceSessions = 1000
+	shardCount        = 64
+)
+
+type rateWindow struct {
+	startedAt time.Time
+	count     int
+}
+
+// RateLimiter 提供单实例固定分钟窗口限流。
+type RateLimiter struct {
+	shards [shardCount]rateShard
+}
+
+type rateShard struct {
+	mu      sync.Mutex
+	windows map[string]rateWindow
+}
+
+func NewRateLimiter() *RateLimiter {
+	limiter := &RateLimiter{}
+	for index := range limiter.shards {
+		limiter.shards[index].windows = make(map[string]rateWindow)
+	}
+	return limiter
+}
+
+func (r *RateLimiter) Allow(_ context.Context, key string, limit int, now time.Time) (bool, error) {
+	if limit <= 0 {
+		return true, nil
+	}
+	shard := &r.shards[shardIndex(key)]
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+	window := shard.windows[key]
+	if window.startedAt.IsZero() || now.Sub(window.startedAt) >= time.Minute {
+		window = rateWindow{startedAt: now, count: 0}
+	}
+	if window.count >= limit {
+		shard.windows[key] = window
+		return false, nil
+	}
+	window.count++
+	shard.windows[key] = window
+	if len(shard.windows) > maxEntriesPerShard() {
+		cleanupRateShard(shard, now)
+	}
+	return true, nil
+}
+
+func cleanupRateShard(shard *rateShard, now time.Time) {
+	for key, window := range shard.windows {
+		if now.Sub(window.startedAt) >= time.Minute {
+			delete(shard.windows, key)
+		}
+	}
+	for len(shard.windows) > maxEntriesPerShard() {
+		var oldestKey string
+		var oldest time.Time
+		for key, window := range shard.windows {
+			if oldestKey == "" || window.startedAt.Before(oldest) {
+				oldestKey = key
+				oldest = window.startedAt
+			}
+		}
+		delete(shard.windows, oldestKey)
+	}
+}
+
+// ConcurrencyLimiter 提供单实例并发租约。
+type ConcurrencyLimiter struct {
+	shards       [shardCount]concurrencyShard
+	indicesCache sync.Pool
+}
+
+type concurrencyShard struct {
+	mu     sync.Mutex
+	counts map[string]int
+}
+
+func NewConcurrencyLimiter() *ConcurrencyLimiter {
+	limiter := &ConcurrencyLimiter{}
+	for index := range limiter.shards {
+		limiter.shards[index].counts = make(map[string]int)
+	}
+	limiter.indicesCache.New = func() any { return make([]int, 0, 256) }
+	return limiter
+}
+
+func (l *ConcurrencyLimiter) Acquire(_ context.Context, key string, limit int) (func(), bool, error) {
+	if limit <= 0 {
+		return func() {}, true, nil
+	}
+	shard := &l.shards[shardIndex(key)]
+	shard.mu.Lock()
+	if shard.counts[key] >= limit {
+		shard.mu.Unlock()
+		return nil, false, nil
+	}
+	shard.counts[key]++
+	shard.mu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			shard.mu.Lock()
+			defer shard.mu.Unlock()
+			shard.counts[key]--
+			if shard.counts[key] <= 0 {
+				delete(shard.counts, key)
+			}
+		})
+	}, true, nil
+}
+
+func (l *ConcurrencyLimiter) Current(_ context.Context, key string) (int, error) {
+	shard := &l.shards[shardIndex(key)]
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+	return shard.counts[key], nil
+}
+
+func (l *ConcurrencyLimiter) CurrentMany(_ context.Context, keys []string) (map[string]int, error) {
+	// Most accounts have no active lease. Keep the sparse result contract used
+	// by the planner instead of allocating one map entry for every candidate.
+	values := make(map[string]int)
+	if len(keys) == 0 {
+		return values, nil
+	}
+
+	// 选号会一次读取整个候选池。先按分片聚合下标，避免同一分片在一次快照中
+	// 被反复加锁数千次，并缩短高并发请求之间的锁竞争窗口。
+	var counts [shardCount]int
+	for _, key := range keys {
+		counts[shardIndex(key)]++
+	}
+	var offsets [shardCount + 1]int
+	for index := range shardCount {
+		offsets[index+1] = offsets[index] + counts[index]
+	}
+	cursors := offsets
+	grouped := l.indicesCache.Get().([]int)
+	if cap(grouped) < len(keys) {
+		grouped = make([]int, len(keys))
+	} else {
+		grouped = grouped[:len(keys)]
+	}
+	defer func() {
+		// 不保留异常大的候选池缓冲，避免一次峰值长期占用进程内存。
+		if cap(grouped) <= maxEntries {
+			l.indicesCache.Put(grouped[:0])
+		}
+	}()
+	for keyIndex, key := range keys {
+		shard := int(shardIndex(key))
+		grouped[cursors[shard]] = keyIndex
+		cursors[shard]++
+	}
+	for shardIndex := range shardCount {
+		if offsets[shardIndex] == offsets[shardIndex+1] {
+			continue
+		}
+		shard := &l.shards[shardIndex]
+		shard.mu.Lock()
+		for _, keyIndex := range grouped[offsets[shardIndex]:offsets[shardIndex+1]] {
+			key := keys[keyIndex]
+			if count := shard.counts[key]; count > 0 {
+				values[key] = count
+			}
+		}
+		shard.mu.Unlock()
+	}
+	return values, nil
+}
+
+type stickyBinding struct {
+	accountID uint64
+	expiresAt time.Time
+}
+
+// StickyStore 提供有界的单实例会话粘滞状态。
+type StickyStore struct {
+	shards [shardCount]stickyShard
+}
+
+type stickyShard struct {
+	mu       sync.Mutex
+	bindings map[string]stickyBinding
+}
+
+func NewStickyStore() *StickyStore {
+	store := &StickyStore{}
+	for index := range store.shards {
+		store.shards[index].bindings = make(map[string]stickyBinding)
+	}
+	return store
+}
+
+func (s *StickyStore) Get(_ context.Context, affinityKey string, now time.Time) (uint64, bool, error) {
+	shard := &s.shards[shardIndex(affinityKey)]
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+	binding, ok := shard.bindings[affinityKey]
+	if !ok {
+		return 0, false, nil
+	}
+	if !now.Before(binding.expiresAt) {
+		delete(shard.bindings, affinityKey)
+		return 0, false, nil
+	}
+	return binding.accountID, true, nil
+}
+
+func (s *StickyStore) Bind(_ context.Context, affinityKey string, proposedAccountID uint64, now, expiresAt time.Time) (uint64, error) {
+	if affinityKey == "" || proposedAccountID == 0 || !now.Before(expiresAt) {
+		return proposedAccountID, nil
+	}
+	shard := &s.shards[shardIndex(affinityKey)]
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+	if binding, ok := shard.bindings[affinityKey]; ok && now.Before(binding.expiresAt) {
+		binding.expiresAt = expiresAt
+		shard.bindings[affinityKey] = binding
+		return binding.accountID, nil
+	}
+	shard.bindings[affinityKey] = stickyBinding{accountID: proposedAccountID, expiresAt: expiresAt}
+	pruneStickyBindingsLocked(shard, now)
+	return proposedAccountID, nil
+}
+
+func (s *StickyStore) Set(_ context.Context, affinityKey string, accountID uint64, expiresAt time.Time) error {
+	if affinityKey == "" {
+		return nil
+	}
+	shard := &s.shards[shardIndex(affinityKey)]
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+	shard.bindings[affinityKey] = stickyBinding{accountID: accountID, expiresAt: expiresAt}
+	pruneStickyBindingsLocked(shard, time.Now())
+	return nil
+}
+
+func pruneStickyBindingsLocked(shard *stickyShard, now time.Time) {
+	if len(shard.bindings) > maxEntriesPerShard() {
+		for key, binding := range shard.bindings {
+			if !now.Before(binding.expiresAt) {
+				delete(shard.bindings, key)
+			}
+		}
+		for len(shard.bindings) > maxEntriesPerShard() {
+			var oldestKey string
+			var oldest time.Time
+			for key, binding := range shard.bindings {
+				if oldestKey == "" || binding.expiresAt.Before(oldest) {
+					oldestKey = key
+					oldest = binding.expiresAt
+				}
+			}
+			delete(shard.bindings, oldestKey)
+		}
+	}
+}
+
+func (s *StickyStore) DeleteByAccount(_ context.Context, accountID uint64) error {
+	for index := range s.shards {
+		shard := &s.shards[index]
+		shard.mu.Lock()
+		for key, binding := range shard.bindings {
+			if binding.accountID == accountID {
+				delete(shard.bindings, key)
+			}
+		}
+		shard.mu.Unlock()
+	}
+	return nil
+}
+
+func (s *StickyStore) DeleteByAccounts(_ context.Context, accountIDs []uint64) error {
+	ids := make(map[uint64]struct{}, len(accountIDs))
+	for _, accountID := range accountIDs {
+		if accountID != 0 {
+			ids[accountID] = struct{}{}
+		}
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	for index := range s.shards {
+		shard := &s.shards[index]
+		shard.mu.Lock()
+		for key, binding := range shard.bindings {
+			if _, remove := ids[binding.accountID]; remove {
+				delete(shard.bindings, key)
+			}
+		}
+		shard.mu.Unlock()
+	}
+	return nil
+}
+
+func shardIndex(key string) uint32 {
+	const offset32 = uint32(2166136261)
+	const prime32 = uint32(16777619)
+	hash := offset32
+	for index := 0; index < len(key); index++ {
+		hash ^= uint32(key[index])
+		hash *= prime32
+	}
+	return hash % shardCount
+}
+
+func maxEntriesPerShard() int { return (maxEntries + shardCount - 1) / shardCount }
+
+// DeviceSessionStore 保存不会跨重启恢复的短期 OAuth 会话。
+type DeviceSessionStore struct {
+	mu       sync.Mutex
+	sessions map[string]account.DeviceSession
+}
+
+func NewDeviceSessionStore() *DeviceSessionStore {
+	return &DeviceSessionStore{sessions: make(map[string]account.DeviceSession)}
+}
+
+func (s *DeviceSessionStore) Create(_ context.Context, value account.DeviceSession) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now().UTC()
+	for id, session := range s.sessions {
+		if !now.Before(session.ExpiresAt) {
+			delete(s.sessions, id)
+		}
+	}
+	if _, exists := s.sessions[value.ID]; !exists && len(s.sessions) >= maxDeviceSessions {
+		var earliestID string
+		var earliestExpiry time.Time
+		for id, session := range s.sessions {
+			if earliestID == "" || session.ExpiresAt.Before(earliestExpiry) {
+				earliestID = id
+				earliestExpiry = session.ExpiresAt
+			}
+		}
+		delete(s.sessions, earliestID)
+	}
+	s.sessions[value.ID] = value
+	return nil
+}
+
+func (s *DeviceSessionStore) Get(_ context.Context, id string, now time.Time) (account.DeviceSession, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	value, ok := s.sessions[id]
+	if !ok || !now.Before(value.ExpiresAt) {
+		delete(s.sessions, id)
+		return account.DeviceSession{}, repository.ErrNotFound
+	}
+	return value, nil
+}
+
+func (s *DeviceSessionStore) Update(_ context.Context, value account.DeviceSession) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.sessions[value.ID]; !ok {
+		return repository.ErrNotFound
+	}
+	s.sessions[value.ID] = value
+	return nil
+}
+
+func (s *DeviceSessionStore) Delete(_ context.Context, id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.sessions, id)
+	return nil
+}
+
+// LockStore 提供单实例非阻塞短期锁。
+type LockStore struct {
+	mu    sync.Mutex
+	locks map[string]string
+}
+
+func NewLockStore() *LockStore { return &LockStore{locks: make(map[string]string)} }
+
+func (s *LockStore) Acquire(_ context.Context, key string, _ time.Duration) (func(), bool, error) {
+	tokenBytes := make([]byte, 16)
+	if _, err := rand.Read(tokenBytes); err != nil {
+		return nil, false, err
+	}
+	token := hex.EncodeToString(tokenBytes)
+	s.mu.Lock()
+	if _, exists := s.locks[key]; exists {
+		s.mu.Unlock()
+		return nil, false, nil
+	}
+	s.locks[key] = token
+	s.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			if s.locks[key] == token {
+				delete(s.locks, key)
+			}
+		})
+	}, true, nil
+}

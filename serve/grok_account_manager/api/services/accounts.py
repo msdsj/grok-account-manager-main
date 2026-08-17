@@ -519,7 +519,7 @@ def _sync_ref_to_relay(ref: dict) -> None:
     try:
         RELAY_MANAGER.sync_accounts([ref["credential"]], refresh_existing=True)
     except Exception as error:
-        raise ValueError(f"同步账号到 grok2api 失败：{error}") from error
+        raise ValueError(f"同步账号到内置网关失败：{error}") from error
 
 
 def _sync_project_pool_to_relay() -> dict:
@@ -530,7 +530,7 @@ def _sync_project_pool_to_relay() -> dict:
     try:
         return RELAY_MANAGER.replace_accounts(credentials, pool="basic", prune_unlisted=True)
     except Exception as error:
-        raise ValueError(f"同步账号池到 grok2api 失败：{error}") from error
+        raise ValueError(f"同步账号池到内置网关失败：{error}") from error
 
 
 def test_selected_accounts(export_keys: list[str], timeout: int = 180) -> dict:

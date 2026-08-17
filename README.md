@@ -2,12 +2,13 @@
  
 Grok 账号注册与凭证管理工具。项目提供 Python 自动化注册流程和 React 本地控制台，支持 DuckMail、Cloud Mail、Outlook/Google 邮箱接码、GrokAccount JSON 凭证归档，以及可选推送到外部 Sub2API 实例。
 
-本项目允许免费使用、学习和二次开发。请勿把 `.env`、邮箱服务 Token/密码、Outlook refresh token、浏览器 cookie、SSO token 或 `output/` 里的凭证提交到 GitHub。
+本项目允许免费使用、学习和二次开发。网关源码和 Dockerfile 已内置在 `gateway/`，运行时不依赖外部 grok2api 仓库或镜像。请勿把 `.env`、邮箱服务 Token/密码、Outlook refresh token、浏览器 cookie、SSO token 或 `output/` 里的凭证提交到 GitHub。
 
 ## 文档
 
 - [完整部署、运行与使用指南](docs/deployment-and-usage.md)：环境准备、CLI、控制台、代理池、本地中转、更新与排错。
 - [快速使用教程](docs/getting-started.md)：从安装到启动前后端、运行注册任务和提交前安全检查。
+- [首次运行教程](docs/first-run.md)：新用户一键启动、注册机入口和后续更新。
 - [更新日志](CHANGELOG.md)：按日期整理的功能变更。
 - [DuckMail 邮箱源](docs/duckmail.md)
 - [Cloud Mail 邮箱源](docs/cloud-mail.md)
@@ -196,7 +197,7 @@ GROK_ACCOUNT_MANAGER_DB_PATH=output/grok-account-manager.db
 
 ## 本地控制台
 
-后端现在是单一 FastAPI 服务，注册机 API、中转站管理 API 和 OpenAI 兼容代理都由它提供。开发模式运行两个进程：一个后端、一个前端。
+后端现在是单一 FastAPI 服务，注册机 API、中转站管理 API 和 OpenAI 兼容代理都由它提供。开发模式运行两个进程：一个后端、一个前端。侧边栏中的“注册机”进入本项目内置的注册任务页面。
 
 ```bash
 uv run grok-account-manager-api
@@ -230,6 +231,22 @@ uv run grok-account-manager-api
 ```
 
 然后打开 `http://127.0.0.1:43187`。旧命令 `uv run grok-account-manager-web` 仍然可用，内部指向同一个 FastAPI 入口。
+
+### 一键更新
+
+从本仓库拉取代码后，使用下面的脚本同步本仓库、安装依赖、构建前端并重建项目自有网关镜像：
+
+```bash
+./scripts/update.sh
+```
+
+要更新后直接启动后端：
+
+```bash
+./scripts/update-and-run.sh
+```
+
+脚本只使用本仓库的 `gateway/` 源码，不会下载或引用用户机器上的其他 grok2api 项目。
 
 ## 输出文件
 

@@ -105,9 +105,24 @@ const visibleWebQuotaModes = ["auto", "fast", "expert", "heavy"] as const;
 
 export function ConsoleQuota({ windows, locale }: { windows: NonNullable<AccountDTO["quotaWindows"]>; locale: string }) {
   const { t } = useTranslation();
-  const window = windows.find((value) => value.mode === "console") ?? windows[0];
-  if (!window) return <span className="text-xs text-muted-foreground">{t("accounts.quotaNotSynced")}</span>;
-  return <WebQuotaMode mode="Console" window={window} locale={locale} />;
+  if (windows.length === 0) return <span className="text-xs text-muted-foreground">{t("accounts.quotaNotSynced")}</span>;
+  const windowsByMode = new Map(windows.map((window) => [window.mode, window]));
+  const modes = [
+    { mode: "console", label: t("creativeConsole.modes.chat") },
+    { mode: "console_image", label: t("creativeConsole.modes.image") },
+    { mode: "console_video", label: t("creativeConsole.modes.video") },
+  ] as const;
+  return (
+    <div className="grid w-full min-w-0 grid-cols-3 divide-x divide-border/70">
+      {modes.map(({ mode, label }) => {
+        const window = windowsByMode.get(mode);
+        if (!window) {
+          return <div key={mode} className="min-w-0 px-2 first:pl-0 last:pr-0"><div className="flex items-center justify-between gap-1 text-[11px]"><span className="truncate text-muted-foreground">{label}</span><span className="text-muted-foreground">-</span></div><div className="mt-1.5 h-1.5 rounded-full bg-muted" /></div>;
+        }
+        return <WebQuotaMode key={mode} mode={label} window={window} locale={locale} compact />;
+      })}
+    </div>
+  );
 }
 
 export function WebQuota({ windows, locale, tier }: { windows: NonNullable<AccountDTO["quotaWindows"]>; locale: string; tier?: AccountDTO["webTier"] }) {

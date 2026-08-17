@@ -1,0 +1,471 @@
+package cli
+
+import (
+	"encoding/json"
+	"io"
+	"strings"
+	"testing"
+)
+
+func TestNormalizeResponsesRequestFlattensNamespaceAndRestoresResponse(t *testing.T) {
+	body := []byte(`{
+		"model":"public",
+		"input":"List calendar events",
+		"tools":[
+			{"type":"namespace","name":"mcp__calendar__","description":"Calendar tools","tools":[
+				{"type":"function","name":"create","defer_loading":true,"parameters":{"type":"object"}},
+				{"type":"function","name":"list","parameters":{"type":"object"}}
+			]},
+			{"type":"tool_search","execution":"client","description":"Find a calendar tool","parameters":{"type":"object"}}
+		],
+		"tool_choice":{"type":"function","name":"list","namespace":"mcp__calendar__"}
+	}`)
+
+	normalized, compatibility, err := normalizeResponsesRequest(body, "grok-4.5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if compatibility == nil {
+		t.Fatal("namespace 请求未建立响应恢复映射")
+	}
+	var request map[string]any
+	if err := json.Unmarshal(normalized, &request); err != nil {
+		t.Fatal(err)
+	}
+	if parallel, ok := request["parallel_tool_calls"].(bool); !ok || parallel {
+		t.Fatalf("客户端 tool_search 必须串行执行: %#v", request["parallel_tool_calls"])
+	}
+	tools := request["tools"].([]any)
+	if len(tools) != 2 {
+		t.Fatalf("上游 tools = %#v", tools)
+	}
+	listTool := tools[0].(map[string]any)
+	searchTool := tools[1].(map[string]any)
+	if listTool["type"] != "function" || listTool["name"] != "mcp__calendar__list" {
+		t.Fatalf("namespace 函数未展平: %#v", listTool)
+	}
+	if _, exists := listTool["defer_loading"]; exists {
+		t.Fatalf("defer_loading 泄露到上游: %#v", listTool)
+	}
+	if searchTool["type"] != "function" || searchTool["name"] != "grok2api_tool_search" || !strings.Contains(searchTool["description"].(string), "Calendar tools") {
+		t.Fatalf("客户端 tool_search 未转换: %#v", searchTool)
+	}
+	choice := request["tool_choice"].(map[string]any)
+	if choice["name"] != "mcp__calendar__list" || choice["namespace"] != nil {
+		t.Fatalf("tool_choice 未转换: %#v", choice)
+	}
+
+	upstream := []byte(`{
+		"id":"resp_1","object":"response",
+		"tools":[{"type":"function","name":"mcp__calendar__list"},{"type":"function","name":"grok2api_tool_search"}],
+		"output":[
+			{"type":"function_call","call_id":"call_1","name":"mcp__calendar__list","arguments":"{}"},
+			{"type":"function_call","call_id":"call_2","name":"grok2api_tool_search","arguments":"{\"goal\":\"calendar\"}"}
+		]
+	}`)
+	restored, err := compatibility.normalizeResponseJSON(upstream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var response map[string]any
+	if err := json.Unmarshal(restored, &response); err != nil {
+		t.Fatal(err)
+	}
+	output := response["output"].([]any)
+	namespaced := output[0].(map[string]any)
+	if namespaced["name"] != "list" || namespaced["namespace"] != "mcp__calendar__" {
+		t.Fatalf("namespace 调用未恢复: %#v", namespaced)
+	}
+	searchCall := output[1].(map[string]any)
+	arguments, ok := searchCall["arguments"].(map[string]any)
+	if searchCall["type"] != "tool_search_call" || searchCall["execution"] != "client" || searchCall["name"] != nil || !ok || arguments["goal"] != "calendar" {
+		t.Fatalf("tool_search_call 未恢复: %#v", searchCall)
+	}
+	visibleTools := response["tools"].([]any)
+	if len(visibleTools) != 2 || visibleTools[0].(map[string]any)["type"] != "namespace" || visibleTools[1].(map[string]any)["type"] != "tool_search" {
+		t.Fatalf("响应 tools 未恢复为客户端声明: %#v", visibleTools)
+	}
+}
+
+func TestNormalizeResponsesRequestLoadsClientToolSearchOutput(t *testing.T) {
+	body := []byte(`{
+		"model":"public",
+		"input":[
+			{"type":"tool_search_call","execution":"client","call_id":"search_1","arguments":{"goal":"shipping"}},
+			{"type":"tool_search_output","execution":"client","call_id":"search_1","status":"completed","tools":[
+				{"type":"namespace","name":"shipping","tools":[
+					{"type":"function","name":"get_eta","defer_loading":true,"parameters":{"type":"object"}}
+				]}
+			]}
+		]
+	}`)
+
+	normalized, compatibility, err := normalizeResponsesRequest(body, "grok-4.5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if compatibility == nil {
+		t.Fatal("tool_search 续轮未建立响应恢复映射")
+	}
+	var request map[string]any
+	if err := json.Unmarshal(normalized, &request); err != nil {
+		t.Fatal(err)
+	}
+	tools := request["tools"].([]any)
+	if len(tools) != 1 {
+		t.Fatalf("已加载 tools = %#v", tools)
+	}
+	loaded := tools[0].(map[string]any)
+	if loaded["name"] != "shipping__get_eta" || loaded["defer_loading"] != nil {
+		t.Fatalf("已加载工具未转换: %#v", loaded)
+	}
+	input := request["input"].([]any)
+	call := input[0].(map[string]any)
+	output := input[1].(map[string]any)
+	if call["type"] != "function_call" || call["name"] != "grok2api_tool_search" || call["arguments"] != `{"goal":"shipping"}` {
+		t.Fatalf("tool_search_call 历史未转换: %#v", call)
+	}
+	if output["type"] != "function_call_output" || output["call_id"] != "search_1" {
+		t.Fatalf("tool_search_output 历史未转换: %#v", output)
+	}
+}
+
+func TestNormalizeResponsesRequestLoadsServerToolSearchHistory(t *testing.T) {
+	normalized, compatibility, err := normalizeResponsesRequest([]byte(`{
+		"model":"public",
+		"input":[
+			{"type":"tool_search_call","execution":"server","call_id":"search_1","arguments":{"goal":"shipping"}},
+			{"type":"tool_search_output","execution":"server","call_id":"search_1","status":"completed","tools":[
+				{"type":"function","name":"get_eta","defer_loading":true,"parameters":{"type":"object"}}
+			]}
+		]
+	}`), "grok-4.5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var request map[string]any
+	if err := json.Unmarshal(normalized, &request); err != nil {
+		t.Fatal(err)
+	}
+	tools := request["tools"].([]any)
+	if len(tools) != 1 || tools[0].(map[string]any)["name"] != "get_eta" || tools[0].(map[string]any)["defer_loading"] != nil {
+		t.Fatalf("tools = %#v", tools)
+	}
+	items := request["input"].([]any)
+	if len(items) != 2 || items[0].(map[string]any)["role"] != "developer" || items[1].(map[string]any)["role"] != "developer" {
+		t.Fatalf("history = %#v", items)
+	}
+	if compatibility == nil || !strings.Contains(compatibility.warningHeader(), "server_tool_search_history_approximated") {
+		t.Fatalf("compatibility = %#v", compatibility)
+	}
+}
+
+func TestNormalizeResponsesRequestEagerLoadsServerToolSearch(t *testing.T) {
+	normalized, compatibility, err := normalizeResponsesRequest([]byte(`{
+		"model":"public","input":"hello",
+		"tools":[
+			{"type":"function","name":"lookup","defer_loading":true,"parameters":{"type":"object"}},
+			{"type":"tool_search"}
+		],
+		"tool_choice":{"type":"tool_search"}
+	}`), "grok-4.5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(normalized, &payload); err != nil {
+		t.Fatal(err)
+	}
+	tools := payload["tools"].([]any)
+	if len(tools) != 1 || tools[0].(map[string]any)["name"] != "lookup" || tools[0].(map[string]any)["defer_loading"] != nil || payload["tool_choice"] != "auto" {
+		t.Fatalf("payload = %#v", payload)
+	}
+	if compatibility == nil || !strings.Contains(compatibility.warningHeader(), "server_tool_search_eager_loaded") || !strings.Contains(compatibility.warningHeader(), "server_tool_search_choice_downgraded") {
+		t.Fatalf("compatibility = %#v", compatibility)
+	}
+}
+
+func TestNormalizeResponsesRequestDropsEmptyServerToolSearchChoice(t *testing.T) {
+	normalized, _, err := normalizeResponsesRequest([]byte(`{
+		"model":"public","input":"hello",
+		"tools":[{"type":"tool_search"}],
+		"tool_choice":{"type":"tool_search"},
+		"parallel_tool_calls":true
+	}`), "grok-4.5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(normalized, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := payload["tools"]; exists {
+		t.Fatalf("tools = %#v", payload["tools"])
+	}
+	if _, exists := payload["tool_choice"]; exists {
+		t.Fatalf("tool_choice = %#v", payload["tool_choice"])
+	}
+	if _, exists := payload["parallel_tool_calls"]; exists {
+		t.Fatalf("parallel_tool_calls = %#v", payload["parallel_tool_calls"])
+	}
+}
+
+func TestNormalizeResponsesRequestSerializesParallelClientToolSearch(t *testing.T) {
+	normalized, compatibility, err := normalizeResponsesRequest([]byte(`{
+		"model":"public","input":"hello","parallel_tool_calls":true,
+		"tools":[{"type":"tool_search","execution":"client"}]
+	}`), "grok-4.5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(normalized, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["parallel_tool_calls"] != false || compatibility == nil || !strings.Contains(compatibility.warningHeader(), "client_tool_search_forced_serial") {
+		t.Fatalf("payload=%#v compatibility=%#v", payload, compatibility)
+	}
+}
+
+func TestNormalizeResponsesRequestLoadsDeferredToolWithoutSearch(t *testing.T) {
+	normalized, compatibility, err := normalizeResponsesRequest([]byte(`{
+		"model":"public","input":"hello",
+		"tools":[{"type":"function","name":"lookup","defer_loading":true,"parameters":{"type":"object"}}]
+	}`), "grok-4.5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(normalized, &payload); err != nil {
+		t.Fatal(err)
+	}
+	tool := payload["tools"].([]any)[0].(map[string]any)
+	if tool["name"] != "lookup" || tool["defer_loading"] != nil || compatibility == nil || !strings.Contains(compatibility.warningHeader(), "orphan_deferred_tool_loaded") {
+		t.Fatalf("tool=%#v compatibility=%#v", tool, compatibility)
+	}
+}
+
+func TestNormalizeResponsesRequestKeepsOrdinaryFunctionsOnNativePath(t *testing.T) {
+	normalized, compatibility, err := normalizeResponsesRequest([]byte(`{
+		"model":"public","input":"hello",
+		"tools":[{"type":"function","name":"lookup","description":"Lookup","parameters":{"type":"object"}}]
+	}`), "grok-4.5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if compatibility != nil {
+		t.Fatal("普通函数请求不应启用响应兼容层")
+	}
+	var request map[string]any
+	if err := json.Unmarshal(normalized, &request); err != nil {
+		t.Fatal(err)
+	}
+	tool := request["tools"].([]any)[0].(map[string]any)
+	if tool["name"] != "lookup" || tool["description"] != "Lookup" {
+		t.Fatalf("普通函数被意外改写: %#v", tool)
+	}
+}
+
+func TestNormalizeResponsesRequestRemovesNullableFunctionParameterRoot(t *testing.T) {
+	normalized, compatibility, err := normalizeResponsesRequest([]byte(`{
+		"model":"public","input":"hello",
+		"tools":[{"type":"function","name":"automation_update","parameters":{
+			"anyOf":[
+				{"type":"object","properties":{"title":{"type":"string"}},"required":["title"],"additionalProperties":false},
+				{"type":"null"}
+			]
+		}}]
+	}`), "grok-4.5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if compatibility == nil || !strings.Contains(compatibility.warningHeader(), "function_parameters_nullable_root_normalized") {
+		t.Fatalf("compatibility = %#v", compatibility)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(normalized, &payload); err != nil {
+		t.Fatal(err)
+	}
+	parameters := payload["tools"].([]any)[0].(map[string]any)["parameters"].(map[string]any)
+	if parameters["type"] != "object" || parameters["anyOf"] != nil || parameters["additionalProperties"] != false {
+		t.Fatalf("upstream parameters = %#v", parameters)
+	}
+	properties := parameters["properties"].(map[string]any)
+	if properties["title"].(map[string]any)["type"] != "string" {
+		t.Fatalf("upstream properties = %#v", properties)
+	}
+	visibleParameters := compatibility.visibleTools[0].(map[string]any)["parameters"].(map[string]any)
+	if _, exists := visibleParameters["anyOf"]; !exists || visibleParameters["type"] != nil {
+		t.Fatalf("visible parameters were mutated = %#v", visibleParameters)
+	}
+}
+
+func TestNormalizeResponsesRequestRejectsNullableNonObjectFunctionRoot(t *testing.T) {
+	_, _, err := normalizeResponsesRequest([]byte(`{
+		"model":"public","input":"hello",
+		"tools":[{"type":"function","name":"invalid","parameters":{
+			"anyOf":[{"type":"object"},{"type":"string"},{"type":"null"}]
+		}}]
+	}`), "grok-4.5")
+	requestErr, ok := err.(*responsesRequestError)
+	if !ok || requestErr.Param != "tools[0].parameters" || requestErr.Code != "invalid_parameter" {
+		t.Fatalf("error = %#v", err)
+	}
+}
+
+func TestNormalizeResponsesRequestRemovesNullableLocalRefFunctionRoot(t *testing.T) {
+	normalized, compatibility, err := normalizeResponsesRequest([]byte(`{
+		"model":"public","input":"hello",
+		"tools":[{"type":"function","name":"lookup","parameters":{
+			"$defs":{"Args":{
+				"type":"object",
+				"properties":{"query":{"type":"string"}},
+				"required":["query"]
+			}},
+			"anyOf":[{"$ref":"#/$defs/Args"},{"type":"null"}]
+		}}]
+	}`), "grok-4.5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if compatibility == nil || !strings.Contains(compatibility.warningHeader(), "function_parameters_nullable_root_normalized") {
+		t.Fatalf("compatibility = %#v", compatibility)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(normalized, &payload); err != nil {
+		t.Fatal(err)
+	}
+	parameters := payload["tools"].([]any)[0].(map[string]any)["parameters"].(map[string]any)
+	if parameters["type"] != "object" {
+		t.Fatalf("upstream parameters = %#v", parameters)
+	}
+	branches := parameters["anyOf"].([]any)
+	if len(branches) != 1 || branches[0].(map[string]any)["$ref"] != "#/$defs/Args" {
+		t.Fatalf("upstream branches = %#v", branches)
+	}
+	visibleParameters := compatibility.visibleTools[0].(map[string]any)["parameters"].(map[string]any)
+	visibleBranches := visibleParameters["anyOf"].([]any)
+	if len(visibleBranches) != 2 || visibleParameters["type"] != nil {
+		t.Fatalf("visible parameters were mutated = %#v", visibleParameters)
+	}
+}
+
+func TestNormalizeResponsesRequestRejectsNullableExternalRefFunctionRoot(t *testing.T) {
+	_, _, err := normalizeResponsesRequest([]byte(`{
+		"model":"public","input":"hello",
+		"tools":[{"type":"function","name":"lookup","parameters":{
+			"anyOf":[
+				{"$ref":"https://example.com/schema.json#/$defs/Args"},
+				{"type":"null"}
+			]
+		}}]
+	}`), "grok-4.5")
+	requestErr, ok := err.(*responsesRequestError)
+	if !ok || requestErr.Param != "tools[0].parameters" || requestErr.Code != "invalid_parameter" {
+		t.Fatalf("error = %#v", err)
+	}
+}
+
+func TestNormalizeBuildFunctionParametersRootVariants(t *testing.T) {
+	tests := []struct {
+		name   string
+		schema map[string]any
+		check  func(*testing.T, map[string]any, bool)
+	}{
+		{
+			name:   "type array",
+			schema: map[string]any{"type": []any{"object", "null"}, "properties": map[string]any{}},
+			check: func(t *testing.T, normalized map[string]any, changed bool) {
+				if !changed || normalized["type"] != "object" {
+					t.Fatalf("normalized=%#v changed=%v", normalized, changed)
+				}
+			},
+		},
+		{
+			name: "oneOf",
+			schema: map[string]any{"oneOf": []any{
+				map[string]any{"type": "object", "additionalProperties": false},
+				map[string]any{"type": "null"},
+			}},
+			check: func(t *testing.T, normalized map[string]any, changed bool) {
+				if !changed || normalized["type"] != "object" || normalized["oneOf"] != nil {
+					t.Fatalf("normalized=%#v changed=%v", normalized, changed)
+				}
+			},
+		},
+		{
+			name: "nested nullable unchanged",
+			schema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{"value": map[string]any{
+					"anyOf": []any{map[string]any{"type": "string"}, map[string]any{"type": "null"}},
+				}},
+			},
+			check: func(t *testing.T, normalized map[string]any, changed bool) {
+				properties := normalized["properties"].(map[string]any)
+				value := properties["value"].(map[string]any)
+				if changed || value["anyOf"] == nil {
+					t.Fatalf("normalized=%#v changed=%v", normalized, changed)
+				}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			value, changed, err := normalizeBuildFunctionParametersRoot(test.schema, "tools[0].parameters")
+			if err != nil {
+				t.Fatal(err)
+			}
+			test.check(t, value.(map[string]any), changed)
+		})
+	}
+}
+
+func TestResponsesCompatibilityRestoresNamespaceAndToolSearchStream(t *testing.T) {
+	_, compatibility, err := normalizeResponsesRequest([]byte(`{
+		"model":"public","input":"hello",
+		"tools":[
+			{"type":"namespace","name":"crm","tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}]},
+			{"type":"tool_search","execution":"client","parameters":{"type":"object"}}
+		]
+	}`), "grok-4.5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := strings.Join([]string{
+		`event: response.output_item.added`,
+		`data: {"type":"response.output_item.added","item":{"id":"item_1","type":"function_call","call_id":"call_1","name":"crm__lookup","arguments":""}}`,
+		``,
+		`event: response.output_item.added`,
+		`data: {"type":"response.output_item.added","item":{"id":"item_2","type":"function_call","call_id":"call_2","name":"grok2api_tool_search","arguments":""}}`,
+		``,
+		`event: response.function_call_arguments.delta`,
+		`data: {"type":"response.function_call_arguments.delta","item_id":"item_2","delta":"{\"goal\":"}`,
+		``,
+		`event: response.function_call_arguments.done`,
+		`data: {"type":"response.function_call_arguments.done","item_id":"item_2","arguments":"{\"goal\":\"crm\"}"}`,
+		``,
+		`event: response.output_item.done`,
+		`data: {"type":"response.output_item.done","item":{"id":"item_2","type":"function_call","call_id":"call_2","name":"grok2api_tool_search","arguments":"{\"goal\":\"crm\"}"}}`,
+		``,
+		`event: response.completed`,
+		`data: {"type":"response.completed","response":{"object":"response","tools":[{"type":"function","name":"crm__lookup"}],"output":[{"type":"function_call","call_id":"call_1","name":"crm__lookup","arguments":"{}"}]}}`,
+		``,
+		`data: [DONE]`,
+		``,
+	}, "\n")
+	stream := compatibility.normalizeResponseStream(io.NopCloser(strings.NewReader(source)))
+	converted, err := io.ReadAll(stream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(converted)
+	if strings.Contains(text, "response.function_call_arguments") {
+		t.Fatalf("内部 Tool Search 参数事件未隐藏:\n%s", text)
+	}
+	for _, expected := range []string{`"namespace":"crm"`, `"type":"tool_search_call"`, `"goal":"crm"`, `"type":"namespace"`, `data: [DONE]`} {
+		if !strings.Contains(text, expected) {
+			t.Fatalf("流式响应缺少 %s:\n%s", expected, text)
+		}
+	}
+}

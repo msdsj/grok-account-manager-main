@@ -73,7 +73,6 @@ class AccountImageTestRequest(BaseModel):
 
 
 class RelayConfigRequest(BaseModel):
-    grok2apiPath: str | None = None
     host: str | None = None
     port: int | None = None
     apiKey: str | None = None

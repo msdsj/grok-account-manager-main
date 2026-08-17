@@ -4,7 +4,7 @@
 
 > 本项目默认按本机工具设计，只监听 `127.0.0.1`。请遵守 Grok、邮箱服务和代理服务的条款，不要把账号凭证、Cookie、OAuth token、代理账号或 `.env` 上传到 GitHub，也不要把管理端口直接暴露到公网。
 >
-> **安全边界：** 控制台登录由本地 `grok2api` 中转处理，并不等于 FastAPI 的全局访问控制。注册、配置和中转管理 API 不应直接暴露到互联网或不受信任的局域网。远程使用请走 SSH 隧道或受控 VPN，不要使用 `--host 0.0.0.0` 直接开放服务。
+> **安全边界：** 控制台登录由本项目的内置网关处理，并不等于 FastAPI 的全局访问控制。注册、配置和中转管理 API 不应直接暴露到互联网或不受信任的局域网。远程使用请走 SSH 隧道或受控 VPN，不要使用 `--host 0.0.0.0` 直接开放服务。
 
 ## 目录
 
@@ -28,9 +28,9 @@
 | CLI | 单机执行注册并写入凭证 | Python、uv、Chrome/Chromium | `uv run grok-account-manager grok ...` |
 | 控制台开发模式 | 修改前端或后端时调试 | CLI 组件，加 Node.js 和 pnpm/npm | 后端 `43187`，前端 `43188` |
 | 控制台构建模式 | 本机日常使用 | CLI 组件，加一次前端构建 | `http://127.0.0.1:43187` |
-| 本地中转 | 使用账号池提供 OpenAI 兼容接口 | 控制台组件，加 Docker Desktop 和外部 `grok2api` 检出 | 控制台的“本地中转”页面 |
+| 本地中转 | 使用账号池提供 OpenAI 兼容接口 | 控制台组件，加 Docker Desktop；网关源码已内置 | 控制台的“本地中转”页面 |
 
-CLI 注册不依赖 `grok2api`。当前完整 Web 控制台的登录、账号管理和中转页面会通过本地 `grok2api` 实例工作，因此要使用完整控制台，请一并完成[本地中转](#本地中转)配置。
+CLI 注册不依赖本地网关。完整 Web 控制台的登录、账号管理和中转页面会通过本项目自动构建的内置网关工作。
 
 ## 环境要求
 
@@ -46,10 +46,7 @@ CLI 注册不依赖 `grok2api`。当前完整 Web 控制台的登录、账号管
 - Node.js `20+`
 - pnpm `11+`。仓库带有 `pnpm-lock.yaml`，推荐使用 pnpm；已有 npm 环境也可使用 `npm install` 和 `npm run ...`。
 
-运行本地中转还需要：
-
-- Docker Desktop，且 Docker daemon 已启动
-- 与当前中转接口兼容的 `grok2api` 源码目录，目录内必须包含 `backend/go.mod`
+运行本地中转还需要 Docker Desktop，且 Docker daemon 已启动。网关源码、前端和 Dockerfile 已随本仓库分发。
 
 ### 端口
 
@@ -57,7 +54,7 @@ CLI 注册不依赖 `grok2api`。当前完整 Web 控制台的登录、账号管
 | --- | --- | --- |
 | FastAPI 后端 | `127.0.0.1:43187` | 注册 API、静态前端、OpenAI 代理入口 |
 | Vite 开发服务器 | `127.0.0.1:43188` | 前端热更新开发服务 |
-| 本地中转 | `127.0.0.1:43871` | 由 `grok2api` 提供的上游服务 |
+| 本地中转 | `127.0.0.1:43871` | 由本项目镜像提供的内置网关 |
 | 可选 Postgres 容器 | 主机端口 `54329` | 预留开发数据库，不是当前默认运行依赖；现有 Compose 默认会发布端口 |
 
 若端口冲突，请优先改启动参数，而不是结束不明进程。例如后端改为 `43190`：
@@ -361,21 +358,7 @@ uv run grok-account-manager grok \
 
 ## 本地中转
 
-本项目不内置 `grok2api` 源码。要启用完整控制台和 OpenAI 兼容中转，请准备一个兼容的新版本 `grok2api` 源码目录，并启动 Docker Desktop。
-
-推荐把外部项目放到默认位置：
-
-```bash
-git clone https://github.com/chenyme/grok2api.git "$HOME/Downloads/grok2api-main"
-```
-
-也可以在 `.env` 指定其他绝对路径：
-
-```dotenv
-GROK2API_PATH=/absolute/path/to/grok2api-main
-```
-
-启动本项目后，后端会在后台尝试构建并启动本地中转镜像。若 Docker、源码目录或 `backend/go.mod` 缺失，注册 API 仍可启动，但完整 Web 控制台的登录和中转功能会不可用。
+本项目将网关源码、前端和 Dockerfile 完整内置在 `gateway/`。启动本项目后，后端会从该目录构建并启动唯一的 `grok-account-manager-gateway:local` 镜像；不会读取其他项目目录或镜像。
 
 首次成功准备中转时，项目会在 `output/` 下生成中转配置和数据目录。中转管理员用户名为 `grok-account-manager`；首次生成的管理员密码保存在仅本机可读的 `output/relay-config.json` 的 `admin_key` 字段中。该值是机密，不能截图、提交或发送给他人；应在可信本机上妥善保存并按需更换。
 
@@ -442,7 +425,7 @@ lsof -nP -iTCP:43188 -sTCP:LISTEN
 
 1. 后端是否运行在 `127.0.0.1:43187`。
 2. 开发模式下，`VITE_DEV_API_TARGET` 是否与后端实际地址一致。
-3. 是否已完成 `grok2api` 源码路径和 Docker Desktop 配置。
+3. Docker Desktop 是否已启动，以及仓库内 `gateway/` 是否完整。
 4. 查看 `output/backend.log` 与 `output/grok2api-relay.log` 的最后几行，不要把含 token 的整份日志公开。
 
 ### 浏览器没有打开或注册页无法加载

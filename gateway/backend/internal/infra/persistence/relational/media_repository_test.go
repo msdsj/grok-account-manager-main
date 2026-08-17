@@ -1,0 +1,510 @@
+package relational
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"testing"
+	"time"
+
+	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
+	mediadomain "github.com/chenyme/grok2api/backend/internal/domain/media"
+	"github.com/chenyme/grok2api/backend/internal/repository"
+	"gorm.io/gorm"
+)
+
+func TestMediaJobRepositoryListMediaJobsPaginatesAndFilters(t *testing.T) {
+	ctx := context.Background()
+	database := openTestDatabase(t)
+
+	accountValue, _, err := NewAccountRepository(database).UpsertByIdentity(ctx, accountdomain.Credential{
+		Provider:             accountdomain.ProviderWeb,
+		AuthType:             accountdomain.AuthTypeSSO,
+		WebTier:              accountdomain.WebTierBasic,
+		Name:                 "media-list-account",
+		SourceKey:            "media-list-account",
+		EncryptedAccessToken: testEncryptedToken,
+		AuthStatus:           accountdomain.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := clientKeyModel{Name: "media-list-key", Prefix: "media-list-key", SecretHash: testSecretHash, EncryptedSecret: testEncryptedToken, Enabled: true, RPMLimit: 60, MaxConcurrent: 4}
+	if err := database.db.WithContext(ctx).Create(&key).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	jobRepo := NewMediaJobRepository(database)
+	now := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
+	jobs := []mediadomain.Job{
+		testMediaJob("media_job_completed_old", accountValue.ID, key.ID, mediadomain.StatusCompleted, now.Add(-4*time.Hour)),
+		testMediaJob("media_job_queued_mid", accountValue.ID, key.ID, mediadomain.StatusQueued, now.Add(-3*time.Hour)),
+		testMediaJob("media_job_failed_newer", accountValue.ID, key.ID, mediadomain.StatusFailed, now.Add(-2*time.Hour)),
+		testMediaJob("media_job_completed_new", accountValue.ID, key.ID, mediadomain.StatusCompleted, now.Add(-time.Hour)),
+	}
+	jobs[0].Prompt = "A quiet harbor"
+	jobs[0].ResultAssetID = "vid_media_list_00000001"
+	jobs[1].Prompt = "Northern lights"
+	jobs[2].Prompt = "Desert sunrise"
+	jobs[3].Prompt = "City skyline"
+	for _, job := range jobs {
+		if err := jobRepo.CreateMediaJob(ctx, job); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	firstPage, total, err := jobRepo.ListMediaJobs(ctx, repository.MediaJobListQuery{
+		Page: repository.PageQuery{Offset: 0, Limit: 2},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 4 {
+		t.Fatalf("total = %d", total)
+	}
+	assertMediaJobIDs(t, firstPage, "media_job_completed_new", "media_job_failed_newer")
+
+	secondPage, total, err := jobRepo.ListMediaJobs(ctx, repository.MediaJobListQuery{
+		Page: repository.PageQuery{Offset: 2, Limit: 2},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 4 {
+		t.Fatalf("second page total = %d", total)
+	}
+	assertMediaJobIDs(t, secondPage, "media_job_queued_mid", "media_job_completed_old")
+
+	completed, total, err := jobRepo.ListMediaJobs(ctx, repository.MediaJobListQuery{
+		Page:   repository.PageQuery{Offset: 0, Limit: 10},
+		Filter: repository.MediaJobListFilter{Status: string(mediadomain.StatusCompleted)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 2 {
+		t.Fatalf("completed total = %d", total)
+	}
+	assertMediaJobIDs(t, completed, "media_job_completed_new", "media_job_completed_old")
+	if completed[1].ResultAssetID != jobs[0].ResultAssetID {
+		t.Fatalf("completed asset ID = %q", completed[1].ResultAssetID)
+	}
+
+	searched, total, err := jobRepo.ListMediaJobs(ctx, repository.MediaJobListQuery{
+		Page: repository.PageQuery{Offset: 0, Limit: 1, Search: "northern"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 1 {
+		t.Fatalf("searched total = %d", total)
+	}
+	assertMediaJobIDs(t, searched, "media_job_queued_mid")
+
+	sorted, total, err := jobRepo.ListMediaJobs(ctx, repository.MediaJobListQuery{
+		Page: repository.PageQuery{
+			Offset: 0,
+			Limit:  4,
+			Sort:   repository.SortQuery{Field: "prompt", Direction: repository.SortAscending},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 4 {
+		t.Fatalf("sorted total = %d", total)
+	}
+	assertMediaJobIDs(t, sorted, "media_job_completed_old", "media_job_completed_new", "media_job_failed_newer", "media_job_queued_mid")
+
+	stats, err := jobRepo.SummarizeMediaJobs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.TotalJobs != 4 || stats.Completed != 2 || stats.Failed != 1 || stats.InProgress != 0 || stats.Queued != 1 {
+		t.Fatalf("stats = %#v", stats)
+	}
+}
+
+func TestMediaJobRepositoryKeepsLargeInputOffHotPaths(t *testing.T) {
+	ctx := context.Background()
+	database := openTestDatabase(t)
+	accountValue, _, err := NewAccountRepository(database).UpsertByIdentity(ctx, accountdomain.Credential{
+		Provider: accountdomain.ProviderWeb, AuthType: accountdomain.AuthTypeSSO,
+		Name: "large-input-account", SourceKey: "large-input-account",
+		EncryptedAccessToken: testEncryptedToken, AuthStatus: accountdomain.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := clientKeyModel{Name: "large-input-key", Prefix: "large-input-key", SecretHash: testSecretHash, EncryptedSecret: testEncryptedToken, Enabled: true, RPMLimit: 60, MaxConcurrent: 4}
+	if err := database.db.WithContext(ctx).Create(&key).Error; err != nil {
+		t.Fatal(err)
+	}
+	repository := NewMediaJobRepository(database)
+	now := time.Now().UTC()
+	job := testMediaJob("media_job_large_input", accountValue.ID, key.ID, mediadomain.StatusQueued, now)
+	job.InputJSON = `{"image_urls":["` + strings.Repeat("A", (1<<20)+1) + `"]}`
+	job.InputImageCount = 1
+	if err := repository.CreateMediaJob(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+
+	polled, err := repository.GetMediaJob(ctx, job.ID, key.ID)
+	if err != nil || polled.InputJSON != "" || polled.InputImageCount != 1 {
+		t.Fatalf("poll projection input len=%d count=%d err=%v", len(polled.InputJSON), polled.InputImageCount, err)
+	}
+	recoverable, err := repository.ListRecoverableMediaJobs(ctx, 1000)
+	if err != nil || len(recoverable) != 1 || recoverable[0].ID != job.ID || recoverable[0].InputJSON != "" {
+		t.Fatalf("recoverable jobs=%#v err=%v", recoverable, err)
+	}
+	claimed, ok, err := repository.TryClaimMediaJob(ctx, job.ID, now, now.Add(time.Hour), "claim_large_input_1234")
+	if err != nil || !ok || claimed.InputJSON != job.InputJSON || claimed.InputImageCount != 1 {
+		t.Fatalf("claimed input len=%d count=%d ok=%v err=%v", len(claimed.InputJSON), claimed.InputImageCount, ok, err)
+	}
+	claimed.Progress = 20
+	claimed.InputJSON = `{"image_urls":["should-not-overwrite"]}`
+	if err := repository.UpdateMediaJob(ctx, claimed); err != nil {
+		t.Fatal(err)
+	}
+	var storedInput string
+	if err := database.db.WithContext(ctx).Model(&mediaJobModel{}).Where("id = ?", job.ID).Pluck("input_json", &storedInput).Error; err != nil || storedInput != job.InputJSON {
+		t.Fatalf("progress update changed immutable input len=%d err=%v", len(storedInput), err)
+	}
+	completedAt := now.Add(time.Minute)
+	claimed.Status, claimed.Progress, claimed.CompletedAt = mediadomain.StatusCompleted, 100, &completedAt
+	if err := repository.UpdateMediaJob(ctx, claimed); err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := repository.ListUnrecordedTerminalMediaJobs(ctx, 200)
+	if err != nil || len(terminal) != 1 || terminal[0].InputJSON != "" || terminal[0].InputImageCount != 1 {
+		t.Fatalf("terminal jobs=%#v err=%v", terminal, err)
+	}
+	if err := repository.MarkMediaJobUsageRecorded(ctx, job.ID, completedAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.db.WithContext(ctx).Model(&mediaJobModel{}).Where("id = ?", job.ID).Pluck("input_json", &storedInput).Error; err != nil || storedInput != "{}" {
+		t.Fatalf("recorded terminal input=%q err=%v", storedInput, err)
+	}
+}
+
+func TestMediaAssetRepositoryExpiresInputOnlyWhenUnreferenced(t *testing.T) {
+	ctx := context.Background()
+	database := openTestDatabase(t)
+	accountValue, _, err := NewAccountRepository(database).UpsertByIdentity(ctx, accountdomain.Credential{
+		Provider: accountdomain.ProviderWeb, AuthType: accountdomain.AuthTypeSSO,
+		Name: "protected-input-account", SourceKey: "protected-input-account",
+		EncryptedAccessToken: testEncryptedToken, AuthStatus: accountdomain.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := clientKeyModel{Name: "protected-input-key", Prefix: "protected-input-key", SecretHash: testSecretHash, EncryptedSecret: testEncryptedToken, Enabled: true, RPMLimit: 60, MaxConcurrent: 4}
+	if err := database.db.WithContext(ctx).Create(&key).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now().UTC()
+	expiresAt := now.Add(-time.Hour)
+	activeID := "input_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	terminalID := "input_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+	assets := NewMediaAssetRepository(database)
+	for _, id := range []string{activeID, terminalID} {
+		if err := assets.CreateMediaAsset(ctx, mediadomain.Asset{
+			ID: id, Kind: "image", StorageKey: id + ".png", MIMEType: "image/png",
+			SizeBytes: 68, SHA256: strings.Repeat("a", 64), ExpiresAt: &expiresAt, CreatedAt: now.Add(-2 * time.Hour),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	jobs := NewMediaJobRepository(database)
+	active := testMediaJob("media_job_protected_input", accountValue.ID, key.ID, mediadomain.StatusQueued, now)
+	active.InputJSON = `{"image_urls":["` + mediadomain.InputReference(activeID) + `"]}`
+	active.InputImageCount = 1
+	if err := jobs.CreateMediaJob(ctx, active); err != nil {
+		t.Fatal(err)
+	}
+	terminal := testMediaJob("media_job_terminal_input", accountValue.ID, key.ID, mediadomain.StatusCompleted, now)
+	terminal.InputJSON = `{"image_urls":["` + mediadomain.InputReference(terminalID) + `"]}`
+	terminal.InputImageCount = 1
+	if err := jobs.CreateMediaJob(ctx, terminal); err != nil {
+		t.Fatal(err)
+	}
+
+	markedAt := now.Add(time.Minute)
+	if expired, err := assets.ExpireMediaInputIfUnreferenced(ctx, activeID, markedAt); err != nil || expired {
+		t.Fatalf("active input expired=%t err=%v", expired, err)
+	}
+	if expired, err := assets.ExpireMediaInputIfUnreferenced(ctx, terminalID, markedAt); err != nil || !expired {
+		t.Fatalf("terminal input expired=%t err=%v", expired, err)
+	}
+	stored, err := assets.GetMediaAsset(ctx, terminalID)
+	if err != nil || stored.ExpiresAt == nil || !stored.ExpiresAt.Equal(markedAt) {
+		t.Fatalf("terminal input expiry=%v err=%v", stored.ExpiresAt, err)
+	}
+}
+
+func TestAccountDeleteDetachesTerminalMediaJobsAndRejectsActiveJobs(t *testing.T) {
+	ctx := context.Background()
+	database := openTestDatabase(t)
+	accounts := NewAccountRepository(database)
+	accountValue, _, err := accounts.UpsertByIdentity(ctx, accountdomain.Credential{
+		Provider: accountdomain.ProviderWeb, AuthType: accountdomain.AuthTypeSSO,
+		Name: "media-delete-account", SourceKey: "media-delete-account",
+		EncryptedAccessToken: testEncryptedToken, AuthStatus: accountdomain.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := clientKeyModel{Name: "media-delete-key", Prefix: "media-delete-key", SecretHash: testSecretHash, EncryptedSecret: testEncryptedToken, Enabled: true, RPMLimit: 60, MaxConcurrent: 4}
+	if err := database.db.WithContext(ctx).Create(&key).Error; err != nil {
+		t.Fatal(err)
+	}
+	job := testMediaJob("media_job_account_delete", accountValue.ID, key.ID, mediadomain.StatusCompleted, time.Now().UTC())
+	job.AccountName = accountValue.Name
+	jobs := NewMediaJobRepository(database)
+	if err := jobs.CreateMediaJob(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := accounts.Delete(ctx, accountValue.ID); err != nil {
+		t.Fatalf("delete account with terminal media job: %v", err)
+	}
+	stored, err := jobs.GetMediaJobsByIDs(ctx, []string{job.ID})
+	if err != nil || len(stored) != 1 || stored[0].AccountID != 0 || stored[0].AccountName != accountValue.Name {
+		t.Fatalf("detached terminal job = %#v, error = %v", stored, err)
+	}
+
+	activeAccount, _, err := accounts.UpsertByIdentity(ctx, accountdomain.Credential{
+		Provider: accountdomain.ProviderWeb, AuthType: accountdomain.AuthTypeSSO,
+		Name: "media-active-account", SourceKey: "media-active-account",
+		EncryptedAccessToken: testEncryptedToken, AuthStatus: accountdomain.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	activeJob := testMediaJob("media_job_account_active", activeAccount.ID, key.ID, mediadomain.StatusInProgress, time.Now().UTC())
+	if err := jobs.CreateMediaJob(ctx, activeJob); err != nil {
+		t.Fatal(err)
+	}
+	if err := accounts.Delete(ctx, activeAccount.ID); !errors.Is(err, repository.ErrConflict) || !strings.Contains(err.Error(), "进行中") {
+		t.Fatalf("delete account with active media job error = %v", err)
+	}
+	if _, err := accounts.Get(ctx, activeAccount.ID); err != nil {
+		t.Fatalf("active job conflict removed account: %v", err)
+	}
+}
+
+func TestMediaAssetRepositoryListMediaAssetsPaginatesAndCounts(t *testing.T) {
+	ctx := context.Background()
+	database := openTestDatabase(t)
+	assetRepo := NewMediaAssetRepository(database)
+
+	stats, err := assetRepo.SummarizeMediaAssets(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.TotalImages != 0 || stats.TotalBytes != 0 {
+		t.Fatalf("initial stats = %#v", stats)
+	}
+
+	now := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
+	assets := []mediadomain.Asset{
+		testMediaAsset("media_asset_0001", "media/asset-0001.png", now.Add(-3*time.Hour)),
+		testMediaAsset("media_asset_0002", "media/asset-0002.png", now.Add(-2*time.Hour)),
+		testMediaAsset("media_asset_0003", "media/asset-0003.png", now.Add(-time.Hour)),
+	}
+	for _, asset := range assets {
+		if err := assetRepo.CreateMediaAsset(ctx, asset); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	firstPage, total, err := assetRepo.ListMediaAssets(ctx, repository.MediaAssetListQuery{
+		Page: repository.PageQuery{Offset: 0, Limit: 2},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 3 {
+		t.Fatalf("total = %d", total)
+	}
+	assertMediaAssetIDs(t, firstPage, "media_asset_0003", "media_asset_0002")
+
+	secondPage, total, err := assetRepo.ListMediaAssets(ctx, repository.MediaAssetListQuery{
+		Page: repository.PageQuery{Offset: 2, Limit: 2},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 3 {
+		t.Fatalf("second page total = %d", total)
+	}
+	assertMediaAssetIDs(t, secondPage, "media_asset_0001")
+
+	searched, total, err := assetRepo.ListMediaAssets(ctx, repository.MediaAssetListQuery{
+		Page: repository.PageQuery{Offset: 0, Limit: 1, Search: "0001"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 1 {
+		t.Fatalf("searched total = %d", total)
+	}
+	assertMediaAssetIDs(t, searched, "media_asset_0001")
+
+	stats, err = assetRepo.SummarizeMediaAssets(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.TotalImages != 3 || stats.TotalBytes != 3*1024 {
+		t.Fatalf("stats = %#v", stats)
+	}
+}
+
+func testMediaJob(id string, accountID, clientKeyID uint64, status mediadomain.Status, createdAt time.Time) mediadomain.Job {
+	job := mediadomain.Job{
+		ID:            id,
+		RequestID:     "request-" + id,
+		ClientKeyID:   clientKeyID,
+		ClientKeyName: "media-list-key",
+		AccountID:     accountID,
+		AccountName:   "media-list-account",
+		Provider:      "grok_web",
+		Model:         "grok-imagine-video",
+		ModelRouteID:  1,
+		UpstreamModel: "grok-imagine-video-upstream",
+		Prompt:        "test prompt",
+		Seconds:       8,
+		Size:          "16:9",
+		Quality:       "720p",
+		Status:        status,
+		InputJSON:     `{}`,
+		CreatedAt:     createdAt,
+		UpdatedAt:     createdAt,
+	}
+	if status == mediadomain.StatusCompleted || status == mediadomain.StatusFailed {
+		job.Progress = 100
+		completedAt := createdAt.Add(time.Minute)
+		job.CompletedAt = &completedAt
+	}
+	return job
+}
+
+func TestMediaUploadTicketRepositoryDeleteUploadTicketByHash(t *testing.T) {
+	ctx := context.Background()
+	database := openTestDatabase(t)
+	repo := NewMediaUploadTicketRepository(database)
+	now := time.Now().UTC()
+	hash := strings.Repeat("ab", 32)
+	otherHash := strings.Repeat("cd", 32)
+	if err := repo.CreateUploadTicket(ctx, repository.MediaUploadTicket{
+		TokenHash: hash, AssetID: "vid_delete_by_hash_1", JobID: "job_delete_by_hash",
+		MaxBytes: 1024, AllowedMIME: "video/mp4", ExpiresAt: now.Add(time.Hour), CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.CreateUploadTicket(ctx, repository.MediaUploadTicket{
+		TokenHash: otherHash, AssetID: "vid_delete_by_hash_2", JobID: "job_delete_keep",
+		MaxBytes: 1024, AllowedMIME: "video/mp4", ExpiresAt: now.Add(time.Hour), CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := repo.DeleteUploadTicketByHash(ctx, hash); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if _, err := repo.GetUploadTicketByHash(ctx, hash); !errors.Is(err, repository.ErrNotFound) {
+		t.Fatalf("deleted ticket still readable: %v", err)
+	}
+	// 精确删除不得影响其他票据。
+	if _, err := repo.GetUploadTicketByHash(ctx, otherHash); err != nil {
+		t.Fatalf("other ticket removed: %v", err)
+	}
+	// 幂等：再次删除缺失行成功。
+	if err := repo.DeleteUploadTicketByHash(ctx, hash); err != nil {
+		t.Fatalf("idempotent delete: %v", err)
+	}
+	if err := repo.DeleteUploadTicketByHash(ctx, ""); err != nil {
+		t.Fatalf("empty hash delete: %v", err)
+	}
+}
+
+func TestMediaUploadTicketRepositoryConsumeRollsBackWhenTicketReadFails(t *testing.T) {
+	ctx := context.Background()
+	database := openTestDatabase(t)
+	repo := NewMediaUploadTicketRepository(database)
+	now := time.Now().UTC()
+	hash := strings.Repeat("ef", 32)
+	if err := repo.CreateUploadTicket(ctx, repository.MediaUploadTicket{
+		TokenHash: hash, AssetID: "vid_consume_rollback_1", JobID: "job_consume_rollback",
+		MaxBytes: 1024, AllowedMIME: "video/mp4", ExpiresAt: now.Add(time.Hour), CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	injected := errors.New("injected ticket read failure")
+	callbackName := "test:fail_consumed_ticket_read"
+	failed := false
+	if err := database.db.Callback().Query().Before("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+		if !failed && tx.Statement != nil && tx.Statement.Table == "media_upload_tickets" {
+			failed = true
+			_ = tx.AddError(injected)
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, consumed, err := repo.ConsumeUploadTicket(ctx, hash, now)
+	if removeErr := database.db.Callback().Query().Remove(callbackName); removeErr != nil {
+		t.Fatal(removeErr)
+	}
+	if !errors.Is(err, injected) || consumed {
+		t.Fatalf("consume = (%v, %v), want injected error and consumed=false", consumed, err)
+	}
+	if !failed {
+		t.Fatal("ticket read failure callback did not run")
+	}
+	ticket, err := repo.GetUploadTicketByHash(ctx, hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ticket.ConsumedAt != nil {
+		t.Fatalf("consume transaction was not rolled back: consumed_at=%v", ticket.ConsumedAt)
+	}
+}
+
+func testMediaAsset(id, storageKey string, createdAt time.Time) mediadomain.Asset {
+	return mediadomain.Asset{
+		ID:         id,
+		Kind:       "image",
+		StorageKey: storageKey,
+		MIMEType:   "image/png",
+		SizeBytes:  1024,
+		SHA256:     strings.Repeat("a", 64),
+		CreatedAt:  createdAt,
+	}
+}
+
+func assertMediaJobIDs(t *testing.T, values []mediadomain.Job, expected ...string) {
+	t.Helper()
+	if len(values) != len(expected) {
+		t.Fatalf("len(values) = %d, expected %d: %#v", len(values), len(expected), values)
+	}
+	for index, id := range expected {
+		if values[index].ID != id {
+			t.Fatalf("values[%d].ID = %q, expected %q; values = %#v", index, values[index].ID, id, values)
+		}
+	}
+}
+
+func assertMediaAssetIDs(t *testing.T, values []mediadomain.Asset, expected ...string) {
+	t.Helper()
+	if len(values) != len(expected) {
+		t.Fatalf("len(values) = %d, expected %d: %#v", len(values), len(expected), values)
+	}
+	for index, id := range expected {
+		if values[index].ID != id {
+			t.Fatalf("values[%d].ID = %q, expected %q; values = %#v", index, values[index].ID, id, values)
+		}
+	}
+}

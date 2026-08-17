@@ -1,0 +1,52 @@
+# OS and editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+/config.yaml
+/config.local.yaml
+/config.*.local.yaml
+/docs/*
+/docs/rules/*
+/backend/docs/goal/
+*.har
+*.pcap
+*.pcapng
+
+# Runtime data
+/data/
+/backend/data/
+*.log
+
+# Go
+/.gocache/
+/.gocache-*/
+/backend/grok2api
+/backend/coverage.out
+*.coverprofile
+*.test
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Frontend
+/.pnpm-store/
+/frontend/node_modules/
+/frontend/dist/
+/frontend/.cache/
+/frontend/*.tsbuildinfo
+
+# Temporary files
+/release/
+/.tmp/
+/tmp/
+/Dockerfile.local

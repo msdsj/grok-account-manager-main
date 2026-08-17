@@ -1,0 +1,153 @@
+package memory
+
+import (
+	"context"
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/chenyme/grok2api/backend/internal/domain/account"
+)
+
+func TestRateAndConcurrencyLimits(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now()
+	rate := NewRateLimiter()
+	if allowed, _ := rate.Allow(ctx, "key", 1, now); !allowed {
+		t.Fatal("第一次请求应被允许")
+	}
+	if allowed, _ := rate.Allow(ctx, "key", 1, now); allowed {
+		t.Fatal("同一分钟的第二次请求应被拒绝")
+	}
+
+	concurrency := NewConcurrencyLimiter()
+	release, acquired, _ := concurrency.Acquire(ctx, "key", 1)
+	if !acquired {
+		t.Fatal("第一次并发租约应成功")
+	}
+	if _, acquired, _ := concurrency.Acquire(ctx, "key", 1); acquired {
+		t.Fatal("超过并发上限的租约不应成功")
+	}
+	release()
+	if _, acquired, _ := concurrency.Acquire(ctx, "key", 1); !acquired {
+		t.Fatal("释放后应能再次获取租约")
+	}
+	values, err := concurrency.CurrentMany(ctx, []string{"key", "missing"})
+	if err != nil || values["key"] != 1 || values["missing"] != 0 {
+		t.Fatalf("并发快照 = %#v, err = %v", values, err)
+	}
+}
+
+func BenchmarkConcurrencyLimiterCurrentMany(b *testing.B) {
+	ctx := context.Background()
+	limiter := NewConcurrencyLimiter()
+	keys := make([]string, 3000)
+	releases := make([]func(), 0, len(keys))
+	for index := range keys {
+		key := fmt.Sprintf("account:%d", index+1)
+		keys[index] = key
+		release, acquired, err := limiter.Acquire(ctx, key, 8)
+		if err != nil || !acquired {
+			b.Fatalf("预置并发租约失败: acquired=%v err=%v", acquired, err)
+		}
+		releases = append(releases, release)
+	}
+	defer func() {
+		for _, release := range releases {
+			release()
+		}
+	}()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(parallel *testing.PB) {
+		for parallel.Next() {
+			values, err := limiter.CurrentMany(ctx, keys)
+			if err != nil || len(values) != len(keys) {
+				b.Fatalf("并发快照数量 = %d, err = %v", len(values), err)
+			}
+		}
+	})
+}
+
+func TestStickyStoreExpires(t *testing.T) {
+	ctx := context.Background()
+	store := NewStickyStore()
+	now := time.Now()
+	if err := store.Set(ctx, "session", 42, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if id, ok, _ := store.Get(ctx, "session", now); !ok || id != 42 {
+		t.Fatalf("粘滞账号 = %d, %v", id, ok)
+	}
+	if _, ok, _ := store.Get(ctx, "session", now.Add(2*time.Second)); ok {
+		t.Fatal("过期粘滞绑定仍然可用")
+	}
+}
+
+func TestStickyStoreBindPreservesExistingAccountAndRefreshesExpiry(t *testing.T) {
+	ctx := context.Background()
+	store := NewStickyStore()
+	now := time.Now().UTC()
+	bound, err := store.Bind(ctx, "session", 42, now, now.Add(time.Minute))
+	if err != nil || bound != 42 {
+		t.Fatalf("first bind = %d, err = %v", bound, err)
+	}
+	bound, err = store.Bind(ctx, "session", 99, now.Add(30*time.Second), now.Add(90*time.Second))
+	if err != nil || bound != 42 {
+		t.Fatalf("existing bind = %d, err = %v", bound, err)
+	}
+	if id, ok, err := store.Get(ctx, "session", now.Add(75*time.Second)); err != nil || !ok || id != 42 {
+		t.Fatalf("refreshed bind = %d, %v, err = %v", id, ok, err)
+	}
+	if _, ok, err := store.Get(ctx, "session", now.Add(100*time.Second)); err != nil || ok {
+		t.Fatalf("expired refreshed bind remains available: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestStickyStoreDeleteByAccountsScansEachShardOnce(t *testing.T) {
+	ctx := context.Background()
+	store := NewStickyStore()
+	expiresAt := time.Now().UTC().Add(time.Minute)
+	if err := store.Set(ctx, "first", 7, expiresAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Set(ctx, "second", 8, expiresAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Set(ctx, "keep", 9, expiresAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeleteByAccounts(ctx, []uint64{7, 8, 8, 0}); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"first", "second"} {
+		if _, ok, err := store.Get(ctx, key, time.Now().UTC()); err != nil || ok {
+			t.Fatalf("deleted binding %q remains: ok=%v err=%v", key, ok, err)
+		}
+	}
+	if id, ok, err := store.Get(ctx, "keep", time.Now().UTC()); err != nil || !ok || id != 9 {
+		t.Fatalf("unrelated binding = %d, ok=%v err=%v", id, ok, err)
+	}
+}
+
+func TestDeviceSessionStoreCleansExpiredAndStaysBounded(t *testing.T) {
+	ctx := context.Background()
+	store := NewDeviceSessionStore()
+	now := time.Now().UTC()
+	if err := store.Create(ctx, account.DeviceSession{ID: "expired", ExpiresAt: now.Add(-time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+	for index := range maxDeviceSessions + 1 {
+		id := fmt.Sprintf("session-%d", index)
+		if err := store.Create(ctx, account.DeviceSession{ID: id, ExpiresAt: now.Add(time.Duration(index+1) * time.Minute)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, exists := store.sessions["expired"]; exists {
+		t.Fatal("expired device session was not removed")
+	}
+	if len(store.sessions) != maxDeviceSessions {
+		t.Fatalf("device sessions = %d, want %d", len(store.sessions), maxDeviceSessions)
+	}
+}

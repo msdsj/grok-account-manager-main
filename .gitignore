@@ -9,6 +9,10 @@ output/*
 !output/.gitkeep
 web/dist/
 web/node_modules/
+gateway/frontend/dist/
+gateway/frontend/node_modules/
+gateway/frontend/.cache/
+gateway/backend/.cache/
 
 # 数据库文件（双重保护）
 *.db

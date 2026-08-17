@@ -1,0 +1,137 @@
+# 配置标记：
+# - [必须修改] 首次启动前必须替换，否则服务会拒绝启动或存在安全风险。
+# - [按需修改] 仅在部署方式发生变化时调整。
+# - [通常不要修改] 已采用推荐默认值。
+
+server:
+  # [通常不要修改] Docker 镜像会通过启动参数覆盖为 0.0.0.0:8000。
+  listen: "127.0.0.1:8000"
+  # [通常不要修改] 单次请求体上限 32 MiB。
+  maxBodyBytes: 33554432
+  # [通常不要修改] 仅限制客户端上传完整请求体的时间，不限制推理或流式响应。
+  readTimeout: 15m
+  # [通常不要修改] 管理 API 和非流式请求的最长生命周期。
+  requestTimeout: 2h
+  # [按需修改] 仅在本地或受信任环境开启，生产环境保持 false。
+  swaggerEnabled: false
+
+auth:
+  # [通常不要修改] 管理端访问与刷新令牌有效期。
+  accessTokenTTL: 15m
+  refreshTokenTTL: 720h
+  # [按需修改] 外部地址使用 HTTPS 时必须设为 true。
+  secureCookies: false
+
+secrets:
+  # [必须修改] 至少 32 个字符。快速生成：openssl rand -hex 32
+  jwtSecret: "replace-with-at-least-32-characters"
+  # [必须修改] Base64 编码的 32 字节密钥。快速生成：openssl rand -base64 32
+  # 首次写入账号后必须长期保留，后续更换会导致已有凭据无法解密。
+  credentialEncryptionKey: "replace-with-base64-key"
+
+bootstrapAdmin:
+  # [按需修改] 仅在数据库中没有管理员时使用。
+  username: "admin"
+  # [必须修改] 首次启动前替换为强密码；管理员创建成功后建议删除本段。
+  password: "replace-with-a-strong-password"
+
+frontend:
+  # [通常不要修改] Go 服务同源托管的前端构建目录。
+  staticPath: "./frontend/dist"
+
+database:
+  # [按需修改] 单实例使用 sqlite；多实例改为 postgres。
+  driver: sqlite # sqlite | postgres
+  sqlite:
+    # [通常不要修改] 相对路径以本配置文件所在目录为基准。
+    path: "./data/backend.db"
+  postgres:
+    # [必须修改：仅 driver=postgres] 填写真实 DSN，并按需启用 sslmode。
+    # 也可通过 GROK2API_DATABASE_URL 注入；非空环境变量会覆盖本字段并自动启用 postgres。
+    dsn: "postgres://user:password@127.0.0.1:5432/grok2api?sslmode=disable"
+    # [按需修改] 根据数据库连接容量调整。
+    maxOpenConns: 50
+    maxIdleConns: 10
+
+runtimeStore:
+  # [按需修改] 单实例使用 memory；多实例改为 redis。
+  driver: memory # memory | redis
+  redis:
+    # [必须修改：仅 driver=redis] 填写 Redis 连接信息。
+    address: "127.0.0.1:6379"
+    username: ""
+    password: ""
+    database: 0
+    # [通常不要修改] 同一 Redis 中部署多个实例组时才需要更换。
+    keyPrefix: "grok2api:"
+    # [按需修改] Redis 使用 TLS 时设为 true。
+    tls: false
+
+deployment:
+  # [通常不要修改] 单实例保持 1；多实例必须同时使用 PostgreSQL、Redis 和共享媒体目录。
+  replicas: 1
+  # [必须修改：仅 replicas>1] 每个实例使用不同的稳定标识。
+  instanceID: ""
+  # [必须修改：仅 replicas>1] 同一实例组和共享媒体目录必须使用相同标识。
+  clusterID: "grok2api"
+  # [必须修改：仅 replicas>1] 确认 media.local.path 已挂载为所有实例共享且可读写的存储。
+  sharedMedia: false
+
+media:
+  # [通常不要修改] 当前仅支持 local；容量和清理策略在管理端设置。
+  driver: local
+  local:
+    # [按需修改] 图片二进制目录；数据库只保存资源元数据。
+    path: "./data/media"
+
+routing:
+  # [按需修改] 服务端推理回放缓存：多轮时自动补回客户端未携带的 encrypted_content。
+  reasoningReplayEnabled: true
+  reasoningReplayTTL: 1h
+  reasoningReplayMaxEntries: 10240
+  # [按需修改] 按账号隔离上游连接池，适合外部 L4/连接哈希负载均衡；会增加连接数、TLS 握手和文件描述符占用。
+  accountIsolatedConnections: false
+  # [通常不要修改] 大账号池默认使用有界分段选号；保留完整池回退、额度优先级和原子并发门禁。
+  segmentedSelectorEnabled: true
+  segmentedSelectorMinCandidates: 3000
+  segmentedSelectorWindowSize: 64
+
+audit:
+  # [通常不要修改] 审计批量写入参数；bufferSize 的修改需重启生效。
+  bufferSize: 16384
+  batchSize: 256
+  flushInterval: 250ms
+  # [通常不要修改] 需要调用方确认提交的审计最多聚合等待该时长；建议保持 1ms–50ms。
+  commitDelay: 5ms
+  # [通常不要修改] enforce 会在异常持续超过宽限期后暂停新的推理请求；确认发生数据丢失时会立即暂停。
+  ledgerMode: enforce # observe | enforce
+  ledgerFailureThreshold: 1
+  ledgerUnhealthyGrace: 10s
+  ledgerQueueHighWatermarkPercent: 90
+
+# [按需启用] Grok Build 出口质量守护。仅配置后仍不会自动启动 sidecar；
+# 使用 docker compose --profile quality-guard up -d --build 启动。
+qualityGuard:
+  enabled: false
+  # 主程序会自动创建并复用不可导出的内部探测身份，无需配置 Client Key。
+  # 使用已验证会输出推理 Token 的 Build 模型时，内置恢复探针还会校验 reasoning Token。
+  model: "grok-4.5"
+  mode: hybrid # passive | active | hybrid
+  activeInterval: 30m
+  passivePollInterval: 5s
+  softTPS: 500
+  hardTPS: 1000
+  consecutiveSoft: 2
+  consecutiveErrors: 2
+  quarantineDuration: 5m
+  noAccountBackoff: 5m
+  minimumHealthyNodes: 3
+  maxOutputTokens: 384
+  failClosed: false
+  minimumGenerationWindow: 1s
+  # 可选的受信任换 IP Webhook；启用时同时填写 rotatableNodeIDs。
+  rotationURL: ""
+  rotationToken: ""
+  rotationTimeout: 45s
+  nodeIDs: []
+  rotatableNodeIDs: []

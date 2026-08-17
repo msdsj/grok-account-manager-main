@@ -1,8 +1,8 @@
-"""Local grok2api relay manager.
+"""Bundled local gateway manager.
 
-The relay is intentionally backed by the current Docker-based grok2api
-checkout only.  Registration remains owned by this project, while the
-upstream account pool and its encrypted database are owned by grok2api.
+The gateway source is vendored in this repository under ``gateway/``.  The
+runtime never reads another checkout or reuses another project's image: it
+builds and runs the project-owned image from the bundled source instead.
 """
 
 from __future__ import annotations
@@ -29,16 +29,14 @@ CONFIG_PATH = OUTPUT_DIR / "relay-config.json"
 LOG_PATH = OUTPUT_DIR / "grok2api-relay.log"
 V2_DATA_DIR = OUTPUT_DIR / "grok2api-v2-data"
 V2_CONFIG_PATH = OUTPUT_DIR / "grok2api-v2-config.yaml"
-V2_IMAGE = "grok-account-manager-grok2api:local"
+V2_IMAGE = "grok-account-manager-gateway:local"
+V2_IMAGE_REVISION_LABEL = "io.grok-account-manager.gateway-revision"
 V2_ADMIN_USERNAME = "grok-account-manager"
 DEFAULT_RELAY_PORT = 43871
 LEGACY_RELAY_PORT = 8000
 RELAY_CONTAINER_PORT = 43871
-DEFAULT_GROK2API_PATH = Path(
-    os.environ.get("GROK2API_PATH")
-    or os.environ.get("GROK_ACCOUNT_MANAGER_GROK2API_PATH")
-    or (Path.home() / "Downloads" / "grok2api-main")
-)
+BUNDLED_GATEWAY_DIR = PROJECT_ROOT / "gateway"
+GATEWAY_REVISION_PATH = BUNDLED_GATEWAY_DIR / "UPSTREAM_REVISION"
 
 CHAT_MODEL_MARKERS = (
     "reasoning",
@@ -54,7 +52,6 @@ CHAT_MODEL_MARKERS = (
 
 @dataclass
 class RelayConfig:
-    grok2api_path: str = str(DEFAULT_GROK2API_PATH)
     host: str = "127.0.0.1"
     port: int = DEFAULT_RELAY_PORT
     api_key: str = "local-grok-api-key"
@@ -71,8 +68,8 @@ class RelayManager:
         self._process: subprocess.Popen | None = None
         self._config = self._load_config()
 
-    def _project_dir(self) -> Path:
-        return Path(self._config.grok2api_path).expanduser().resolve()
+    def _gateway_dir(self) -> Path:
+        return BUNDLED_GATEWAY_DIR
 
     def snapshot(self) -> dict:
         config = self._config
@@ -81,7 +78,9 @@ class RelayManager:
         return {
             **status,
             "config": {
-                "grok2apiPath": config.grok2api_path,
+                "source": "bundled",
+                "sourcePath": str(BUNDLED_GATEWAY_DIR),
+                "sourceRevision": _gateway_revision(),
                 "host": config.host,
                 "port": config.port,
                 "baseUrl": config.base_url,
@@ -92,15 +91,13 @@ class RelayManager:
                 "adminKeyMasked": _mask_secret(config.admin_key),
                 "dataDir": str(V2_DATA_DIR),
                 "logPath": str(LOG_PATH),
-                "engine": "grok2api",
+                "engine": "bundled-gateway",
             },
         }
 
     def update_config(self, patch: dict[str, Any]) -> dict:
         with self._lock:
             current = asdict(self._config)
-            if "grok2apiPath" in patch:
-                current["grok2api_path"] = str(patch.get("grok2apiPath") or "").strip()
             if "host" in patch:
                 current["host"] = str(patch.get("host") or "127.0.0.1").strip() or "127.0.0.1"
             if "port" in patch:
@@ -113,9 +110,6 @@ class RelayManager:
                 raise ValueError("API 秘钥不能为空")
             if not current["admin_key"]:
                 raise ValueError("管理秘钥不能为空")
-            project_dir = Path(current["grok2api_path"]).expanduser()
-            if not (project_dir / "backend" / "go.mod").exists():
-                raise ValueError("grok2api 路径必须指向当前新版项目，并包含 backend/go.mod")
             self._config = RelayConfig(**current)
             self._save_config(self._config)
 
@@ -155,8 +149,8 @@ class RelayManager:
                 self.apply_remote_config()
                 return self.snapshot()
 
-            project_dir = self._project_dir()
-            self._ensure_v2_runtime(project_dir)
+            gateway_dir = self._gateway_dir()
+            self._ensure_v2_runtime(gateway_dir)
 
             OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
             _ensure_v2_data_dir()
@@ -174,13 +168,13 @@ class RelayManager:
                 }
             )
             log_file = LOG_PATH.open("a", encoding="utf-8")
-            log_file.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] starting grok2api\n")
+            log_file.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] starting bundled gateway\n")
             log_file.flush()
             command = _grok2api_v2_command(self._config, V2_CONFIG_PATH)
             try:
                 self._process = subprocess.Popen(
                     command,
-                    cwd=str(project_dir),
+                    cwd=str(gateway_dir),
                     env=env,
                     stdout=log_file,
                     stderr=subprocess.STDOUT,
@@ -196,9 +190,9 @@ class RelayManager:
                 return self.snapshot()
             with self._lock:
                 if self._process is not None and self._process.poll() is not None:
-                    raise RuntimeError(f"grok2api 启动失败，退出码 {self._process.returncode}。请查看 {LOG_PATH}")
+                    raise RuntimeError(f"内置网关启动失败，退出码 {self._process.returncode}。请查看 {LOG_PATH}")
             time.sleep(0.5)
-        raise TimeoutError(f"grok2api 启动超时。请查看 {LOG_PATH}")
+        raise TimeoutError(f"内置网关启动超时。请查看 {LOG_PATH}")
 
     def stop(self) -> dict:
         with self._lock:
@@ -377,11 +371,11 @@ class RelayManager:
         except Exception as error:
             return {"status": "error", "message": str(error)}
 
-    def _ensure_v2_runtime(self, project_dir: Path) -> None:
-        if not (project_dir / "backend" / "go.mod").exists():
-            raise ValueError(f"未找到新版 grok2api 项目入口：{project_dir}/backend/go.mod")
+    def _ensure_v2_runtime(self, gateway_dir: Path) -> None:
+        if not (gateway_dir / "backend" / "go.mod").exists() or not (gateway_dir / "Dockerfile").exists():
+            raise ValueError(f"内置网关文件不完整：{gateway_dir}。请重新拉取本项目代码。")
         if not shutil.which("docker"):
-            raise RuntimeError("新版 grok2api 需要 Docker Desktop，但未找到 docker 命令")
+            raise RuntimeError("内置网关需要 Docker Desktop，但未找到 docker 命令")
 
         docker_info = subprocess.run(
             ["docker", "info"],
@@ -390,31 +384,35 @@ class RelayManager:
             check=False,
         )
         if docker_info.returncode != 0:
-            raise RuntimeError("新版 grok2api 需要 Docker Desktop，请先启动 Docker Desktop 后再启动中转")
+            raise RuntimeError("内置网关需要 Docker Desktop，请先启动 Docker Desktop 后再启动中转")
 
-        self._ensure_v2_config(project_dir)
-        image_check = subprocess.run(
-            ["docker", "image", "inspect", V2_IMAGE],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-        if image_check.returncode == 0:
+        self._ensure_v2_config(gateway_dir)
+        source_revision = _gateway_revision()
+        if _image_revision() == source_revision:
             return
 
         with LOG_PATH.open("a", encoding="utf-8") as log_file:
-            log_file.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] building grok2api v2 image\n")
+            log_file.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] building bundled gateway image ({source_revision})\n")
             log_file.flush()
             build = subprocess.run(
-                ["docker", "build", "--tag", V2_IMAGE, str(project_dir)],
+                [
+                    "docker",
+                    "build",
+                    "--pull",
+                    "--build-arg",
+                    f"GATEWAY_SOURCE_REVISION={source_revision}",
+                    "--tag",
+                    V2_IMAGE,
+                    str(gateway_dir),
+                ],
                 stdout=log_file,
                 stderr=subprocess.STDOUT,
                 check=False,
             )
         if build.returncode != 0:
-            raise RuntimeError(f"新版 grok2api 镜像构建失败，退出码 {build.returncode}。请查看 {LOG_PATH}")
+            raise RuntimeError(f"内置网关镜像构建失败，退出码 {build.returncode}。请查看 {LOG_PATH}")
 
-    def _ensure_v2_config(self, project_dir: Path) -> None:
+    def _ensure_v2_config(self, gateway_dir: Path) -> None:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         _ensure_v2_data_dir()
         if V2_CONFIG_PATH.exists():
@@ -431,11 +429,11 @@ class RelayManager:
             self._config.admin_key = secrets.token_urlsafe(24)
             self._save_config(self._config)
 
-        template_path = project_dir / "config.example.yaml"
+        template_path = gateway_dir / "config.example.yaml"
         try:
             config_text = template_path.read_text(encoding="utf-8")
         except OSError as error:
-            raise RuntimeError(f"无法读取新版 grok2api 配置模板：{error}") from error
+            raise RuntimeError(f"无法读取内置网关配置模板：{error}") from error
         config_text = _rewrite_relay_listen(config_text)
         replacements = {
             'jwtSecret: "replace-with-at-least-32-characters"': f'jwtSecret: "{secrets.token_hex(32)}"',
@@ -545,16 +543,10 @@ class RelayManager:
         if CONFIG_PATH.exists():
             try:
                 data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-                configured_path = Path(
-                    str(data.get("grok2api_path") or data.get("grok2apiPath") or DEFAULT_GROK2API_PATH)
-                ).expanduser()
-                if not (configured_path / "backend" / "go.mod").exists():
-                    configured_path = DEFAULT_GROK2API_PATH
                 configured_port = _safe_port(data.get("port"), DEFAULT_RELAY_PORT)
                 if configured_port == LEGACY_RELAY_PORT:
                     configured_port = DEFAULT_RELAY_PORT
                 return RelayConfig(
-                    grok2api_path=str(configured_path),
                     host=str(data.get("host") or "127.0.0.1"),
                     port=configured_port,
                     api_key=str(data.get("api_key") or data.get("apiKey") or "local-grok-api-key"),
@@ -619,7 +611,7 @@ def _rewrite_relay_listen(config_text: str) -> str:
 
 
 def _grok2api_v2_command(config: RelayConfig, config_path: Path) -> list[str]:
-    container_name = f"grok-account-manager-grok2api-{config.port}"
+    container_name = f"grok-account-manager-gateway-{config.port}"
     return [
         "docker",
         "run",
@@ -664,6 +656,33 @@ def _write_private_text(path: Path, content: str) -> None:
     finally:
         if descriptor >= 0:
             os.close(descriptor)
+
+
+def _gateway_revision() -> str:
+    """Return the vendored gateway revision used to decide whether to rebuild."""
+    try:
+        revision = GATEWAY_REVISION_PATH.read_text(encoding="utf-8").strip()
+    except OSError:
+        revision = ""
+    return revision or "unknown"
+
+
+def _image_revision() -> str:
+    """Read the bundled-source revision stamped into the project-owned image."""
+    result = subprocess.run(
+        [
+            "docker",
+            "image",
+            "inspect",
+            "--format",
+            f'{{{{ index .Config.Labels "{V2_IMAGE_REVISION_LABEL}" }}}}',
+            V2_IMAGE,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result.stdout.strip() if result.returncode == 0 else ""
 
 
 def _mask_secret(value: str) -> str:
