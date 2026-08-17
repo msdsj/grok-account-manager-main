@@ -964,6 +964,7 @@ function VideoPanel({ apiKey, model, modelOptions, onModelChange }: CreativePane
   const activeModel = activeModels.some((item) => item.publicId === model)
     ? model
     : activeModels[0]?.publicId ?? "";
+  const selectedGenerateRoute = generateModels.find((item) => item.publicId === activeModel);
 
   useEffect(() => {
     if (activeModel && activeModel !== model) onModelChange(activeModel);
@@ -980,8 +981,15 @@ function VideoPanel({ apiKey, model, modelOptions, onModelChange }: CreativePane
   const hasReferenceImage = Boolean(referenceURL.trim() || referenceFileID);
   const hasReferenceAudio = Boolean(referenceVoiceId.trim());
   const isReferenceMode = hasReferenceImage || hasReferenceAudio;
-  const generateResolutions = isReferenceMode ? videoResolutions.filter((item) => item !== "1080p") : videoResolutions;
-  const selectedVideoResolution = isReferenceMode && resolution === "1080p" ? "720p" : resolution;
+  const supports1080p = selectedGenerateRoute?.provider !== "grok_web"
+    && selectedGenerateRoute?.upstreamModel === "grok-imagine-video-1.5";
+  const routeVideoResolutions = selectedGenerateRoute?.provider === "grok_web"
+    ? (["720p"] as const)
+    : supports1080p
+      ? videoResolutions
+      : videoResolutions.filter((item) => item !== "1080p");
+  const generateResolutions = isReferenceMode ? routeVideoResolutions.filter((item) => item !== "1080p") : routeVideoResolutions;
+  const selectedVideoResolution = generateResolutions.some((item) => item === resolution) ? resolution : generateResolutions[0] ?? "720p";
 
   const createMutation = useMutation({
     mutationFn: async () => {

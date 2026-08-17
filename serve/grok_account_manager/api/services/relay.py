@@ -469,7 +469,9 @@ class RelayManager:
         response = requests.post(
             f"{self._config.base_url}/api/admin/v1/client-keys",
             headers=self._v2_admin_headers(),
-            json={"name": "grok-account-manager", "enabled": True, "accountPool": "free"},
+            # Media routes may require Super/paid accounts. The bundled gateway
+            # must not silently create a key that excludes those accounts.
+            json={"name": "grok-account-manager", "enabled": True, "accountPool": "all"},
             timeout=20,
         )
         _raise_response_error(response)

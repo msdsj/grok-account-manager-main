@@ -106,7 +106,7 @@ class Config:
         node_ids = tuple(dict.fromkeys(str(value).strip() for value in values.get("node_ids", []) if str(value).strip()))
         rotatable_node_ids = tuple(dict.fromkeys(str(value).strip() for value in values.get("rotatable_node_ids", []) if str(value).strip()))
         config = cls(
-            base_url="http://grok2api:8000",
+            base_url="http://gateway:8000",
             internal_token=token,
             model=str(values.get("model") or "").strip(),
             node_ids=node_ids,

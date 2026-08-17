@@ -1056,6 +1056,15 @@ func quotaWindowExhausted(candidate account.RoutingCandidate, consumed map[accou
 	if candidate.QuotaWindow == nil {
 		return false
 	}
+	// Console's /usage endpoint returns media products as 0/0 when it does not
+	// publish a dedicated limit. That is an unknown quota, not an exhausted
+	// account: let the upstream request decide and refresh the snapshot after it
+	// completes. A real exhausted window always has a positive total (or a
+	// provider-specific remaining value such as Web video720p).
+	if candidate.QuotaWindow.Total <= 0 && candidate.QuotaWindow.Remaining <= 0 &&
+		(candidate.QuotaWindow.Mode == "console_image" || candidate.QuotaWindow.Mode == "console_video") {
+		return false
+	}
 	remaining := candidate.QuotaWindow.Remaining - consumed[accountQuotaConsumptionKey{accountID: candidate.Credential.ID, mode: candidate.QuotaWindow.Mode}]
 	return remaining <= 0
 }

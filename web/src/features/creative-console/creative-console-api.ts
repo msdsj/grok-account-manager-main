@@ -509,7 +509,11 @@ function resolveMediaURL(value: string): string {
   try {
     const browserOrigin = typeof window === "undefined" ? "http://localhost" : window.location.origin;
     const resolved = new URL(url, `${browserOrigin}/`);
-    if (resolved.pathname.startsWith("/v1/media/images/")) {
+    // Media URLs are emitted by the gateway using its configured public base
+    // URL.  The control panel proxies the API through its own origin, so keep
+    // both archived image and video paths same-origin to avoid a stale port or
+    // hostname breaking playback.
+    if (resolved.pathname.startsWith("/v1/media/images/") || resolved.pathname.startsWith("/v1/media/videos/")) {
       return `${resolved.pathname}${resolved.search}${resolved.hash}`;
     }
     return resolved.origin === browserOrigin ? `${resolved.pathname}${resolved.search}${resolved.hash}` : resolved.toString();

@@ -1,20 +1,27 @@
-name: grok2api
+name: grok-account-manager
 
 services:
-  grok2api:
-    container_name: grok2api
-    image: "${GROK2API_IMAGE:-ghcr.io/chenyme/grok2api:latest}"
+  gateway:
+    container_name: "${GROK_ACCOUNT_MANAGER_GATEWAY_CONTAINER:-grok-account-manager-gateway}"
+    # Build the vendored gateway from this repository.  No grok2api image is
+    # pulled or required on a user's machine.
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        GATEWAY_SOURCE_REVISION: "${GATEWAY_SOURCE_REVISION:-local}"
+    image: "${GROK_ACCOUNT_MANAGER_GATEWAY_IMAGE:-grok-account-manager-gateway:local}"
     ports:
-      - "${GROK2API_PORT:-8000}:8000"
+      - "${GROK_ACCOUNT_MANAGER_GATEWAY_PORT:-43871}:8000"
     environment:
       TZ: "${TZ:-Asia/Shanghai}"
-      # 非空时覆盖 config.yaml 的 PostgreSQL DSN，并自动启用 postgres。
+      # The bundled backend keeps this compatibility key internally.
       GROK2API_DATABASE_URL: "${GROK2API_DATABASE_URL:-}"
       GROK2API_QUALITY_GUARD_DIR: /var/lib/grok2api-quality-guard
     volumes:
-      - "${GROK2API_CONFIG:-./config.yaml}:/run/grok2api/config.yaml:ro"
-      - grok2api-data:/app/data
-      - quality_guard_state:/var/lib/grok2api-quality-guard
+      - "${GROK_ACCOUNT_MANAGER_CONFIG:-./config.yaml}:/run/grok2api/config.yaml:ro"
+      - grok_account_manager_gateway_data:/app/data
+      - grok_account_manager_quality_guard_state:/var/lib/grok2api-quality-guard
     restart: unless-stopped
     init: true
     stop_grace_period: 30s
@@ -57,16 +64,16 @@ services:
   # docker compose --profile quality-guard up -d --build
 
   egress-quality-guard:
-    container_name: grok2api-egress-quality-guard
+    container_name: grok-account-manager-egress-quality-guard
     profiles: ["quality-guard"]
     build:
       context: .
       dockerfile: tools/egress-quality-guard/Dockerfile
     depends_on:
-      grok2api:
+      gateway:
         condition: service_healthy
     volumes:
-      - quality_guard_state:/var/lib/grok2api-quality-guard
+      - grok_account_manager_quality_guard_state:/var/lib/grok2api-quality-guard
     restart: "on-failure:5"
     init: true
     stop_grace_period: 30s
@@ -74,5 +81,5 @@ services:
       - no-new-privileges:true
 
 volumes:
-  grok2api-data:
-  quality_guard_state:
+  grok_account_manager_gateway_data:
+  grok_account_manager_quality_guard_state:

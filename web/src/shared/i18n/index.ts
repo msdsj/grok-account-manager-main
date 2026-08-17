@@ -89,6 +89,7 @@ const resources = {
         availableBreakdown: "Build {{build}} · Web {{web}} · Console {{console}} 可用",
         baseURL: "上游地址",
         chatTimeout: "聊天超时",
+        recoveryProbeAt: "恢复探测时间 {{time}}",
       },
       accountCredential: {
         label: "凭据续期",
@@ -2125,6 +2126,28 @@ Object.assign(resources.en.translation.settings.routing as unknown as Record<str
   markBuildChatDeniedAsReauth: "Mark Build Chat denied as reauth",
   markBuildChatDeniedAsReauthHelp: "Mark accounts that receive a Build Chat permission denial for reauthorization and remove them from routing.",
 });
+Object.assign(resources["zh-CN"].translation.accounts as unknown as Record<string, string>, {
+  imagineQuota: "Imagine 额度",
+  imagineQuotaRemaining: "剩余 {{remaining}} 次",
+  imagineQuotaExhausted: "已用尽",
+  imagineModeImagePro: "生图 Pro",
+  imagineModeImageEdit: "图片编辑",
+  imagineModeVideo: "视频",
+  imagineModeVideo720p: "视频 720p",
+});
+Object.assign(resources.en.translation.accounts as unknown as Record<string, string>, {
+  imagineQuota: "Imagine quota",
+  imagineQuotaRemaining: "{{remaining}} remaining",
+  imagineQuotaExhausted: "Exhausted",
+  imagineModeImagePro: "Image Pro",
+  imagineModeImageEdit: "Image edit",
+  imagineModeVideo: "Video",
+  imagineModeVideo720p: "Video 720p",
+});
+Object.assign(resources.en.translation.console as unknown as Record<string, string>, {
+  recoveryProbeAt: "Recovery probe after {{time}}",
+});
+
 function readStoredLanguage(): string | null {
   if (typeof window === "undefined") return null;
   try {

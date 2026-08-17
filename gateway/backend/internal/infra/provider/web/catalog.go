@@ -25,7 +25,10 @@ var catalog = []ModelSpec{
 	{PublicID: "grok-imagine-image-lite", UpstreamModel: "grok-imagine-image", ProtocolModel: "imagine-lite", Capability: modeldomain.CapabilityImage, Mode: "fast", MinimumTier: account.WebTierBasic},
 	{PublicID: "grok-imagine-image-quality-lite", UpstreamModel: "grok-imagine-image-quality", ProtocolModel: "imagine", Capability: modeldomain.CapabilityImage, Mode: "image_pro", MinimumTier: account.WebTierBasic},
 	{PublicID: "grok-imagine-image-edit", UpstreamModel: "imagine-image-edit", Capability: modeldomain.CapabilityImageEdit, Mode: "image_edit", MinimumTier: account.WebTierSuper},
-	{PublicID: "grok-imagine-video", UpstreamModel: "grok-imagine-video", ProtocolModel: "imagine-video-gen", Capability: modeldomain.CapabilityVideo, Mode: "video", MinimumTier: account.WebTierSuper},
+	// The Web quota endpoint now exposes video720p for Basic accounts. Keep the
+	// route available when that window is present; the upstream request remains
+	// the final entitlement check for accounts whose product policy differs.
+	{PublicID: "grok-imagine-video", UpstreamModel: "grok-imagine-video", ProtocolModel: "imagine-video-gen", Capability: modeldomain.CapabilityVideo, Mode: "video", MinimumTier: account.WebTierBasic},
 }
 
 func Catalog() []ModelSpec { return append([]ModelSpec(nil), catalog...) }

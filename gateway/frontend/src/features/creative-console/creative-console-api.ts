@@ -527,7 +527,9 @@ function resolveMediaURL(value: string): string {
   try {
     const browserOrigin = typeof window === "undefined" ? "http://localhost" : window.location.origin;
     const resolved = new URL(url, `${browserOrigin}/`);
-    if (resolved.pathname.startsWith("/v1/media/images/")) {
+    // Keep gateway-archived media same-origin with the control panel.  This
+    // matters when the public base URL contains a different local port.
+    if (resolved.pathname.startsWith("/v1/media/images/") || resolved.pathname.startsWith("/v1/media/videos/")) {
       return `${resolved.pathname}${resolved.search}${resolved.hash}`;
     }
     return resolved.origin === browserOrigin ? `${resolved.pathname}${resolved.search}${resolved.hash}` : resolved.toString();

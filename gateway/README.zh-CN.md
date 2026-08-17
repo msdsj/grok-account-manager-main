@@ -154,11 +154,10 @@ flowchart LR
 
 ## 快速部署
 
-官方镜像支持 `linux/amd64` 和 `linux/arm64`。
+本目录是 `grok-account-manager` 主仓库内置的网关源码。部署时始终从当前仓库本地构建，不需要下载或预先安装任何 grok2api 镜像。
 
 ```bash
-git clone https://github.com/chenyme/grok2api.git
-cd grok2api
+cd grok-account-manager-main/gateway
 cp config.example.yaml config.yaml
 ```
 
@@ -182,12 +181,12 @@ bootstrapAdmin:
 启动服务：
 
 ```bash
-docker compose pull
+docker compose build
 docker compose up -d
-docker compose logs -f grok2api
+docker compose logs -f gateway
 ```
 
-访问 `http://127.0.0.1:8000`。镜像已包含前端，SQLite 数据库与本地媒体保存在 Compose 数据卷中。
+访问 `http://127.0.0.1:43871`。镜像已包含前端，SQLite 数据库与本地媒体保存在项目自有 Compose 数据卷中。
 
 ### 源码运行
 
@@ -365,7 +364,7 @@ docker compose --profile quality-guard up -d --build
 
 曾使用预览版 `clientKeyID` 配置的现有部署可以直接升级：该字段会被兼容读取但不再使用，可安全删除；原来手工创建的探测 Key 不会被程序擅自删除。
 
-后续修改该配置时，执行 `docker compose --profile quality-guard restart grok2api egress-quality-guard` 使基础配置重新加载；管理页面中的策略调整仍支持热加载。
+后续修改该配置时，执行 `docker compose --profile quality-guard restart gateway egress-quality-guard` 使基础配置重新加载；管理页面中的策略调整仍支持热加载。
 
 普通的 `docker compose up -d` 不会启动守护程序，也不会产生主动探测流量。sidecar 只从主程序获得权限受限的内部凭据，不保存或使用管理员密码。启用自动隔离前请先阅读上面的详细说明。
 

@@ -138,6 +138,22 @@ func (s *Service) CreateVideo(ctx context.Context, input VideoInput) (media.Job,
 		return media.Job{}, err
 	}
 	routes, err = routesForVideoParameters(routes, operation, input.Resolution, len(input.ReferenceURLs), input.Duration)
+	// Keep the historical public model name usable for 1080p text/image video.
+	// The upstream contract exposes 1080p on 1.5 only, so transparently fall
+	// back to that Console route when callers still send grok-imagine-video.
+	if err != nil && operation == provider.VideoOperationGenerate &&
+		strings.EqualFold(strings.TrimSpace(input.Resolution), "1080p") &&
+		len(input.ReferenceURLs) == 0 && strings.TrimSpace(input.ImageURL) == "" {
+		if upgraded, lookupErr := s.models.GetByPublicIDCandidates(ctx, "grok-imagine-video-1.5"); lookupErr == nil {
+			upgraded, _, lookupErr = s.eligibleMediaRoutes(upgraded, input.ClientKey, model.CapabilityVideo, providerSupported)
+			if lookupErr == nil {
+				if upgraded, lookupErr = routesForVideoParameters(upgraded, operation, input.Resolution, 0, input.Duration); lookupErr == nil {
+					routes = upgraded
+					err = nil
+				}
+			}
+		}
+	}
 	if err != nil {
 		return media.Job{}, err
 	}

@@ -153,11 +153,10 @@ Each Provider keeps its own credentials, quota, health, cooldown, concurrency, a
 
 ## Quick start
 
-Official images support `linux/amd64` and `linux/arm64`.
+This directory contains the gateway source bundled in the `grok-account-manager` repository. Deployments build it locally from this checkout; no grok2api image or checkout is required.
 
 ```bash
-git clone https://github.com/chenyme/grok2api.git
-cd grok2api
+cd grok-account-manager-main/gateway
 cp config.example.yaml config.yaml
 ```
 
@@ -181,12 +180,12 @@ bootstrapAdmin:
 Start the service:
 
 ```bash
-docker compose pull
+docker compose build
 docker compose up -d
-docker compose logs -f grok2api
+docker compose logs -f gateway
 ```
 
-Open `http://127.0.0.1:8000`. The image already includes the frontend; SQLite data and local media are stored in the Compose volume.
+Open `http://127.0.0.1:43871`. The locally built image includes the frontend; SQLite data and local media are stored in project-owned Compose volumes.
 
 ### Run from source
 
@@ -368,7 +367,7 @@ Existing preview deployments that still contain `clientKeyID` can upgrade
 directly. The field is accepted for compatibility but ignored and can be
 removed; any manually created probe key is intentionally left untouched.
 
-After changing this configuration, run `docker compose --profile quality-guard restart grok2api egress-quality-guard` to reload the base settings; policy edits made in the admin page still hot-reload.
+After changing this configuration, run `docker compose --profile quality-guard restart gateway egress-quality-guard` to reload the base settings; policy edits made in the admin page still hot-reload.
 
 The normal `docker compose up -d` command does not start the guard or generate
 probe traffic. The sidecar receives a narrowly scoped internal credential from

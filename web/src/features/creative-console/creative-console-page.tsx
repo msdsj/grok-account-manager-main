@@ -990,9 +990,11 @@ function VideoPanel({ apiKey, model, modelOptions, onModelChange }: CreativePane
   const hasReferenceImage = Boolean(referenceURL.trim() || referenceFileID);
   const hasReferenceAudio = Boolean(referenceVoiceId.trim());
   const isReferenceMode = hasReferenceImage || hasReferenceAudio;
+  const supports1080p = selectedGenerateRoute?.provider !== "grok_web"
+    && selectedGenerateRoute?.upstreamModel === "grok-imagine-video-1.5";
   const routeVideoResolutions = selectedGenerateRoute?.provider === "grok_web"
     ? (["720p"] as const)
-    : selectedGenerateRoute?.publicId === "grok-imagine-video-1.5"
+    : supports1080p
       ? videoResolutions
       : videoResolutions.filter((item) => item !== "1080p");
   const generateResolutions = isReferenceMode ? routeVideoResolutions.filter((item) => item !== "1080p") : routeVideoResolutions;
@@ -1786,13 +1788,24 @@ function uniqueModelsByPublicID(models: ModelRouteDTO[]): ModelRouteDTO[] {
 }
 
 function preferWebMediaRoutes(models: ModelRouteDTO[]): ModelRouteDTO[] {
-  const webRoutes = models.filter((model) => (
-    model.provider === "grok_web"
-    && model.available
-    && model.capabilityKnown
-    && model.supportedAccounts > 0
-  ));
-  return webRoutes.length > 0 ? webRoutes : models;
+  // Prefer Web only for a duplicate public model. A global Web-only filter
+  // hides Console/Build-only products such as grok-imagine-video-1.5, which
+  // is the only route that can legitimately accept 1080p.
+  const grouped = new Map<string, ModelRouteDTO[]>();
+  for (const model of models) {
+    const routes = grouped.get(model.publicId) ?? [];
+    routes.push(model);
+    grouped.set(model.publicId, routes);
+  }
+  return [...grouped.values()].flatMap((routes) => {
+    const webRoutes = routes.filter((model) => (
+      model.provider === "grok_web"
+      && model.available
+      && model.capabilityKnown
+      && model.supportedAccounts > 0
+    ));
+    return webRoutes.length > 0 ? webRoutes : routes;
+  });
 }
 
 function isUsableImageRoute(model: ModelRouteDTO): boolean {

@@ -1142,6 +1142,7 @@ func (m *Manager) leaseForNodeWithOptions(ctx context.Context, scope domain.Scop
 		if err != nil {
 			return nil, false, err
 		}
+		userAgent = normalizeBrowserUserAgent(userAgent)
 	}
 	// Derive identity independently of the current toggle. clientFor applies one
 	// authoritative toggle snapshot, so enabling isolation between these two

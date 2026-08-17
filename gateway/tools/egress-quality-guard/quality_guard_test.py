@@ -18,7 +18,7 @@ SPEC.loader.exec_module(quality_guard)
 
 def config(**overrides):
     values = dict(
-        base_url="http://grok2api:8000", internal_token="scoped-secret",
+        base_url="http://gateway:8000", internal_token="scoped-secret",
         model="grok-4.5", node_ids=(), mode="hybrid", active_interval_seconds=1800,
         passive_poll_seconds=5, passive_page_size=200, passive_max_pages=10, jitter_seconds=0,
         request_timeout_seconds=120, soft_tps=500.0, hard_tps=1000.0,

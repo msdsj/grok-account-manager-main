@@ -71,6 +71,10 @@ func newBrowserClient(proxyURL, userAgent string) (*browserClient, error) {
 	options := []tlsclient.HttpClientOption{
 		tlsclient.WithTimeoutSeconds(7200),
 		tlsclient.WithClientProfile(browserProfile(userAgent)),
+		// Grok Web media endpoints currently reject the HTTP/2 wire shape even
+		// when the TLS/browser profile and Clearance are valid. HTTP/1.1 is also
+		// required by the WebSocket dialer, so keep browser traffic consistent.
+		tlsclient.WithForceHttp1(),
 		tlsclient.WithNotFollowRedirects(),
 	}
 	if proxyURL != "" {
@@ -119,6 +123,35 @@ func browserProfile(userAgent string) profiles.ClientProfile {
 		}
 	}
 	return profiles.Chrome_146
+}
+
+// normalizeBrowserUserAgent keeps the HTTP User-Agent aligned with the TLS
+// profile selected above. Clearance providers may return a newer Chromium
+// version than tls-client supports; advertising that version with an older
+// ClientHello is a common source of Cloudflare media challenges.
+func normalizeBrowserUserAgent(userAgent string) string {
+	match := chromeMajorPattern.FindStringSubmatch(userAgent)
+	if len(match) != 2 {
+		return userAgent
+	}
+	major, err := strconv.Atoi(match[1])
+	if err != nil {
+		return userAgent
+	}
+	if _, ok := profiles.MappedTLSClients[fmt.Sprintf("chrome_%d", major)]; ok {
+		return userAgent
+	}
+	bestMajor, bestDistance := 0, int(^uint(0)>>1)
+	for _, candidate := range []int{146, 144, 133, 131, 124, 120, 117} {
+		distance := candidate - major
+		if distance < 0 {
+			distance = -distance
+		}
+		if distance < bestDistance {
+			bestMajor, bestDistance = candidate, distance
+		}
+	}
+	return chromeMajorPattern.ReplaceAllString(userAgent, "Chrome/"+strconv.Itoa(bestMajor))
 }
 
 func (c *browserClient) Do(request *http.Request) (*http.Response, error) {
