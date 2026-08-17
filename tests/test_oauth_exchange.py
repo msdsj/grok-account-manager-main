@@ -1,5 +1,6 @@
 import unittest
 from unittest.mock import Mock, patch
+from requests.cookies import RequestsCookieJar
 
 from grok_account_manager.grok.oauth_exchange import (
     CloudflareBlockedError,
@@ -10,6 +11,7 @@ from grok_account_manager.grok.oauth_exchange import (
     _drive_device_authorization_page,
     _poll_device_token_once,
     _request_device_code,
+    _try_direct_device_authorization,
 )
 
 
@@ -91,6 +93,66 @@ class OAuthExchangeTests(unittest.TestCase):
         self.assertEqual(http_session.post.call_count, 2)
         self.assertEqual(status, "pending")
         self.assertIsNone(payload)
+
+    def test_direct_device_authorization_uses_sso_cookie_and_allow_action(self) -> None:
+        verify_response = Mock(status_code=303)
+        verify_response.headers = {"Location": "https://accounts.x.ai/oauth2/device/consent"}
+        approve_response = Mock(status_code=303)
+        approve_response.headers = {"Location": "https://accounts.x.ai/oauth2/device/done"}
+        http_session = Mock()
+        http_session.cookies = RequestsCookieJar()
+        http_session.post.side_effect = [verify_response, approve_response]
+
+        authorized, description = _try_direct_device_authorization(
+            http_session=http_session,
+            user_code="ABCD-EFGH",
+            sso_token="browser-sso",
+        )
+
+        self.assertTrue(authorized)
+        self.assertIn("verify/approve", description)
+        self.assertEqual(http_session.cookies.get_dict()["sso"], "browser-sso")
+        self.assertEqual(http_session.cookies.get_dict()["sso-rw"], "browser-sso")
+        self.assertEqual(http_session.post.call_count, 2)
+        verify_call, approve_call = http_session.post.call_args_list
+        self.assertEqual(verify_call.kwargs["data"], {"user_code": "ABCD-EFGH"})
+        self.assertEqual(approve_call.kwargs["data"]["action"], "allow")
+        self.assertFalse(approve_call.kwargs["allow_redirects"])
+
+    def test_direct_device_authorization_falls_back_when_verify_is_not_consent(self) -> None:
+        verify_response = Mock(status_code=200)
+        verify_response.headers = {"Location": "https://accounts.x.ai/sign-in"}
+        http_session = Mock()
+        http_session.cookies = RequestsCookieJar()
+        http_session.post.return_value = verify_response
+
+        authorized, description = _try_direct_device_authorization(
+            http_session=http_session,
+            user_code="ABCD-EFGH",
+            sso_token="browser-sso",
+        )
+
+        self.assertFalse(authorized)
+        self.assertIn("重新登录", description)
+        http_session.post.assert_called_once()
+
+    def test_direct_authorization_polls_without_touching_browser(self) -> None:
+        with patch(
+            "grok_account_manager.grok.oauth_exchange._poll_device_token_once",
+            return_value=("complete", {"access_token": "access", "refresh_token": "refresh"}),
+        ):
+            result = _drive_device_authorization_and_poll(
+                session=Mock(),
+                oauth_page=None,
+                device_code="device-code",
+                user_code="user-code",
+                token_endpoint="https://auth.x.ai/oauth2/token",
+                interval=5,
+                expires_in=30,
+                drive_browser=False,
+            )
+
+        self.assertEqual(result["refresh_token"], "refresh")
 
     def test_session_discovery_is_not_shared_between_rounds(self) -> None:
         def session_with_token_endpoint(endpoint: str):

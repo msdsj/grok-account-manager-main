@@ -31,6 +31,7 @@ func TestIsClearanceRefreshableMediaError(t *testing.T) {
 	}{
 		{name: "empty challenge response", code: http.StatusForbidden, want: true},
 		{name: "cloudflare html", code: http.StatusForbidden, body: "<!doctype html><title>Just a moment...</title>", want: true},
+		{name: "json anti-bot code", code: http.StatusForbidden, body: `{"error":{"code":7,"message":"Request rejected by anti-bot rules."}}`, want: true},
 		{name: "structured moderation response", code: http.StatusForbidden, body: `{"error":{"code":"content-moderated","message":"rejected"}}`, want: false},
 		{name: "server failure", code: http.StatusBadGateway, want: false},
 	}

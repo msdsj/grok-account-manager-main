@@ -52,7 +52,19 @@ func isClearanceRefreshableMediaError(e *webMediaUpstreamError) bool {
 	if e == nil || e.status != http.StatusForbidden {
 		return false
 	}
-	return e.cloudflareChallenge || e.bodyKind == "empty" || e.bodyKind == "html"
+	return e.cloudflareChallenge || e.bodyKind == "empty" || e.bodyKind == "html" || isMediaAntiBotRejection(e)
+}
+
+// isMediaAntiBotRejection covers the JSON response used by the media
+// endpoint when the current browser/egress session is rejected before the
+// request reaches the account layer (for example code 7). It is distinct from
+// structured moderation JSON, which must remain request-scoped.
+func isMediaAntiBotRejection(e *webMediaUpstreamError) bool {
+	if e == nil || e.bodyKind != "json" {
+		return false
+	}
+	text := strings.ToLower(e.summary)
+	return strings.Contains(text, "anti-bot") || strings.Contains(text, "antibot")
 }
 
 func (e *webMediaUpstreamError) providerResponse() *provider.Response {

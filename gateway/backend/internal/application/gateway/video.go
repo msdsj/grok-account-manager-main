@@ -679,6 +679,14 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 				}
 				failureHandled = true
 				retriableCreate = safeCreateFailure && !account.IsBuildSuper(lease.Credential, lease.Billing)
+			case status == http.StatusTooManyRequests && isVideoTransientRateLimit(err):
+				// Web media code 8 is a request/egress rate limit, not proof
+				// that this account's video window is empty. Cool the account
+				// briefly and continue with another eligible account without
+				// overwriting its quota snapshot.
+				s.selector.MarkFailure(failureCtx, lease.Credential, status, 0)
+				failureHandled = true
+				retriableCreate = safeCreateFailure
 			case (status == http.StatusPaymentRequired || status == http.StatusTooManyRequests) && lease.QuotaMode != "":
 				exhausted, reconcileErr := s.accounts.ReconcileRateLimit(failureCtx, lease.Credential.ID, lease.QuotaMode, 0)
 				s.selector.MarkQuotaStateChanged(lease.Credential.Provider, lease.Credential.ID)
@@ -786,6 +794,25 @@ func videoQuotaMode(providerValue account.Provider, catalogMode, resolution stri
 		}
 	}
 	return catalogMode
+}
+
+func isVideoTransientRateLimit(err error) bool {
+	text := strings.ToLower(strings.TrimSpace(errString(err)))
+	if text == "" || !strings.Contains(text, "too many requests") {
+		return false
+	}
+	// Do not hide an explicit quota exhaustion response behind the generic
+	// rate-limit branch. Console's free-usage response is account-scoped.
+	return !strings.Contains(text, "free usage quota exceeded") &&
+		!strings.Contains(text, "free-usage-exhausted") &&
+		!strings.Contains(text, "usage exhausted")
+}
+
+func errString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 func (s *Service) acquireVideoInputSlot(ctx context.Context, references []string) (func(), error) {

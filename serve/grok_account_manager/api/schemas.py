@@ -77,6 +77,7 @@ class RelayConfigRequest(BaseModel):
     port: int | None = None
     apiKey: str | None = None
     adminKey: str | None = None
+    gatewayProxy: str | None = None
 
     def to_patch(self) -> dict[str, Any]:
         return self.model_dump(exclude_none=True)

@@ -197,11 +197,18 @@ GOOGLE_ACCOUNTS_FILE=/absolute/path/to/google_accounts.txt
 GROK_ACCOUNT_MANAGER_MAX_CONCURRENCY=20
 GROK_ACCOUNT_MANAGER_MAX_OAUTH_CONCURRENCY=2
 GROK_ACCOUNT_MANAGER_MAX_REGISTRATION_ATTEMPTS=3
+# 可选的速度调节（降低后更快，但更容易触发上游风控）
+GROK_ACCOUNT_MANAGER_ROUND_PACING_MIN_SECONDS=4
+GROK_ACCOUNT_MANAGER_ROUND_PACING_MAX_SECONDS=11
+GROK_ACCOUNT_MANAGER_WORKER_START_STAGGER_MIN_SECONDS=1
+GROK_ACCOUNT_MANAGER_WORKER_START_STAGGER_MAX_SECONDS=3
 ```
 
 - `GROK_ACCOUNT_MANAGER_MAX_CONCURRENCY`：控制台允许的注册窗口上限。
 - `GROK_ACCOUNT_MANAGER_MAX_OAUTH_CONCURRENCY`：同时进行 OAuth token 交换的窗口数。
 - `GROK_ACCOUNT_MANAGER_MAX_REGISTRATION_ATTEMPTS`：单轮注册页面失败时的最大重试次数，范围为 `1` 到 `4`。
+- `GROK_ACCOUNT_MANAGER_ROUND_PACING_*`：每个 Worker 下一轮前的随机等待范围；调低会提速，但会增加同一出口的注册突发和风控概率。
+- `GROK_ACCOUNT_MANAGER_WORKER_START_STAGGER_*`：并发窗口启动错峰范围；调低会更快打开窗口，但不建议在单一公网出口上设为 0。
 
 并发、独立 profile 和临时指纹只用于隔离本地浏览器会话，不能改变多个窗口共用同一个公网出口的事实，也不能保证通过第三方风控。
 
@@ -252,7 +259,7 @@ OAuth 交换示例：
 uv run grok-account-manager grok --count 1 --sink json --oauth-exchange
 ```
 
-OAuth 交换使用 xAI Device Flow：程序会在同一个浏览器中打开授权标签页，并轮询 token endpoint，不会监听固定的本地回调端口。授权或人机验证页面仍可能需要用户在可见浏览器中完成操作。只有成功得到有效 `refresh_token` 的结果才会按 OAuth 模式写入正式凭证。详细流程见 [Grok OAuth Flow](grok-oauth-flow.md)。
+OAuth 交换使用 xAI Device Flow：注册成功后会优先利用同一 `sso` 会话通过 HTTP 完成 `verify/approve`，跳过 Build 页面等待；直连不适用时才在同一个浏览器中打开授权标签页，并用真实鼠标事件提交设备码和 Build/Allow。整个流程不会监听固定的本地回调端口，Cloudflare 或人机验证仍可能需要用户在可见浏览器中完成操作。只有成功得到有效 `refresh_token` 的结果才会按 OAuth 模式写入正式凭证。详细流程见 [Grok OAuth Flow](grok-oauth-flow.md)。
 
 按 `Ctrl+C` 可停止 CLI 后续轮次。不要在同一批次同时启动 CLI 和控制台注册任务，以免它们争用账号池、浏览器和输出文件。
 
@@ -363,6 +370,17 @@ uv run grok-account-manager grok \
 首次成功准备中转时，项目会在 `output/` 下生成中转配置和数据目录。中转管理员用户名为 `grok-account-manager`；首次生成的管理员密码保存在仅本机可读的 `output/relay-config.json` 的 `admin_key` 字段中。该值是机密，不能截图、提交或发送给他人；应在可信本机上妥善保存并按需更换。
 
 在控制台“本地中转”页面可以检查状态、启动或停止中转、同步本地账号和查看可用模型。中转默认地址为 `http://127.0.0.1:43871`。不要把它、后端端口或中转配置直接映射到公网。
+
+如果电脑上的代理客户端使用默认混合端口，项目默认会把网关出口配置为
+`http://127.0.0.1:7890`。由于网关运行在 Docker 容器内，启动时会自动改写为
+`http://host.docker.internal:7890`，并创建/更新名为“本机VPN-Web”的内置 Web 出口节点；
+不需要另外安装或拉取 grok2api 镜像。端口不同或使用 SOCKS5 时，在 `.env` 中填写：
+
+```dotenv
+GROK_ACCOUNT_MANAGER_GATEWAY_PROXY=socks5://127.0.0.1:1080
+```
+
+也可以填写远程代理地址。确实需要直连时将该变量留空，重启本项目后会停用自动创建的本机 VPN 节点。代理地址只写入本机权限为 `0600` 的配置文件，控制台状态仅显示脱敏值。
 
 `docker-compose.yml` 中的 Postgres 服务是后续数据库迁移预留项。当前默认账号数据库是 SQLite，不会因为运行 `docker compose up -d` 自动切换到 Postgres。现有 Compose 使用示例账号并默认发布主机端口 `54329`，只应在可信开发网络中运行；如要启用它，应先修改密码和端口映射策略。
 

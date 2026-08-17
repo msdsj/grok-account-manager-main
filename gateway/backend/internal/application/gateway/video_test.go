@@ -46,6 +46,15 @@ func TestVideoQuotaModeUsesWeb720pProduct(t *testing.T) {
 	}
 }
 
+func TestVideoTransientRateLimitDoesNotConsumeQuota(t *testing.T) {
+	if !isVideoTransientRateLimit(errors.New("Grok Web 媒体上游返回 429: 8: Too many requests")) {
+		t.Fatal("generic Web 429 was not classified as transient")
+	}
+	if isVideoTransientRateLimit(errors.New("Console 媒体上游返回 429: Free usage quota exceeded")) {
+		t.Fatal("explicit Console quota exhaustion was classified as transient")
+	}
+}
+
 func TestGetVideoExposesOnlyReadableResultAsset(t *testing.T) {
 	completed := media.Job{
 		ID: "video_status", ClientKeyID: 7, Status: media.StatusCompleted,

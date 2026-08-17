@@ -9,10 +9,11 @@ Invalid action。授权完成后轮询 token endpoint 获取 OAuth tokens。
 
 from __future__ import annotations
 
+import threading
 import time
 from functools import lru_cache
 from typing import Any, Callable, TypedDict
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urljoin, urlparse
 
 import requests
 
@@ -55,6 +56,10 @@ MAX_CONSECUTIVE_POLL_TRANSPORT_ERRORS = 3
 MAX_CONSECUTIVE_PAGE_ERRORS = 6
 DISCOVERY_TIMEOUT_SECONDS = 8
 DEVICE_CODE_TIMEOUT_SECONDS = 15
+OAUTH_ENDPOINT_CACHE_TTL_SECONDS = 10 * 60
+
+_SESSION_ENDPOINT_CACHE_LOCK = threading.Lock()
+_SESSION_ENDPOINT_CACHE: tuple[float, dict[str, str | None]] | None = None
 
 
 class OAuthTerminalError(RuntimeError):
@@ -139,10 +144,29 @@ def _discover_oauth_endpoints(
     timeout: int = 30,
     http_session: Any = None,
 ) -> dict[str, str | None]:
-    """Read OIDC endpoints, bypassing the global cache for a round context."""
+    """Read OIDC endpoints while reusing the static discovery response briefly.
+
+    A real registration round still uses its pinned HTTP session for the device
+    request and token polling.  Discovery only publishes endpoint URLs, so a
+    short process cache avoids one extra auth.x.ai round trip for every account.
+    Test doubles and non-requests clients intentionally keep the old uncached
+    behavior so callers can validate their own egress context.
+    """
+
+    global _SESSION_ENDPOINT_CACHE
 
     if http_session is None:
         return _discover_oauth_endpoints_cached(timeout)
+    if isinstance(http_session, requests.Session):
+        now = time.monotonic()
+        with _SESSION_ENDPOINT_CACHE_LOCK:
+            cached = _SESSION_ENDPOINT_CACHE
+            if cached is not None and now - cached[0] < OAUTH_ENDPOINT_CACHE_TTL_SECONDS:
+                return dict(cached[1])
+        result = _discover_oauth_endpoints_uncached(http_session, timeout=timeout)
+        with _SESSION_ENDPOINT_CACHE_LOCK:
+            _SESSION_ENDPOINT_CACHE = (time.monotonic(), dict(result))
+        return result
     return _discover_oauth_endpoints_uncached(http_session, timeout=timeout)
 
 
@@ -186,6 +210,97 @@ def _verification_url(device_data: dict, prefer_email_login: bool = True) -> str
     if prefer_email_login:
         url += "&email=true"
     return url
+
+
+def _device_redirect_state(location: str | None, base_url: str) -> str:
+    """Classify the auth.x.ai redirect without loading accounts.x.ai in Chrome."""
+
+    raw_location = str(location or "").strip()
+    if not raw_location:
+        return ""
+    try:
+        parsed = urlparse(urljoin(base_url, raw_location))
+    except Exception:
+        return ""
+    host = (parsed.hostname or "").lower()
+    if host != "x.ai" and not host.endswith(".x.ai"):
+        return ""
+    path = parsed.path.rstrip("/").lower()
+    if path == "/oauth2/device/consent":
+        return "consent"
+    if path == "/oauth2/device/done":
+        return "done"
+    if path in {"/sign-in", "/signin", "/login"}:
+        return "sign-in"
+    return ""
+
+
+def _try_direct_device_authorization(
+    http_session: Any,
+    user_code: str,
+    sso_token: str | None,
+    timeout: int = DEVICE_CODE_TIMEOUT_SECONDS,
+) -> tuple[bool, str]:
+    """Approve a device code through xAI's same-session HTTP flow.
+
+    A newly registered account already has the ``sso`` cookie. xAI accepts that
+    cookie on ``device/verify`` and ``device/approve``, so there is no reason to
+    open a second browser page or wait for the Build consent UI. If the direct
+    flow is rejected (Cloudflare, changed endpoint, missing cookie), callers
+    fall back to the browser driver below.
+    """
+
+    token = str(sso_token or "").strip()
+    code = str(user_code or "").strip()
+    if http_session is None or not token or not code:
+        return False, "缺少同一浏览器会话或 sso cookie"
+
+    try:
+        # requests.Session keeps these cookies for both auth.x.ai and the
+        # accounts.x.ai redirect while preserving the round's pinned proxy.
+        http_session.cookies.set("sso", token, domain=".x.ai", path="/")
+        http_session.cookies.set("sso-rw", token, domain=".x.ai", path="/")
+        headers = {
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Content-Type": "application/x-www-form-urlencoded",
+        }
+        verify = http_session.post(
+            "https://auth.x.ai/oauth2/device/verify",
+            data={"user_code": code},
+            headers=headers,
+            timeout=timeout,
+            allow_redirects=False,
+        )
+        verify_state = _device_redirect_state(
+            verify.headers.get("Location"), "https://auth.x.ai/oauth2/device/verify"
+        )
+        if verify.status_code == 401 or verify_state == "sign-in":
+            return False, "xAI verify 要求重新登录"
+        if not 200 <= verify.status_code < 400 or verify_state != "consent":
+            return False, f"xAI verify 未进入 consent（HTTP {verify.status_code}，state={verify_state or '-'}）"
+
+        approve = http_session.post(
+            "https://auth.x.ai/oauth2/device/approve",
+            data={
+                "user_code": code,
+                "action": "allow",
+                "principal_type": "User",
+                "principal_id": "",
+            },
+            headers=headers,
+            timeout=timeout,
+            allow_redirects=False,
+        )
+        approve_state = _device_redirect_state(
+            approve.headers.get("Location"), "https://auth.x.ai/oauth2/device/approve"
+        )
+        if approve.status_code == 401 or approve_state == "sign-in":
+            return False, "xAI approve 要求重新登录"
+        if not 200 <= approve.status_code < 400 or approve_state != "done":
+            return False, f"xAI approve 未完成（HTTP {approve.status_code}，state={approve_state or '-'}）"
+        return True, "HTTP verify/approve 已完成"
+    except Exception as error:
+        return False, f"{error.__class__.__name__}: {error}"
 
 
 def _open_oauth_url(session, url: str) -> tuple[object, bool]:
@@ -244,6 +359,7 @@ def exchange_sso_for_oauth_tokens(
     prefer_google_login: bool = False,
     stop_event=None,
     http_session: Any = None,
+    sso_token: str | None = None,
 ) -> OAuthTokens | None:
     """使用当前浏览器登录态执行 xAI device flow，返回真正的 OAuth tokens。"""
     print("[OAuth Exchange] 开始使用 xAI Device Flow 换取 OAuth tokens...")
@@ -302,8 +418,24 @@ def exchange_sso_for_oauth_tokens(
                 f"[OAuth Exchange] Device Code 已生成 ({attempt}/{max_attempts})，"
                 f"User Code: {user_code}"
             )
-            print("[OAuth Exchange] 正在浏览器中打开授权页面")
-            oauth_page, opened_new_tab = _open_oauth_url(session, verification_url)
+            direct_authorized = False
+            oauth_page = None
+            opened_new_tab = False
+            if sso_token and http_session is not None:
+                direct_authorized, direct_description = _try_direct_device_authorization(
+                    http_session=http_session,
+                    user_code=user_code,
+                    sso_token=sso_token,
+                    timeout=DEVICE_CODE_TIMEOUT_SECONDS,
+                )
+                if direct_authorized:
+                    print(f"[OAuth Exchange] 已通过同一 sso 会话直接完成 Build 授权（{direct_description}）")
+                else:
+                    print(f"[OAuth Exchange] 直连 Build 授权未完成，回退浏览器自动化：{direct_description}")
+
+            if not direct_authorized:
+                print("[OAuth Exchange] 正在浏览器中打开授权页面")
+                oauth_page, opened_new_tab = _open_oauth_url(session, verification_url)
             try:
                 tokens = _drive_device_authorization_and_poll(
                     session=session,
@@ -321,6 +453,7 @@ def exchange_sso_for_oauth_tokens(
                     prefer_google_login=prefer_google_login,
                     stop_event=stop_event,
                     http_session=http_session,
+                    drive_browser=not direct_authorized,
                 )
             finally:
                 if opened_new_tab:
@@ -412,6 +545,7 @@ def _drive_device_authorization_and_poll(
     stop_event=None,
     prefer_google_login: bool = False,
     http_session: Any = None,
+    drive_browser: bool = True,
 ) -> OAuthTokens | None:
     deadline = time.monotonic() + expires_in
     next_poll_at = time.monotonic()
@@ -422,8 +556,15 @@ def _drive_device_authorization_and_poll(
     consecutive_page_errors = 0
     consent_click_sent = False
     consent_click_at = 0.0
+    consent_click_attempts = 0
+    device_code_click_sent = False
+    device_code_click_at = 0.0
+    device_code_click_attempts = 0
 
-    print("[OAuth Exchange] 已进入 device 授权页驱动；如果停在人机验证页，请手动完成")
+    if drive_browser:
+        print("[OAuth Exchange] 已进入 device 授权页驱动；如果停在人机验证页，请手动完成")
+    else:
+        print("[OAuth Exchange] 已完成 HTTP 授权，直接轮询 token，不再等待 Build 页面")
 
     while time.monotonic() < deadline:
         if stop_event and stop_event.is_set():
@@ -462,8 +603,14 @@ def _drive_device_authorization_and_poll(
 
         if now - last_status_at >= 5:
             remaining = max(0, int(deadline - now))
-            print(f"[OAuth Exchange] 等待 device 授权，剩余约 {remaining} 秒；页面: {_page_status(session, oauth_page)}")
+            page_label = _page_status(session, oauth_page) if drive_browser else "HTTP 直连已授权"
+            print(f"[OAuth Exchange] 等待 device 授权，剩余约 {remaining} 秒；页面: {page_label}")
             last_status_at = now
+
+        if not drive_browser:
+            wait_seconds = max(0.05, min(0.5, next_poll_at - time.monotonic()))
+            time.sleep(wait_seconds)
+            continue
 
         try:
             page = oauth_page or session.refresh_page()
@@ -491,6 +638,25 @@ def _drive_device_authorization_and_poll(
             continue
 
         consecutive_page_errors = 0
+
+        if action == "device-code-ready":
+            now = time.monotonic()
+            if (
+                not device_code_click_sent
+                and device_code_click_attempts < 8
+                and (device_code_click_attempts == 0 or now - device_code_click_at >= 1)
+            ):
+                device_code_click_attempts += 1
+                device_code_click_at = now
+                clicked, description = _click_device_consent_button(page, purpose="device-code")
+                if clicked:
+                    device_code_click_sent = True
+                    print(f"[OAuth Exchange] 已用真实鼠标事件提交 Device Code ({description})")
+                elif "device-code-button" not in notices:
+                    print(f"[OAuth Exchange] Device Code 提交按钮尚未就绪：{description}")
+                    notices.add("device-code-button")
+            time.sleep(1)
+            continue
 
         if action == "needs-email-code" and not email_code:
             print("[OAuth Exchange] 授权登录要求邮箱验证码，开始读取验证码")
@@ -526,13 +692,23 @@ def _drive_device_authorization_and_poll(
             )
 
         if action == "device-consent-ready":
-            if not consent_click_sent:
-                clicked, description = _click_device_consent_button(page)
+            now = time.monotonic()
+            if (
+                not consent_click_sent
+                and consent_click_attempts < 8
+                and (consent_click_attempts == 0 or now - consent_click_at >= 1)
+            ) or (
+                consent_click_sent
+                and now - consent_click_at >= 8
+                and consent_click_attempts < 3
+            ):
+                consent_click_attempts += 1
+                consent_click_at = now
+                clicked, description = _click_device_consent_button(page, purpose="consent")
                 if clicked:
                     consent_click_sent = True
-                    consent_click_at = time.monotonic()
                     print(f"[OAuth Exchange] 已用真实鼠标事件点击 xAI 授权按钮 ({description})")
-                    time.sleep(2)
+                    time.sleep(1)
                     continue
                 if "device-consent-button" not in notices:
                     print(f"[OAuth Exchange] 暂未找到可点击的 xAI 授权按钮: {description}")
@@ -540,16 +716,28 @@ def _drive_device_authorization_and_poll(
             elif time.monotonic() - consent_click_at >= 20:
                 current_url = _page_status(session, oauth_page)
                 if "/oauth2/device/consent" in current_url.lower():
-                    raise RuntimeError("点击授权按钮后页面 20 秒仍未跳转")
+                    raise RuntimeError("自动点击 Build 授权按钮后页面 20 秒仍未跳转")
             time.sleep(1)
             continue
 
-        if action in {"needs-manual-consent", "needs-google-password"}:
+        if action == "needs-manual-consent":
+            # Some xAI builds do not expose the consent path in the URL. Give
+            # the real-CDP clicker one more chance instead of waiting for a
+            # human to press the Build button.
+            clicked, description = _click_device_consent_button(page, purpose="consent")
+            if clicked:
+                consent_click_sent = True
+                consent_click_at = time.monotonic()
+                consent_click_attempts += 1
+                print(f"[OAuth Exchange] 已补点击 Build 授权按钮 ({description})")
+            elif action not in notices:
+                print(f"[OAuth Exchange] 授权按钮尚未就绪：{description}")
+                notices.add(action)
+            time.sleep(1)
+            continue
+        if action == "needs-google-password":
             if action not in notices:
-                if action == "needs-google-password":
-                    print("[OAuth Exchange] Google 授权页要求密码，但账号池没有可用密码，等待人工处理...")
-                else:
-                    print("[OAuth Exchange] 授权页结构尚未识别，等待页面组件加载...")
+                print("[OAuth Exchange] Google 授权页要求密码，但账号池没有可用密码，等待人工处理...")
                 notices.add(action)
             time.sleep(2)
             continue
@@ -622,6 +810,10 @@ function normalizedText(node) {
         node.value || '',
         node.getAttribute?.('aria-label') || '',
         node.getAttribute?.('title') || '',
+        node.getAttribute?.('data-testid') || '',
+        node.getAttribute?.('data-test-id') || '',
+        node.getAttribute?.('name') || '',
+        node.getAttribute?.('id') || '',
     ].join(' ').replace(/\s+/g, ' ').trim();
 }
 
@@ -900,8 +1092,9 @@ if (userCodeInput && userCode) {
     if (compactCurrent !== compactCode) {
         return setValue(userCodeInput, userCode) ? 'device-code-filled' : 'idle';
     }
-    const label = clickButton('device-code-next', ['continue', 'next', 'submit', 'confirm', '继续', '下一步', '提交', '确认'], userCodeInput);
-    return label ? `device-code-click:${label}` : 'device-code-filled';
+    // The Python side performs the submit with a real CDP mouse event. This
+    // avoids the same React/submitter issue as the final Build consent.
+    return 'device-code-ready';
 }
 
 const emailInput = visibleInputs('input[type="email"], input[name="email"], input[autocomplete="email"], input[data-testid="email"]').at(0);
@@ -970,25 +1163,38 @@ const likelyOauthPage = isXaiHost && (
     bodyCompact.includes('授权') ||
     bodyCompact.includes('允许访问')
 );
+const visibleControls = Array.from(document.querySelectorAll(
+    'button, input[type="submit"], input[type="button"], a, [role="button"]'
+)).filter((node) => isVisible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true');
+const hasApproveForm = visibleControls.some((node) => {
+    const action = String(node.form?.action || node.getAttribute('href') || '').toLowerCase();
+    return action.includes('/oauth2/device/approve');
+});
+const hasBuildControl = visibleControls.some((node) => {
+    const text = compactText(node);
+    return [
+        'build', 'continuetobuild', 'connectbuild', 'usebuild', 'getstarted',
+        'startbuilding', 'openbuild', 'gotobuild', 'buildconsole',
+        '开始使用', '开始构建', '连接build', '使用build'
+    ].some((word) => text === word || text.includes(word));
+});
 if (likelyOauthPage) {
     if (turnstileState() === 'pending') {
         return 'needs-human-turnstile';
     }
-    const label = clickButton('xai-oauth-consent', [
-        '继续',
-        '允许',
-        '授权',
-        '同意',
-        '批准',
-        '确认',
-        'continue',
-        'allow',
-        'authorize',
-        'approve',
-        'agree',
-        'confirm'
-    ], null, false);
-    return label ? `consent-click:${label}` : 'needs-manual-consent';
+    // xAI's consent endpoint needs the actual submitter from a real browser
+    // mouse event. Leave the candidate untouched and let Python dispatch the
+    // CDP click instead of using HTMLElement.click().
+    return 'device-consent-ready';
+}
+// Some xAI deployments render the Build consent as a client-side route with
+// no /oauth or /device path. A real approve form or a strong Build label is
+// enough to put it through the same CDP clicker.
+if (isXaiHost && (hasApproveForm || (hasBuildControl && !emailInput && !passwordInput))) {
+    if (turnstileState() === 'pending') {
+        return 'needs-human-turnstile';
+    }
+    return 'device-consent-ready';
 }
 
 return 'idle';
@@ -1003,7 +1209,7 @@ return 'idle';
     )
 
 
-def _click_device_consent_button(page) -> tuple[bool, str]:
+def _click_device_consent_button(page, purpose: str = "consent") -> tuple[bool, str]:
     """用 Chrome 真实鼠标事件点击 xAI consent 的允许按钮。
 
     这里不能调用 form.submit()/requestSubmit()，也不能通过 JS 执行 element.click()。
@@ -1013,6 +1219,7 @@ def _click_device_consent_button(page) -> tuple[bool, str]:
     try:
         candidate = page.run_js(
             r"""
+const purpose = String(arguments[0] || 'consent');
 const marker = 'data-grok-oauth-consent-target';
 for (const node of document.querySelectorAll(`[${marker}]`)) {
     node.removeAttribute(marker);
@@ -1035,23 +1242,34 @@ function words(node) {
         node.getAttribute('aria-label') || '',
         node.getAttribute('title') || '',
         node.getAttribute('data-action') || '',
+        node.getAttribute('data-testid') || '',
+        node.getAttribute('data-test-id') || '',
+        node.id || '',
     ].join(' ').replace(/\s+/g, ' ').trim().toLowerCase();
 }
 
-const allowWords = [
+const consentWords = [
+    'build', 'continue to build', 'connect build', 'use build', 'get started',
+    'start building', 'open build', 'go to build', 'build console',
     'allow', 'authorize', 'approve', 'accept', 'continue', 'confirm',
-    '允许', '授权', '同意', '批准', '继续', '确认'
+    '允许', '授权', '同意', '批准', '开始使用', '开始构建', '连接build', '使用build'
 ];
+const deviceCodeWords = [
+    'continue', 'next', 'submit', 'confirm', 'verify', 'activate',
+    '继续', '下一步', '提交', '确认', '验证', '激活'
+];
+const allowWords = purpose === 'device-code' ? deviceCodeWords : consentWords;
 const denyWords = [
     'cancel', 'deny', 'decline', 'reject', 'back', 'not now',
-    '取消', '拒绝', '返回', '暂不'
+    'sign out', 'switch account', 'use another account',
+    '取消', '拒绝', '返回', '暂不', '退出登录', '切换账号', '使用其他账号'
 ];
 const controls = Array.from(document.querySelectorAll(
-    'button, input[type="submit"], input[type="button"]'
+    'button, input[type="submit"], input[type="button"], a, [role="button"]'
 )).filter(visible);
 const scored = controls.map((node, index) => {
     const text = words(node);
-    const formAction = String(node.form?.action || '').toLowerCase();
+    const formAction = String(node.form?.action || node.getAttribute('href') || '').toLowerCase();
     let score = 0;
     if (denyWords.some((word) => text.includes(word))) score -= 10000;
     const exact = allowWords.findIndex((word) => text === word);
@@ -1060,6 +1278,7 @@ const scored = controls.map((node, index) => {
     else if (contains >= 0) score += 1000 - contains;
     if (String(node.type || '').toLowerCase() === 'submit') score += 100;
     if (formAction.includes('/oauth2/device/approve')) score += 500;
+    if (purpose === 'device-code' && text.includes('build')) score -= 1500;
     return { node, index, text, formAction, score };
 }).filter((item) => item.score > 0).sort((left, right) => right.score - left.score);
 
@@ -1069,7 +1288,7 @@ let selected = scored[0] || null;
 if (!selected) {
     const approveControls = controls.filter((node) => {
         const text = words(node);
-        return String(node.form?.action || '').toLowerCase().includes('/oauth2/device/approve') &&
+        return String(node.form?.action || node.getAttribute('href') || '').toLowerCase().includes('/oauth2/device/approve') &&
             !denyWords.some((word) => text.includes(word));
     });
     if (approveControls.length === 1) {
@@ -1078,7 +1297,7 @@ if (!selected) {
             node,
             index: controls.indexOf(node),
             text: words(node),
-            formAction: String(node.form?.action || '').toLowerCase(),
+            formAction: String(node.form?.action || node.getAttribute('href') || '').toLowerCase(),
             score: 1,
         };
     }
@@ -1097,7 +1316,8 @@ return {
     text: selected.text.slice(0, 80),
     formAction: selected.formAction,
 };
-            """
+            """,
+            purpose,
         )
         if not isinstance(candidate, dict) or not candidate.get("found"):
             count = candidate.get("count", 0) if isinstance(candidate, dict) else 0

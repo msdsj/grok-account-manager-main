@@ -53,6 +53,21 @@ from .pending import OAUTH_PENDING, PERSISTENCE_FAILED, PendingResultStore
 from .registration_proxy_pool import load_saved_registration_proxies
 
 
+def _env_float(name: str, default: float, *, minimum: float = 0.0, maximum: float = 120.0) -> float:
+    """Read a bounded timing override without allowing invalid sleep values."""
+    try:
+        value = float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, value))
+
+
+def _timing_range(min_name: str, max_name: str, default_min: float, default_max: float) -> tuple[float, float]:
+    lower = _env_float(min_name, default_min)
+    upper = _env_float(max_name, default_max)
+    return (lower, max(lower, upper))
+
+
 def _fingerprint_summary(session: DrissionBrowserSession) -> str:
     isolation = str(getattr(session, "isolation_summary", "") or "").strip()
     identity = getattr(session, "identity", None)
@@ -870,10 +885,16 @@ class RegistrationJobManager:
         with self._lock:
             cross_job_delay = max(0.0, self._next_job_start_not_before - time.monotonic())
         multiplier = max(0, worker_index - 1)
+        stagger_min, stagger_max = _timing_range(
+            "GROK_ACCOUNT_MANAGER_WORKER_START_STAGGER_MIN_SECONDS",
+            "GROK_ACCOUNT_MANAGER_WORKER_START_STAGGER_MAX_SECONDS",
+            WORKER_START_STAGGER_MIN_SECONDS,
+            WORKER_START_STAGGER_MAX_SECONDS,
+        )
         worker_delay = (
             random.uniform(
-                WORKER_START_STAGGER_MIN_SECONDS * multiplier,
-                WORKER_START_STAGGER_MAX_SECONDS * multiplier,
+                stagger_min * multiplier,
+                stagger_max * multiplier,
             )
             if multiplier
             else 0.0
@@ -934,7 +955,13 @@ class RegistrationJobManager:
 
         节奏本身也是一种可被风控识别的特征——真人不会以固定间隔连续注册账号。
         """
-        delay = random.uniform(ROUND_PACING_MIN_SECONDS, ROUND_PACING_MAX_SECONDS)
+        pacing_min, pacing_max = _timing_range(
+            "GROK_ACCOUNT_MANAGER_ROUND_PACING_MIN_SECONDS",
+            "GROK_ACCOUNT_MANAGER_ROUND_PACING_MAX_SECONDS",
+            ROUND_PACING_MIN_SECONDS,
+            ROUND_PACING_MAX_SECONDS,
+        )
+        delay = random.uniform(pacing_min, pacing_max)
         self._event(
             "info",
             f"Worker {worker_index} 等待 {delay:.1f}s 后开始下一轮（模拟真人节奏，降低风控概率）",
@@ -1880,9 +1907,15 @@ class RegistrationJobManager:
                 self._event_locked("success", "任务已全部完成")
             self._job["finishedAt"] = now_ms()
             registered_this_round = int(self._job.get("registered") or 0)
-            self._next_job_start_not_before = time.monotonic() + random.uniform(
+            pacing_min, pacing_max = _timing_range(
+                "GROK_ACCOUNT_MANAGER_ROUND_PACING_MIN_SECONDS",
+                "GROK_ACCOUNT_MANAGER_ROUND_PACING_MAX_SECONDS",
                 ROUND_PACING_MIN_SECONDS,
                 ROUND_PACING_MAX_SECONDS,
+            )
+            self._next_job_start_not_before = time.monotonic() + random.uniform(
+                pacing_min,
+                pacing_max,
             )
             self._mail_source = None
             self._proxy_pool = None

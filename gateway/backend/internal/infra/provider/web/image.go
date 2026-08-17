@@ -1522,6 +1522,13 @@ func (a *Adapter) postJSONWithReferer(ctx context.Context, cfg Config, lease *eg
 			if isClearanceRefreshableMediaError(upstreamErr) {
 				lease.InvalidateClearance()
 				_ = a.invalidateSignedStatsig(http.MethodPost, endpoint)
+				// A JSON anti-bot response (code 7) is still an egress/session
+				// rejection. Feed it back to the Web egress manager so a fixed
+				// node can cool and the next video attempt can select another
+				// exit instead of replaying every account on the same IP.
+				if a.egress != nil {
+					a.egress.FeedbackForScope(context.WithoutCancel(ctx), domainegress.ScopeWeb, lease.NodeID, response.StatusCode, nil)
+				}
 				return response, nil
 			}
 			// Structured JSON responses are application policy decisions. They

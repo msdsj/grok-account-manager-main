@@ -256,6 +256,7 @@ class GrokProvider:
                                 session,
                                 email=email,
                                 password=oauth_password,
+                                sso_token=sso_value,
                                 code_getter=lambda: mailbox.wait_for_code(
                                     timeout=180,
                                     stop_event=self.stop_event,

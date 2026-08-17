@@ -922,9 +922,10 @@ func (m *Manager) acquire(ctx context.Context, scope domain.Scope, affinity stri
 	return m.leaseForNode(ctx, scope, affinity, encryptedCredentialCookies, managedClearance, selected)
 }
 
-// acquireUnavailableFallback keeps the primary selection error when fallback
-// is disabled. A fixed fallback is never silently replaced with direct traffic
-// when it is invalid or unavailable.
+// acquireUnavailableFallback keeps the primary selection error for normal
+// request scopes when fallback is disabled. Asset downloads are different:
+// their upstream job already exists, so an invalid bound node may be replaced
+// by another asset node or a direct transfer without replaying generation.
 func (m *Manager) acquireUnavailableFallback(ctx context.Context, scope domain.Scope, affinity string, allowDirect bool, encryptedCredentialCookies string, managedClearance bool, primaryErr error) (*Lease, bool, error) {
 	lease, configured, applied, err := m.acquireFallback(ctx, scope, affinity, allowDirect, encryptedCredentialCookies, managedClearance, primaryErr)
 	if err != nil {
@@ -932,6 +933,26 @@ func (m *Manager) acquireUnavailableFallback(ctx context.Context, scope domain.S
 	}
 	if applied {
 		return lease, configured, nil
+	}
+	// Asset URLs are produced by an already-completed upstream job. If the
+	// account's original node was removed, cooled, or lost its proxy while the
+	// job was running, keep the same account identity but reselect a healthy
+	// asset/Web node before failing the local download. A direct asset request
+	// is the final fallback because the object host is public and the SSO cookie
+	// remains account-bound.
+	if scope == domain.ScopeWebAsset || scope == domain.ScopeConsoleAsset {
+		unboundLease, unboundConfigured, unboundErr := m.acquire(ctx, scope, affinity, allowDirect, encryptedCredentialCookies, 0)
+		if unboundErr == nil {
+			return unboundLease, configured || unboundConfigured, nil
+		}
+		if allowDirect {
+			directLease, _, directErr := m.leaseForNode(ctx, scope, affinity, encryptedCredentialCookies, managedClearance, domain.Node{ID: 0, Name: "direct", Scope: scope, Enabled: true, Health: 1})
+			if directErr == nil {
+				return directLease, configured || unboundConfigured, nil
+			}
+			return nil, configured || unboundConfigured, fallbackError(primaryErr, errors.Join(unboundErr, directErr))
+		}
+		return nil, configured || unboundConfigured, fallbackError(primaryErr, unboundErr)
 	}
 	return nil, true, primaryErr
 }

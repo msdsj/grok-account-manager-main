@@ -14,14 +14,22 @@ import os
 from pathlib import Path
 import secrets
 import shutil
+import socket
 import subprocess
 import threading
 import time
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import requests
+from dotenv import load_dotenv
 
 from ...core.browser import PROJECT_ROOT
+
+
+# RelayManager is constructed during module import, before the FastAPI app
+# factory runs its usual dotenv initialization.
+load_dotenv()
 
 
 OUTPUT_DIR = PROJECT_ROOT / "output"
@@ -37,6 +45,9 @@ LEGACY_RELAY_PORT = 8000
 RELAY_CONTAINER_PORT = 43871
 BUNDLED_GATEWAY_DIR = PROJECT_ROOT / "gateway"
 GATEWAY_REVISION_PATH = BUNDLED_GATEWAY_DIR / "UPSTREAM_REVISION"
+GATEWAY_PROXY_ENV = "GROK_ACCOUNT_MANAGER_GATEWAY_PROXY"
+DEFAULT_GATEWAY_PROXY = "http://127.0.0.1:7890"
+HOST_PROXY_NODE_NAME = "本机VPN-Web"
 
 CHAT_MODEL_MARKERS = (
     "reasoning",
@@ -56,6 +67,8 @@ class RelayConfig:
     port: int = DEFAULT_RELAY_PORT
     api_key: str = "local-grok-api-key"
     admin_key: str = "grok2api"
+    gateway_proxy: str = DEFAULT_GATEWAY_PROXY
+    gateway_proxy_applied: str = ""
 
     @property
     def base_url(self) -> str:
@@ -89,6 +102,8 @@ class RelayManager:
                 "apiKeyMasked": _mask_secret(config.api_key),
                 "adminKey": config.admin_key,
                 "adminKeyMasked": _mask_secret(config.admin_key),
+                "gatewayProxy": _mask_proxy_url(config.gateway_proxy),
+                "gatewayProxyConfigured": bool(config.gateway_proxy),
                 "dataDir": str(V2_DATA_DIR),
                 "logPath": str(LOG_PATH),
                 "engine": "bundled-gateway",
@@ -106,6 +121,9 @@ class RelayManager:
                 current["api_key"] = str(patch.get("apiKey") or "").strip()
             if "adminKey" in patch:
                 current["admin_key"] = str(patch.get("adminKey") or "").strip()
+            if "gatewayProxy" in patch:
+                current["gateway_proxy"] = _normalize_gateway_proxy(patch.get("gatewayProxy"))
+                current["gateway_proxy_applied"] = ""
             if not current["api_key"]:
                 raise ValueError("API 秘钥不能为空")
             if not current["admin_key"]:
@@ -209,7 +227,9 @@ class RelayManager:
 
     def apply_remote_config(self, clearance: dict[str, str] | None = None) -> dict:
         del clearance
-        return self._ensure_v2_client_key()
+        result = self._ensure_v2_client_key()
+        self._ensure_gateway_proxy_node()
+        return result
 
     def sync_accounts(self, credentials: list[dict], *, refresh_existing: bool = False) -> dict:
         del refresh_existing
@@ -484,6 +504,134 @@ class RelayManager:
         self._save_config(self._config)
         return {"managedApiKey": True}
 
+    def _ensure_gateway_proxy_node(self) -> None:
+        """Keep the project-owned Web egress node aligned with the host VPN.
+
+        The gateway runs in a container, so a host-local endpoint must be
+        rewritten to ``host.docker.internal`` before it is stored in the
+        gateway database. This is deliberately best-effort: a machine without
+        a running VPN should still be able to start the bundled gateway and use
+        its normal direct fallback.
+        """
+
+        configured_proxy = _normalize_gateway_proxy(self._config.gateway_proxy)
+        try:
+            headers = self._v2_admin_headers()
+            response = requests.get(
+                f"{self._config.base_url}/api/admin/v1/egress-nodes",
+                headers=headers,
+                params={"scope": "grok_web"},
+                timeout=20,
+            )
+            _raise_response_error(response)
+            payload = response.json()
+            data = payload.get("data") if isinstance(payload, dict) else None
+            items = data.get("items") if isinstance(data, dict) else []
+            if not isinstance(items, list):
+                items = []
+            node = next(
+                (
+                    item
+                    for item in items
+                    if isinstance(item, dict)
+                    and str(item.get("name") or "").strip() == HOST_PROXY_NODE_NAME
+                    and str(item.get("scope") or "") == "grok_web"
+                ),
+                None,
+            )
+
+            if not configured_proxy:
+                if node and (bool(node.get("enabled")) or bool(node.get("proxyConfigured"))):
+                    self._update_gateway_proxy_node(headers, node, enabled=False, clear_proxy=True)
+                if self._config.gateway_proxy_applied:
+                    self._config.gateway_proxy_applied = ""
+                    self._save_config(self._config)
+                return
+
+            if _is_local_proxy(configured_proxy) and not _proxy_endpoint_reachable(configured_proxy):
+                if node and (bool(node.get("enabled")) or bool(node.get("proxyConfigured"))):
+                    self._update_gateway_proxy_node(headers, node, enabled=False, clear_proxy=True)
+                if self._config.gateway_proxy_applied:
+                    self._config.gateway_proxy_applied = ""
+                    self._save_config(self._config)
+                with LOG_PATH.open("a", encoding="utf-8") as log_file:
+                    log_file.write(
+                        f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] host VPN proxy unavailable "
+                        f"({_mask_proxy_url(configured_proxy)}); using direct fallback\n"
+                    )
+                return
+
+            container_proxy = _container_proxy_url(configured_proxy)
+            needs_update = (
+                node is None
+                or not bool(node.get("enabled"))
+                or not bool(node.get("proxyConfigured"))
+                or self._config.gateway_proxy_applied != configured_proxy
+            )
+            if needs_update:
+                if node is None:
+                    request = {
+                        "name": HOST_PROXY_NODE_NAME,
+                        "scope": "grok_web",
+                        "enabled": True,
+                        "proxyPool": False,
+                        "proxyURL": container_proxy,
+                        "accountCapacity": 0,
+                    }
+                    create = requests.post(
+                        f"{self._config.base_url}/api/admin/v1/egress-nodes",
+                        headers=headers,
+                        json=request,
+                        timeout=20,
+                    )
+                    _raise_response_error(create)
+                else:
+                    self._update_gateway_proxy_node(headers, node, enabled=True, proxy_url=container_proxy)
+
+            if self._config.gateway_proxy_applied != configured_proxy:
+                self._config.gateway_proxy_applied = configured_proxy
+                self._save_config(self._config)
+        except Exception as error:
+            # Proxy setup must not make the local API unavailable. The masked
+            # endpoint is enough to diagnose a typo without leaking credentials.
+            masked = _mask_proxy_url(configured_proxy)
+            with LOG_PATH.open("a", encoding="utf-8") as log_file:
+                log_file.write(
+                    f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] host VPN proxy setup skipped "
+                    f"({masked}): {type(error).__name__}: {error}\n"
+                )
+
+    def _update_gateway_proxy_node(
+        self,
+        headers: dict[str, str],
+        node: dict[str, Any],
+        *,
+        enabled: bool,
+        proxy_url: str | None = None,
+        clear_proxy: bool = False,
+    ) -> None:
+        node_id = str(node.get("id") or "").strip()
+        if not node_id:
+            raise RuntimeError("本机 VPN 出口节点缺少 ID")
+        request: dict[str, Any] = {
+            "name": HOST_PROXY_NODE_NAME,
+            "scope": "grok_web",
+            "enabled": enabled,
+            "proxyPool": False,
+            "accountCapacity": int(node.get("accountCapacity") or 0),
+        }
+        if clear_proxy:
+            request["clearProxyURL"] = True
+        elif proxy_url:
+            request["proxyURL"] = proxy_url
+        response = requests.put(
+            f"{self._config.base_url}/api/admin/v1/egress-nodes/{node_id}",
+            headers=headers,
+            json=request,
+            timeout=20,
+        )
+        _raise_response_error(response)
+
     def _v2_import_accounts(self, credentials: list[dict]) -> dict:
         if not self.is_running():
             self.start()
@@ -548,15 +696,36 @@ class RelayManager:
                 configured_port = _safe_port(data.get("port"), DEFAULT_RELAY_PORT)
                 if configured_port == LEGACY_RELAY_PORT:
                     configured_port = DEFAULT_RELAY_PORT
-                return RelayConfig(
+                if GATEWAY_PROXY_ENV in os.environ:
+                    gateway_proxy_value = os.environ.get(GATEWAY_PROXY_ENV, "")
+                elif "gateway_proxy" in data:
+                    gateway_proxy_value = data.get("gateway_proxy")
+                elif "gatewayProxy" in data:
+                    gateway_proxy_value = data.get("gatewayProxy")
+                else:
+                    gateway_proxy_value = DEFAULT_GATEWAY_PROXY
+                config = RelayConfig(
                     host=str(data.get("host") or "127.0.0.1"),
                     port=configured_port,
                     api_key=str(data.get("api_key") or data.get("apiKey") or "local-grok-api-key"),
                     admin_key=str(data.get("admin_key") or data.get("adminKey") or "grok2api"),
+                    gateway_proxy=_normalize_gateway_proxy(gateway_proxy_value),
+                    gateway_proxy_applied=_normalize_gateway_proxy(data.get("gateway_proxy_applied") or ""),
                 )
+                # Older local runs stored an external checkout path in this
+                # file. Rewriting through the project-owned dataclass removes
+                # that stale cross-project setting on the next startup.
+                if "grok2api_path" in data or "gateway_proxy" not in data:
+                    self._save_config(config)
+                return config
             except Exception:
                 pass
-        return RelayConfig()
+        gateway_proxy_value = (
+            os.environ.get(GATEWAY_PROXY_ENV, "")
+            if GATEWAY_PROXY_ENV in os.environ
+            else DEFAULT_GATEWAY_PROXY
+        )
+        return RelayConfig(gateway_proxy=_normalize_gateway_proxy(gateway_proxy_value))
 
     def _save_config(self, config: RelayConfig) -> None:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -593,6 +762,99 @@ def _safe_port(value: Any, default: int) -> int:
     return max(1, min(65535, port))
 
 
+def _normalize_gateway_proxy(value: Any) -> str:
+    """Normalize a user-entered gateway proxy without exposing credentials."""
+
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if "://" not in raw:
+        raw = f"http://{raw}"
+    parsed = urlsplit(raw)
+    if not parsed.scheme or not parsed.hostname:
+        raise ValueError("网关代理地址格式无效")
+    try:
+        if parsed.port is None or not 1 <= parsed.port <= 65535:
+            raise ValueError("网关代理端口必须是 1-65535")
+    except ValueError as error:
+        raise ValueError("网关代理端口无效") from error
+    return urlunsplit(parsed)
+
+
+def _container_proxy_url(value: str) -> str:
+    """Rewrite host-loopback proxy URLs for use from inside Docker."""
+
+    normalized = _normalize_gateway_proxy(value)
+    if not normalized:
+        return ""
+    parsed = urlsplit(normalized)
+    hostname = (parsed.hostname or "").lower()
+    if hostname not in {"127.0.0.1", "localhost", "::1"}:
+        return normalized
+    host = "host.docker.internal"
+    if parsed.port is not None:
+        host = f"{host}:{parsed.port}"
+    if parsed.username is not None:
+        userinfo = parsed.username
+        if parsed.password is not None:
+            userinfo += f":{parsed.password}"
+        host = f"{userinfo}@{host}"
+    return urlunsplit(parsed._replace(netloc=host))
+
+
+def _is_local_proxy(value: str) -> bool:
+    try:
+        hostname = (urlsplit(_normalize_gateway_proxy(value)).hostname or "").lower()
+    except ValueError:
+        return False
+    return hostname in {"127.0.0.1", "localhost", "::1"}
+
+
+def _proxy_endpoint_reachable(value: str) -> bool:
+    """Check only whether the local proxy port is listening.
+
+    This deliberately does not perform an external request or send proxy
+    credentials. The gateway's own egress probe remains authoritative for
+    protocol and upstream reachability.
+    """
+
+    try:
+        parsed = urlsplit(_normalize_gateway_proxy(value))
+        hostname = parsed.hostname or ""
+        port = parsed.port
+        if not hostname or port is None:
+            return False
+        with socket.create_connection((hostname, port), timeout=0.5):
+            return True
+    except (OSError, ValueError):
+        return False
+
+
+def _mask_proxy_url(value: str) -> str:
+    """Return a display-safe proxy URL with userinfo and host partially hidden."""
+
+    normalized = str(value or "").strip()
+    if not normalized:
+        return "直连"
+    try:
+        parsed = urlsplit(normalized if "://" in normalized else f"http://{normalized}")
+        hostname = parsed.hostname or "?"
+        if hostname.count(".") == 3:
+            parts = hostname.split(".")
+            display_host = f"{parts[0]}.***.***.{parts[-1]}"
+        elif len(hostname) <= 3:
+            display_host = "***"
+        else:
+            display_host = f"{hostname[:2]}***{hostname[-2:]}"
+        if ":" in hostname and not hostname.startswith("["):
+            display_host = "[IPv6]"
+        if parsed.port is not None:
+            display_host = f"{display_host}:{parsed.port}"
+        return f"{parsed.scheme}://{display_host}"
+    except (ValueError, TypeError):
+        return "代理（配置无效）"
+
+
 def _rewrite_relay_listen(config_text: str) -> str:
     """Keep the mounted grok2api config aligned with the container port."""
     migrated = config_text.replace(
@@ -614,12 +876,16 @@ def _rewrite_relay_listen(config_text: str) -> str:
 
 def _grok2api_v2_command(config: RelayConfig, config_path: Path) -> list[str]:
     container_name = f"grok-account-manager-gateway-{config.port}"
-    return [
+    command = [
         "docker",
         "run",
         "--rm",
         "--name",
         container_name,
+        # Docker Desktop provides this name by default; the explicit host-gateway
+        # mapping also makes the same command work on Linux Docker Engine.
+        "--add-host",
+        "host.docker.internal:host-gateway",
         "--publish",
         f"{config.host}:{config.port}:{RELAY_CONTAINER_PORT}",
         "--health-cmd",
@@ -645,6 +911,27 @@ def _grok2api_v2_command(config: RelayConfig, config_path: Path) -> list[str]:
         "--listen",
         f"0.0.0.0:{RELAY_CONTAINER_PORT}",
     ]
+    proxy = _container_proxy_url(config.gateway_proxy)
+    if _is_local_proxy(config.gateway_proxy) and not _proxy_endpoint_reachable(config.gateway_proxy):
+        proxy = ""
+    if proxy:
+        # The explicit Web node handles browser traffic. These environment
+        # variables additionally cover direct Build/utility requests that use
+        # Go's ProxyFromEnvironment path.
+        image_index = command.index(V2_IMAGE)
+        command[image_index:image_index] = [
+            "--env",
+            f"HTTP_PROXY={proxy}",
+            "--env",
+            f"HTTPS_PROXY={proxy}",
+            "--env",
+            f"ALL_PROXY={proxy}",
+            "--env",
+            "NO_PROXY=127.0.0.1,localhost,host.docker.internal",
+            "--env",
+            "no_proxy=127.0.0.1,localhost,host.docker.internal",
+        ]
+    return command
 
 
 def _write_private_text(path: Path, content: str) -> None:

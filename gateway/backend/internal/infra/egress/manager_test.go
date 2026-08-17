@@ -2473,6 +2473,26 @@ func TestWebAssetCredentialFallsBackToWebWithSameResinIdentity(t *testing.T) {
 	}
 }
 
+func TestWebAssetCredentialFallsBackToDirectWhenBoundNodeIsUnavailable(t *testing.T) {
+	cipher, err := security.NewCipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := NewManager(egressRepositoryTestStub{nodes: []domain.Node{
+		{ID: 2, Name: "cooled-web", Scope: domain.ScopeWeb, Enabled: false, Health: 0},
+	}}, cipher)
+	lease, err := manager.AcquireCredential(context.Background(), domain.ScopeWebAsset, accountdomain.Credential{
+		ID: 42, Provider: accountdomain.ProviderWeb, EgressNodeID: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	if lease.NodeID != 0 || lease.ProxyURL != "" {
+		t.Fatalf("asset direct fallback = node %d proxy %q", lease.NodeID, lease.ProxyURL)
+	}
+}
+
 func TestEgressNodeSnapshotAvoidsRepeatedRepositoryReads(t *testing.T) {
 	repository := &countingEgressRepository{egressRepositoryTestStub: egressRepositoryTestStub{nodes: []domain.Node{{ID: 1, Scope: domain.ScopeWeb, Enabled: true}}}}
 	manager := NewManager(repository, nil)
