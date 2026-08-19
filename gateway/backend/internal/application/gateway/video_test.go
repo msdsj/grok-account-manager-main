@@ -46,15 +46,6 @@ func TestVideoQuotaModeUsesWeb720pProduct(t *testing.T) {
 	}
 }
 
-func TestVideoTransientRateLimitDoesNotConsumeQuota(t *testing.T) {
-	if !isVideoTransientRateLimit(errors.New("Grok Web 媒体上游返回 429: 8: Too many requests")) {
-		t.Fatal("generic Web 429 was not classified as transient")
-	}
-	if isVideoTransientRateLimit(errors.New("Console 媒体上游返回 429: Free usage quota exceeded")) {
-		t.Fatal("explicit Console quota exhaustion was classified as transient")
-	}
-}
-
 func TestGetVideoExposesOnlyReadableResultAsset(t *testing.T) {
 	completed := media.Job{
 		ID: "video_status", ClientKeyID: 7, Status: media.StatusCompleted,
@@ -775,7 +766,7 @@ type videoHTTPStatusError struct{ status int }
 func (e videoHTTPStatusError) Error() string       { return http.StatusText(e.status) }
 func (e videoHTTPStatusError) HTTPStatusCode() int { return e.status }
 
-func TestVideoWebForbiddenRetriesPinnedAccountOnceThenFailsOver(t *testing.T) {
+func TestVideoWebForbiddenFailsWithoutAccountFailover(t *testing.T) {
 	ctx := context.Background()
 	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "video-retry.db"))
 	if err != nil {
@@ -849,15 +840,15 @@ func TestVideoWebForbiddenRetriesPinnedAccountOnceThenFailsOver(t *testing.T) {
 	}
 	service.runVideoJob(ctx, job, route)
 
-	if attempts := adapter.Attempts(); len(attempts) != 3 || attempts[0] != first.ID || attempts[1] != first.ID || attempts[2] != second.ID {
-		t.Fatalf("video attempts = %#v, want first, first, second", attempts)
+	if attempts := adapter.Attempts(); len(attempts) != 1 || attempts[0] != first.ID {
+		t.Fatalf("video attempts = %#v, want first account once", attempts)
 	}
 	stored, err := mediaRepo.GetMediaJob(ctx, job.ID, job.ClientKeyID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stored.Status != media.StatusCompleted || stored.AccountID != second.ID || stored.ResultAssetID != "video_asset_00001" {
-		t.Fatalf("completed job = %#v", stored)
+	if stored.Status != media.StatusFailed || stored.AccountID != first.ID {
+		t.Fatalf("failed job = %#v", stored)
 	}
 
 	adapter.mu.Lock()

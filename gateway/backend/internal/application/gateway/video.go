@@ -544,8 +544,6 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 	quotaRefreshGroup := s.providers.QuotaRefreshGroup(route.Provider, route.UpstreamModel)
 	attemptPolicy := s.videoAttemptPolicy()
 	excluded := make(map[uint64]bool)
-	forbiddenEgressRetried := make(map[uint64]bool)
-	var retryPinnedAccountID uint64
 	failureAttempts := newFailureAttemptRecorder(http.MethodPost, "/videos/generations")
 	var selection *selectionSession
 	var lease *accountLease
@@ -560,9 +558,10 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 			lease = nil
 		}
 		// First try stays on the account chosen when the local job was created.
-		// Create-stage failures may switch accounts; poll failures never reach here as retries.
-		pinnedAccountID := retryPinnedAccountID
-		retryPinnedAccountID = 0
+		// A create-stage failure may switch accounts only after quota exhaustion is
+		// confirmed; transport, anti-bot, and upstream rate-limit failures must not
+		// fan one request across the whole account pool.
+		pinnedAccountID := uint64(0)
 		if attempt == 0 {
 			pinnedAccountID = job.AccountID
 		}
@@ -662,31 +661,16 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 				failureHandled = true
 				retriableCreate = safeCreateFailure
 			case status == http.StatusForbidden && s.providers.RetryForbiddenAsEgress(lease.Credential.Provider):
-				// Web anti-bot 403 is egress-scoped. Retry the same account once so
-				// egress invalidation can rebuild the route, then move on normally.
+				// Web anti-bot 403 is egress-scoped. The adapter already invalidates
+				// the clearance and feeds back the node; switching accounts would
+				// only replay the same request through the same exit IP.
 				failureHandled = true
-				if safeCreateFailure {
-					if !forbiddenEgressRetried[lease.Credential.ID] {
-						forbiddenEgressRetried[lease.Credential.ID] = true
-						retryPinnedAccountID = lease.Credential.ID
-						delete(excluded, lease.Credential.ID)
-					}
-					retriableCreate = true
-				}
 			case status == http.StatusForbidden && lease.Credential.Provider == account.ProviderBuild:
 				if !account.IsBuildSuper(lease.Credential, lease.Billing) {
 					s.selector.MarkFailure(failureCtx, lease.Credential, status, 0)
 				}
 				failureHandled = true
 				retriableCreate = safeCreateFailure && !account.IsBuildSuper(lease.Credential, lease.Billing)
-			case status == http.StatusTooManyRequests && isVideoTransientRateLimit(err):
-				// Web media code 8 is a request/egress rate limit, not proof
-				// that this account's video window is empty. Cool the account
-				// briefly and continue with another eligible account without
-				// overwriting its quota snapshot.
-				s.selector.MarkFailure(failureCtx, lease.Credential, status, 0)
-				failureHandled = true
-				retriableCreate = safeCreateFailure
 			case (status == http.StatusPaymentRequired || status == http.StatusTooManyRequests) && lease.QuotaMode != "":
 				exhausted, reconcileErr := s.accounts.ReconcileRateLimit(failureCtx, lease.Credential.ID, lease.QuotaMode, 0)
 				s.selector.MarkQuotaStateChanged(lease.Credential.Provider, lease.Credential.ID)
@@ -694,7 +678,9 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 					s.selector.MarkFailure(failureCtx, lease.Credential, status, 0)
 				}
 				failureHandled = true
-				retriableCreate = safeCreateFailure
+				// A second account is justified only when the refreshed quota
+				// window confirms that this account is exhausted.
+				retriableCreate = safeCreateFailure && reconcileErr == nil && exhausted
 			case status == http.StatusTooManyRequests || status == http.StatusPaymentRequired:
 				s.selector.MarkFailure(failureCtx, lease.Credential, status, 0)
 				failureHandled = true
@@ -794,25 +780,6 @@ func videoQuotaMode(providerValue account.Provider, catalogMode, resolution stri
 		}
 	}
 	return catalogMode
-}
-
-func isVideoTransientRateLimit(err error) bool {
-	text := strings.ToLower(strings.TrimSpace(errString(err)))
-	if text == "" || !strings.Contains(text, "too many requests") {
-		return false
-	}
-	// Do not hide an explicit quota exhaustion response behind the generic
-	// rate-limit branch. Console's free-usage response is account-scoped.
-	return !strings.Contains(text, "free usage quota exceeded") &&
-		!strings.Contains(text, "free-usage-exhausted") &&
-		!strings.Contains(text, "usage exhausted")
-}
-
-func errString(err error) string {
-	if err == nil {
-		return ""
-	}
-	return err.Error()
 }
 
 func (s *Service) acquireVideoInputSlot(ctx context.Context, references []string) (func(), error) {
