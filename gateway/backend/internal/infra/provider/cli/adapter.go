@@ -221,6 +221,9 @@ func (a *Adapter) config() Config {
 }
 
 func (a *Adapter) ForwardResponse(ctx context.Context, request provider.ResponseResourceRequest) (*provider.Response, error) {
+	if request.NormalizedMetadata != nil {
+		*request.NormalizedMetadata = provider.NormalizedRequestMetadata{}
+	}
 	accessToken, err := a.cipher.Decrypt(request.Credential.EncryptedAccessToken)
 	if err != nil {
 		return nil, err
@@ -233,17 +236,23 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 	if request.NormalizeBody {
 		if request.Operation == conversation.OperationChat || request.Operation == conversation.OperationMessages {
 			body, conversationOptions, err = conversation.ConvertRequestWithOptions(body, request.Model, request.Operation)
+			if err == nil && conversationOptions.ReasoningEffortSet && request.NormalizedMetadata != nil {
+				request.NormalizedMetadata.ReasoningEffort = conversationOptions.ReasoningEffort
+			}
 		} else {
-			var foreignCompactions int
-			body, foreignCompactions, err = expandGatewayCompactionHistory(body, a.compaction, request.PromptCacheKey)
+			var foreignCompactions, driftedCompactions int
+			body, foreignCompactions, driftedCompactions, err = expandGatewayCompactionHistory(body, a.compaction, request.PromptCacheKey)
 			if err != nil {
 				return invalidResponsesResponse(err), nil
 			}
-			body, toolCompatibility, err = normalizeResponsesRequest(body, request.Model)
+			body, toolCompatibility, err = normalizeResponsesRequestWithMetadata(body, request.Model, request.NormalizedMetadata)
 			if toolCompatibility != nil {
 				compactionRequested = toolCompatibility.compactionRequested
 				if foreignCompactions > 0 {
 					toolCompatibility.addWarning("foreign_compaction_omitted")
+				}
+				if driftedCompactions > 0 {
+					toolCompatibility.addWarning("compaction_session_drifted")
 				}
 			}
 		}
@@ -253,7 +262,7 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 			}
 			return invalidResponsesResponse(err), nil
 		}
-		body, err = normalizeBuildRequest(body, request.Model, request.Operation)
+		body, err = normalizeBuildRequestWithMetadata(body, request.Model, request.Operation, request.NormalizedMetadata)
 		if err != nil {
 			if request.Operation == conversation.OperationChat || request.Operation == conversation.OperationMessages {
 				return invalidConversationResponse(request.Operation, err), nil
@@ -824,7 +833,7 @@ func (a *Adapter) RefreshCredential(ctx context.Context, credential account.Cred
 		return provider.RefreshedCredential{}, &provider.CredentialRefreshError{Code: "missing_refresh_token", Message: "Refresh token is missing", Permanent: true}
 	}
 	refreshCtx := infraegress.WithCredential(ctx, credential)
-	tokens, err := a.oauth.refresh(refreshCtx, refreshToken)
+	tokens, err := a.oauth.refreshWithClientID(refreshCtx, refreshToken, credential.OIDCClientID)
 	if err != nil {
 		return provider.RefreshedCredential{}, err
 	}
@@ -836,7 +845,7 @@ func (a *Adapter) RefreshCredential(ctx context.Context, credential account.Cred
 	if err != nil {
 		return provider.RefreshedCredential{}, err
 	}
-	return provider.RefreshedCredential{EncryptedAccessToken: accessEncrypted, EncryptedRefreshToken: refreshEncrypted, ExpiresAt: tokens.ExpiresAt}, nil
+	return provider.RefreshedCredential{EncryptedAccessToken: accessEncrypted, EncryptedRefreshToken: refreshEncrypted, ExpiresAt: tokens.ExpiresAt, RefreshTokenRotated: tokens.RefreshTokenRotated}, nil
 }
 
 func (a *Adapter) StartDeviceAuthorization(ctx context.Context) (provider.DeviceAuthorization, error) {
@@ -860,6 +869,34 @@ func (a *Adapter) PollDeviceAuthorization(ctx context.Context, deviceCode string
 
 func (a *Adapter) ParseImportedCredentials(data []byte) ([]provider.CredentialSeed, error) {
 	return parseImportedCredentials(data)
+}
+
+// PrepareImportedCredential validates a refresh-token-only import and keeps
+// the rotated tokens returned by xAI before the account is persisted.
+func (a *Adapter) PrepareImportedCredential(ctx context.Context, seed provider.CredentialSeed) (provider.CredentialSeed, error) {
+	if strings.TrimSpace(seed.AccessToken) != "" || strings.TrimSpace(seed.RefreshToken) == "" {
+		return seed, nil
+	}
+	refreshCtx, cancel := context.WithTimeout(ctx, buildControlTimeout)
+	defer cancel()
+	tokens, err := a.oauth.refreshWithClientID(refreshCtx, strings.TrimSpace(seed.RefreshToken), seed.OIDCClientID)
+	if err != nil {
+		return provider.CredentialSeed{}, fmt.Errorf("验证 Grok Build refresh token: %w", err)
+	}
+	claims := decodeJWTClaims(firstNonEmpty(tokens.IDToken, tokens.AccessToken))
+	seed.AccessToken = tokens.AccessToken
+	seed.RefreshToken = tokens.RefreshToken
+	seed.ExpiresAt = tokens.ExpiresAt
+	seed.OIDCClientID = firstNonEmpty(seed.OIDCClientID, defaultOAuthClientID)
+	seed.UserID = firstNonEmpty(seed.UserID, stringClaim(claims, "sub"))
+	seed.Email = firstNonEmpty(seed.Email, stringClaim(claims, "email"))
+	seed.TeamID = firstNonEmpty(seed.TeamID, stringClaim(claims, "team_id"))
+	if seed.Name == "" || seed.Name == "Grok Build account" {
+		seed.Name = firstNonEmpty(seed.Email, seed.UserID, "Grok Build account")
+	}
+	identity := firstNonEmpty(seed.UserID, strings.ToLower(seed.Email), seed.TeamID, seed.RefreshToken, seed.AccessToken)
+	seed.SourceKey = "import:" + security.HashToken(strings.Join([]string{credentialImportProvider, seed.OIDCClientID, identity}, "|"))
+	return seed, nil
 }
 
 func (a *Adapter) MarshalCredentials(values []provider.CredentialSeed) ([]byte, error) {

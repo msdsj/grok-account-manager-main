@@ -75,7 +75,7 @@ func (s *Selector) beginSelectionSessionForKey(ctx context.Context, provider acc
 			continue
 		}
 		consideredCandidates++
-		if candidate.ModelCapabilityKnown && !candidate.SupportsModel {
+		if !s.candidateSupportsModel(provider, upstreamModel, quotaMode, candidate) {
 			continue
 		}
 		supportedCandidates++
@@ -179,7 +179,7 @@ func (session *selectionSession) acquireQuotaProbe(ctx context.Context, excluded
 		return nil, nil
 	}
 	if session.probePlan == nil {
-		plan, err := session.selector.planCandidateIndexes(ctx, session.values, session.probeCandidates, time.Now().UTC(), session.selector.resolveTierOrder(session.provider, session.upstreamModel))
+		plan, err := session.selector.planCandidateIndexes(ctx, session.values, session.probeCandidates, time.Now().UTC(), session.selector.resolveTierOrder(session.provider, session.upstreamModel, session.quotaMode))
 		if err != nil {
 			return nil, err
 		}
@@ -256,7 +256,7 @@ func (session *selectionSession) acquireNormal(ctx context.Context, excluded map
 	indexes := session.unexcludedNormalIndexes(excluded)
 	activeRequest := session.selector.nextSegmentedActiveRequest(session.provider, session.upstreamModel, session.quotaMode, len(indexes))
 	if activeRequest != nil {
-		lease, err := session.selector.acquireSegmentedCandidates(ctx, session.values, indexes, session.quotaMode, session.selector.resolveTierOrder(session.provider, session.upstreamModel), *activeRequest)
+		lease, err := session.selector.acquireSegmentedCandidates(ctx, session.values, indexes, session.quotaMode, session.selector.resolveTierOrder(session.provider, session.upstreamModel, session.quotaMode), *activeRequest)
 		if err != nil || lease == nil || session.stickyKey == "" {
 			return lease, err
 		}
@@ -270,7 +270,7 @@ func (session *selectionSession) acquireNormal(ctx context.Context, excluded map
 	deadline := time.Now().Add(capacityWait)
 	for {
 		if session.normalPlan == nil {
-			plan, err := session.selector.planCandidateIndexes(ctx, session.values, session.normalCandidates, time.Now().UTC(), session.selector.resolveTierOrder(session.provider, session.upstreamModel))
+			plan, err := session.selector.planCandidateIndexes(ctx, session.values, session.normalCandidates, time.Now().UTC(), session.selector.resolveTierOrder(session.provider, session.upstreamModel, session.quotaMode))
 			if err != nil {
 				return nil, err
 			}
@@ -354,6 +354,27 @@ func (session *selectionSession) hasUnexcludedNormal(excluded map[uint64]bool) b
 	for _, index := range session.normalCandidates {
 		if !session.candidateExcluded(excluded, session.values[index].Credential.ID) {
 			return true
+		}
+	}
+	return false
+}
+
+// hasAvailableCandidate reports whether this request-level snapshot still has
+// an account the quality retry is allowed to switch to. This is deliberately
+// stronger than checking the routing attempt counter: a large attempt budget
+// does not imply that another account exists.
+func (session *selectionSession) hasAvailableCandidate(excluded map[uint64]bool, allowQuotaProbe bool) bool {
+	if session == nil {
+		return false
+	}
+	if session.hasUnexcludedNormal(excluded) {
+		return true
+	}
+	if allowQuotaProbe {
+		for _, index := range session.probeCandidates {
+			if !session.candidateExcluded(excluded, session.values[index].Credential.ID) {
+				return true
+			}
 		}
 	}
 	return false

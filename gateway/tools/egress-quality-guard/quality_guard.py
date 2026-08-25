@@ -42,6 +42,7 @@ RUNTIME_CONFIG_FIELDS = {
 
 BOOTSTRAP_VERSION = 1
 BOOTSTRAP_FILE = Path("/var/lib/grok2api-quality-guard/bootstrap.json")
+DEFAULT_GROK2API_BASE_URL = "http://gateway:8000"
 INTERNAL_API_PREFIX = "/api/internal/v1/quality-guard"
 QUALITY_MARKER_PROFILE_ID = "quality-marker"
 THROUGHPUT_PROFILE_ID = "throughput"
@@ -105,8 +106,9 @@ class Config:
         token = str(payload.get("internal_token") or "").strip()
         node_ids = tuple(dict.fromkeys(str(value).strip() for value in values.get("node_ids", []) if str(value).strip()))
         rotatable_node_ids = tuple(dict.fromkeys(str(value).strip() for value in values.get("rotatable_node_ids", []) if str(value).strip()))
+        base_url = os.environ.get("GROK2API_BASE_URL", "").strip() or DEFAULT_GROK2API_BASE_URL
         config = cls(
-            base_url="http://gateway:8000",
+            base_url=base_url.rstrip("/"),
             internal_token=token,
             model=str(values.get("model") or "").strip(),
             node_ids=node_ids,
@@ -143,8 +145,20 @@ class Config:
 
     def validate(self) -> None:
         parsed = urllib.parse.urlparse(self.base_url)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            raise ValueError("GROK2API_BASE_URL must be an absolute HTTP(S) URL")
+        try:
+            hostname = parsed.hostname
+            parsed.port
+        except ValueError:
+            hostname = None
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or "?" in self.base_url
+            or "#" in self.base_url
+        ):
+            raise ValueError("GROK2API_BASE_URL must be an absolute HTTP(S) URL without credentials, query, or fragment")
         if not self.internal_token:
             raise ValueError("quality guard bootstrap internal token is missing")
         if not self.model or not self.prompt or not self.expected:
@@ -370,14 +384,18 @@ def classify_result(result: dict[str, Any], config: Config, profile: dict[str, A
         # Rolling upgrades may still expose panel-equivalent TPS under the legacy name.
         speed_value = result.get("visibleTokensPerSecond")
     speed = float(speed_value or 0.0)
+    reasoning_tokens = max(0, int(result.get("reasoningTokens") or result.get("reasoning_tokens") or 0))
     generation_ms = int(result.get("generationMs") or 0)
     if generation_ms <= 0:
-        generation_ms = max(0, int(result.get("durationMs") or 0) - int(result.get("firstTokenMs") or 0))
+        generation_ms = generation_window_ms(
+            int(result.get("firstTokenMs") or 0),
+            int(result.get("durationMs") or 0),
+            reasoning_tokens,
+        )
     # QUALITY_OK is a content marker, not a quality proof. Apply the same
     # token / window / TPS rules used for user-traffic audits.
     if output_tokens < 32:
         return "soft", "insufficient_output_tokens"
-    reasoning_tokens = max(0, int(result.get("reasoningTokens") or result.get("reasoning_tokens") or 0))
     if "thinkingRequired" in result:
         require_thinking = bool(result.get("thinkingRequired"))
     else:
@@ -465,7 +483,12 @@ def classify_audit(value: dict[str, Any], config: Config) -> tuple[str, str, flo
     first_token_ms = value.get("firstTokenMs")
     if first_token_ms is None:
         return "ignored", "missing_first_token", 0.0, 0
-    generation_ms = int(value.get("durationMs") or 0) - int(first_token_ms)
+    reasoning_tokens = max(0, int(value.get("reasoningTokens") or 0))
+    generation_ms = generation_window_ms(
+        int(first_token_ms),
+        int(value.get("durationMs") or 0),
+        reasoning_tokens,
+    )
     output_tokens = max(0, int(value.get("outputTokens") or 0))
     if generation_ms <= 0 or output_tokens < 32:
         return "ignored", "insufficient_output_tokens", 0.0, output_tokens
@@ -477,6 +500,19 @@ def classify_audit(value: dict[str, Any], config: Config) -> tuple[str, str, flo
     if speed >= config.soft_tps:
         return "soft", "soft_tps", speed, output_tokens
     return "healthy", "within_threshold", speed, output_tokens
+
+
+def generation_window_ms(first_token_ms: int, duration_ms: int, reasoning_tokens: int = 0) -> int:
+    if duration_ms <= 0:
+        return 0
+    if first_token_ms < 0:
+        first_token_ms = 0
+    if first_token_ms >= duration_ms:
+        return 0
+    generation_ms = duration_ms - first_token_ms
+    if reasoning_tokens > 0 and generation_ms < first_token_ms and generation_ms < 1000:
+        return duration_ms
+    return generation_ms
 
 
 def default_node_state() -> dict[str, Any]:

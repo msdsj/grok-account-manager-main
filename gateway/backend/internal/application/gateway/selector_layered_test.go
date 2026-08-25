@@ -108,7 +108,7 @@ func (r *layeredAccountRepository) UpdateHealth(_ context.Context, id uint64, _ 
 	}
 	r.healthUpdates = append(r.healthUpdates, repository.InvalidationEvent{
 		Kind: repository.InvalidationAccountHealthChanged, Provider: provider, AccountID: id,
-		FailureCount: failureCount, CooldownUntil: cooldownUntil,
+		FailureCount: failureCount, CooldownUntil: cooldownUntil, HealthMarker: account.NormalizeHealthMarker(lastError),
 	})
 	return nil
 }
@@ -192,8 +192,12 @@ func TestSelectorHealthInvalidationDoesNotRebuildProviderSnapshots(t *testing.T)
 	cooldownUntil := now.Add(time.Minute)
 	selector.ApplyInvalidation(repository.InvalidationEvent{
 		Kind: repository.InvalidationAccountHealthChanged, Provider: account.ProviderBuild, AccountID: 1,
-		FailureCount: 1, CooldownUntil: &cooldownUntil, PublishedAt: now,
+		FailureCount: 1, CooldownUntil: &cooldownUntil, HealthMarker: account.LastErrorMissingThinking, PublishedAt: now,
 	})
+	marked := selector.applyRoutingHealth(account.Credential{ID: 1, Provider: account.ProviderBuild}, now)
+	if marked.LastError != account.LastErrorMissingThinking {
+		t.Fatalf("durable health marker was lost in the runtime overlay: %#v", marked)
+	}
 	_, err := selector.beginSelectionSession(context.Background(), account.ProviderBuild, 0, "model-a", "", "", nil, false)
 	var unavailable *SelectionUnavailableError
 	if !errors.As(err, &unavailable) || unavailable.Reason != SelectionCooling {
@@ -815,6 +819,24 @@ func TestAssembleRoutingCandidatesAllowsRecognizedStaticConsoleModelWithStaleSna
 	unknown := assembleRoutingCandidates(account.ProviderConsole, "", bases, overlay)
 	if len(unknown) != 1 || !unknown[0].ModelCapabilityKnown || unknown[0].SupportsModel {
 		t.Fatalf("unknown Console model = %#v", unknown)
+	}
+}
+
+func TestAssembleRoutingCandidatesAllowsRecognizedWebImagineModelWithStaleSnapshot(t *testing.T) {
+	bases := []account.RoutingAccountBase{{Credential: account.Credential{
+		ID: 1, Provider: account.ProviderWeb, Enabled: true, AuthStatus: account.AuthStatusActive,
+	}}}
+	overlay := account.RoutingOverlaySnapshot{Values: []account.RoutingAccountOverlay{{
+		AccountID: 1, ModelCapabilityKnown: true, SupportsModel: false,
+	}}}
+
+	recognized := assembleRoutingCandidates(account.ProviderWeb, account.QuotaModeWebImagePro, bases, overlay)
+	if len(recognized) != 1 || !recognized[0].ModelCapabilityKnown || !recognized[0].SupportsModel {
+		t.Fatalf("recognized Web Imagine model = %#v", recognized)
+	}
+	unknown := assembleRoutingCandidates(account.ProviderWeb, "", bases, overlay)
+	if len(unknown) != 1 || !unknown[0].ModelCapabilityKnown || unknown[0].SupportsModel {
+		t.Fatalf("unknown Web model = %#v", unknown)
 	}
 }
 

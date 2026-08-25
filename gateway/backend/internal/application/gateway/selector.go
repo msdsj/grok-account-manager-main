@@ -482,7 +482,7 @@ func (s *Selector) acquire(ctx context.Context, provider account.Provider, model
 			continue
 		}
 		consideredCandidates++
-		if candidate.ModelCapabilityKnown && !candidate.SupportsModel {
+		if !s.candidateSupportsModel(provider, upstreamModel, quotaMode, candidate) {
 			continue
 		}
 		supportedCandidates++
@@ -538,7 +538,7 @@ func (s *Selector) acquire(ctx context.Context, provider account.Provider, model
 	if len(probeCandidates) > 0 {
 		staleClaims := 0
 		capacityMisses := 0
-		plan, err := s.planCandidateIndexes(ctx, values, probeCandidates, now, s.resolveTierOrder(provider, upstreamModel))
+		plan, err := s.planCandidateIndexes(ctx, values, probeCandidates, now, s.resolveTierOrder(provider, upstreamModel, quotaMode))
 		if err != nil {
 			return nil, err
 		}
@@ -611,7 +611,7 @@ func (s *Selector) acquire(ctx context.Context, provider account.Provider, model
 	// 粘性账号仅因并发满载而暂时不可用时，先等待该账号；超时后允许本次请求临时借用
 	// 其他账号，但不覆盖原绑定，避免并行请求让活跃会话在账号池中来回抖动。
 	if saturatedStickyID != 0 {
-		plan, err := s.planCandidateIndexes(ctx, values, normalCandidates, time.Now().UTC(), s.resolveTierOrder(provider, upstreamModel))
+		plan, err := s.planCandidateIndexes(ctx, values, normalCandidates, time.Now().UTC(), s.resolveTierOrder(provider, upstreamModel, quotaMode))
 		if err != nil {
 			return nil, err
 		}
@@ -637,7 +637,7 @@ func (s *Selector) acquire(ctx context.Context, provider account.Provider, model
 	}
 	activeRequest := s.nextSegmentedActiveRequest(provider, upstreamModel, quotaMode, len(normalCandidates))
 	if activeRequest != nil {
-		lease, acquireErr := s.acquireSegmentedCandidates(ctx, values, normalCandidates, quotaMode, s.resolveTierOrder(provider, upstreamModel), *activeRequest)
+		lease, acquireErr := s.acquireSegmentedCandidates(ctx, values, normalCandidates, quotaMode, s.resolveTierOrder(provider, upstreamModel, quotaMode), *activeRequest)
 		if acquireErr != nil || lease == nil || stickyKey == "" {
 			return lease, acquireErr
 		}
@@ -653,7 +653,7 @@ func (s *Selector) acquire(ctx context.Context, provider account.Provider, model
 		currentTime := time.Now().UTC()
 		staleClaims := 0
 		capacityMisses := 0
-		plan, err := s.planCandidateIndexes(ctx, values, normalCandidates, currentTime, s.resolveTierOrder(provider, upstreamModel))
+		plan, err := s.planCandidateIndexes(ctx, values, normalCandidates, currentTime, s.resolveTierOrder(provider, upstreamModel, quotaMode))
 		if err != nil {
 			return nil, err
 		}
@@ -784,7 +784,7 @@ func (s *Selector) acquirePinned(ctx context.Context, provider account.Provider,
 			return nil, &SelectionUnavailableError{Reason: SelectionNoAccounts}
 		}
 		if inference {
-			if candidate.ModelCapabilityKnown && !candidate.SupportsModel {
+			if !s.candidateSupportsModel(provider, upstreamModel, quotaMode, candidate) {
 				return nil, &SelectionUnavailableError{Reason: SelectionUnsupportedModel}
 			}
 			if candidate.ModelQuotaBlock != nil && now.Before(candidate.ModelQuotaBlock.CooldownUntil) {
@@ -887,18 +887,54 @@ func annotateSelectionAccountScope(err *error, scope clientkeydomain.AccountScop
 }
 
 func effectiveQuotaMode(candidate account.RoutingCandidate, fallback string) string {
-	if candidate.QuotaWindow != nil && candidate.QuotaWindow.Mode == "weekly" {
-		return "weekly"
+	if candidate.QuotaWindow != nil && candidate.QuotaWindow.Mode != "" {
+		return candidate.QuotaWindow.Mode
+	}
+	if candidate.Credential.Provider == account.ProviderWeb && fallback == account.QuotaModeWebImageEdit {
+		switch candidate.Credential.WebTier {
+		case account.WebTierSuper, account.WebTierHeavy:
+			return account.QuotaModeWebImageEdit
+		default:
+			return account.QuotaModeWebImagePro
+		}
 	}
 	return fallback
+}
+
+// candidateSupportsModel treats a recognized Web catalog entry as an
+// effective capability for tiers that the adapter explicitly allows. This
+// prevents a historical capability snapshot from blocking a newly enabled
+// catalog feature, while unknown/manual Web routes and all other providers
+// retain the persisted snapshot semantics.
+func (s *Selector) candidateSupportsModel(provider account.Provider, upstreamModel, quotaMode string, candidate account.RoutingCandidate) bool {
+	if provider == account.ProviderWeb {
+		order := s.resolveTierOrder(provider, upstreamModel, quotaMode)
+		if len(order) > 0 {
+			return webTierInOrder(order, candidate.Credential.WebTier)
+		}
+	}
+	return !candidate.ModelCapabilityKnown || candidate.SupportsModel
 }
 
 func (s *Selector) MarkSuccess(ctx context.Context, credential account.Credential) {
 	s.markSuccess(ctx, credential, true)
 }
 
+func isMissingThinkingStrike(lastError string) bool {
+	return lastError == lastErrorMissingThinking || lastError == lastErrorMissingThinkingDisabled
+}
+
+type missingThinkingPenaltyResult string
+
+const (
+	missingThinkingPenaltyUnchanged missingThinkingPenaltyResult = "unchanged"
+	missingThinkingPenaltyCooled    missingThinkingPenaltyResult = "cooled"
+	missingThinkingPenaltyDisabled  missingThinkingPenaltyResult = "disabled"
+)
+
 func (s *Selector) markSuccess(ctx context.Context, credential account.Credential, quotaProbe bool) {
 	now := time.Now().UTC()
+	keepThinkingStrike := isMissingThinkingStrike(credential.LastError)
 	healthChanged := credential.FailureCount > 0 || credential.CooldownUntil != nil || credential.LastError != ""
 	touchLastUsed := healthChanged
 	s.selectionMu.Lock()
@@ -910,9 +946,14 @@ func (s *Selector) markSuccess(ctx context.Context, credential account.Credentia
 	}
 	s.selectionMu.Unlock()
 	if healthChanged {
-		if err := s.accounts.UpdateHealth(ctx, credential.ID, credential.Provider, 0, nil, "", true); err == nil {
+		lastError := ""
+		if keepThinkingStrike {
+			lastError = lastErrorMissingThinking
+		}
+		if err := s.accounts.UpdateHealth(ctx, credential.ID, credential.Provider, 0, nil, lastError, true); err == nil {
 			s.ApplyInvalidation(repository.InvalidationEvent{
 				Kind: repository.InvalidationAccountHealthChanged, Provider: credential.Provider, AccountID: credential.ID,
+				HealthMarker: account.NormalizeHealthMarker(lastError),
 			})
 		}
 	} else if touchLastUsed {
@@ -1093,26 +1134,64 @@ func (s *Selector) clearQuotaConsumptionAccount(provider account.Provider, accou
 	s.quotaMu.Unlock()
 }
 
+// markMissingThinking cools an account for the first no-thinking hit and
+// disables it if missing thinking appears again after that cooldown.
+func (s *Selector) markMissingThinking(ctx context.Context, credential account.Credential, cooldown time.Duration) (missingThinkingPenaltyResult, error) {
+	if cooldown <= 0 {
+		cooldown = defaultMissingThinkingCooldown
+	}
+	now := time.Now().UTC()
+	inCooldown := credential.CooldownUntil != nil && now.Before(*credential.CooldownUntil)
+	if isMissingThinkingStrike(credential.LastError) && !inCooldown {
+		disabled := false
+		if _, err := s.accounts.UpdateMany(ctx, credential.Provider, []uint64{credential.ID}, repository.AccountUpdates{Enabled: &disabled}); err != nil {
+			return missingThinkingPenaltyUnchanged, err
+		}
+		healthErr := s.accounts.UpdateHealth(ctx, credential.ID, credential.Provider, credential.FailureCount, nil, lastErrorMissingThinkingDisabled, false)
+		s.ApplyInvalidation(repository.InvalidationEvent{
+			Kind: repository.InvalidationAccountStateChanged, Provider: credential.Provider, AccountID: credential.ID,
+		})
+		s.evictCandidate(credential.Provider, credential.ID)
+		if s.sticky != nil {
+			_ = s.sticky.DeleteByAccount(ctx, credential.ID)
+		}
+		return missingThinkingPenaltyDisabled, healthErr
+	}
+	if inCooldown {
+		return missingThinkingPenaltyUnchanged, nil
+	}
+	until := now.Add(cooldown)
+	if err := s.accounts.UpdateHealth(ctx, credential.ID, credential.Provider, credential.FailureCount, &until, lastErrorMissingThinking, false); err != nil {
+		return missingThinkingPenaltyUnchanged, err
+	}
+	s.ApplyInvalidation(repository.InvalidationEvent{
+		Kind: repository.InvalidationAccountHealthChanged, Provider: credential.Provider, AccountID: credential.ID,
+		FailureCount: credential.FailureCount, CooldownUntil: &until, HealthMarker: account.LastErrorMissingThinking,
+	})
+	s.evictCandidate(credential.Provider, credential.ID)
+	return missingThinkingPenaltyCooled, nil
+}
+
 func (s *Selector) MarkFailure(ctx context.Context, credential account.Credential, status int, retryAfter time.Duration) {
-	_ = s.markFailure(ctx, credential, credential.FailureCount+1, status, retryAfter)
+	_ = s.markFailure(ctx, credential, credential.FailureCount, credential.FailureCount+1, status, retryAfter)
 }
 
 // MarkFailureAfterSuccess records a stream failure from a fresh health baseline.
 // The upstream already returned a successful response header, so failures that
 // preceded this request must not be carried into the new cooldown calculation.
 func (s *Selector) MarkFailureAfterSuccess(ctx context.Context, credential account.Credential, status int, retryAfter time.Duration) error {
-	return s.markFailure(ctx, credential, 1, status, retryAfter)
+	return s.markFailure(ctx, credential, 0, 1, status, retryAfter)
 }
 
-func (s *Selector) markFailure(ctx context.Context, credential account.Credential, failureCount, status int, retryAfter time.Duration) error {
+func (s *Selector) markFailure(ctx context.Context, credential account.Credential, baselineFailureCount, nextFailureCount, status int, retryAfter time.Duration) error {
 	_, cooldownBase, cooldownMax, _ := s.routingConfig()
 	// 网络/超时（status 0）只短隔离本号，不累加失败次数，避免瞬时抖动把号池指数冻空。
 	// 上游返回的 4xx/5xx 仍按原指数冷却：那是上游明确给出的状态，不是本地网络抖动。
 	softNetwork := status == 0
-	effectiveFailureCount := failureCount
+	effectiveFailureCount := nextFailureCount
 	cooldown := cooldownBase
 	if softNetwork {
-		effectiveFailureCount = credential.FailureCount
+		effectiveFailureCount = baselineFailureCount
 		cooldown = softNetworkCooldown
 		if retryAfter > cooldown {
 			cooldown = retryAfter
@@ -1440,8 +1519,8 @@ func (s *Selector) applyHealthInvalidation(event repository.InvalidationEvent) {
 		value := event.CooldownUntil.UTC()
 		cooldownUntil = &value
 	}
-	overrideLastError := ""
-	if event.FailureCount > 0 || cooldownUntil != nil {
+	overrideLastError := account.NormalizeHealthMarker(event.HealthMarker)
+	if overrideLastError == "" && (event.FailureCount > 0 || cooldownUntil != nil) {
 		overrideLastError = "upstream failure"
 	}
 	value := routingHealthOverride{
@@ -1802,14 +1881,15 @@ func assembleRoutingCandidates(provider account.Provider, quotaMode string, base
 		}
 	}
 	result := make([]account.RoutingCandidate, 0, len(bases))
-	staticConsoleModel := provider == account.ProviderConsole && strings.TrimSpace(quotaMode) != ""
+	staticProviderModel := (provider == account.ProviderConsole && strings.TrimSpace(quotaMode) != "") ||
+		(provider == account.ProviderWeb && account.IsWebImagineQuotaMode(quotaMode))
 	for _, base := range bases {
 		overlayValue := byAccount[base.Credential.ID]
 		if overlay.HasBindings && !overlayValue.Bound {
 			continue
 		}
 		known, supports := overlayValue.ModelCapabilityKnown, overlayValue.SupportsModel
-		if staticConsoleModel {
+		if staticProviderModel {
 			known, supports = true, true
 		} else if overlay.HasBindings {
 			known, supports = true, true
@@ -1989,18 +2069,41 @@ func retryDelay(now, retryAt time.Time) time.Duration {
 	return retryAt.Sub(now)
 }
 
-func (s *Selector) resolveTierOrder(provider account.Provider, upstreamModel string) []account.WebTier {
+func (s *Selector) resolveTierOrder(provider account.Provider, upstreamModel, quotaMode string) []account.WebTier {
 	if s.tierOrders == nil {
 		return nil
+	}
+	if resolver, ok := s.tierOrders.(interface {
+		TierOrderForQuotaMode(account.Provider, string, string) []account.WebTier
+	}); ok {
+		return resolver.TierOrderForQuotaMode(provider, upstreamModel, quotaMode)
 	}
 	return s.tierOrders.TierOrder(provider, upstreamModel)
 }
 
 func tierOrderRank(order []account.WebTier, tier account.WebTier) int {
+	tier = normalizedRoutingWebTier(tier)
 	for index, value := range order {
 		if value == tier {
 			return index
 		}
 	}
 	return len(order)
+}
+
+func normalizedRoutingWebTier(tier account.WebTier) account.WebTier {
+	if tier == "" || tier == account.WebTierAuto {
+		return account.WebTierBasic
+	}
+	return tier
+}
+
+func webTierInOrder(order []account.WebTier, tier account.WebTier) bool {
+	tier = normalizedRoutingWebTier(tier)
+	for _, allowed := range order {
+		if allowed == tier {
+			return true
+		}
+	}
+	return false
 }

@@ -21,8 +21,11 @@ your own traffic before allowing automatic quarantine.
 ## How it works
 
 1. Passive mode polls recent successful streaming audits and computes the same
-   speed shown by the grok2api panel: `output / (duration - first token)`.
-   `output` intentionally includes reasoning tokens.
+   speed shown by the grok2api panel: `output / generation window`.
+   `output` includes reasoning tokens. The window is `duration - first token`,
+   except when that tail is both shorter than the first-token wait and under
+   1s: then the full duration is used so buffered thinking is not assigned to
+   a few milliseconds.
 2. Active mode calls a quality-guard-only internal probe endpoint. The scoped
    credential cannot access account exports, administrator management, or the
    rest of the administrator API.
@@ -181,6 +184,15 @@ After changing the base `qualityGuard` settings in `config.yaml`, run
 `docker compose --profile quality-guard restart grok2api egress-quality-guard`
 so the main service regenerates the bootstrap. Policy changes saved in the
 admin page still hot-reload without a restart.
+
+The sidecar talks to grok2api at `GROK2API_BASE_URL`, which defaults to
+`http://grok2api:8000` on the Compose network. Set it when the main service is
+renamed or published on host networking, for example
+`GROK2API_BASE_URL=http://127.0.0.1:8000`.
+
+Missing-thinking **request-path withhold/retry** (`qualityGuard.requestRetry`)
+runs inside the grok2api gateway, not this sidecar. See `config.example.yaml`
+and the root README.
 
 Verify the managed nodes, model, and minimum healthy-node count before leaving
 the sidecar running. Never commit the state volume or

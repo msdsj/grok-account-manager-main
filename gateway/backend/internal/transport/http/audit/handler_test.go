@@ -84,14 +84,25 @@ func TestAuditDetailReturnsCompleteTextAndBinaryBodies(t *testing.T) {
 
 func TestAuditResponseDerivesOutputThroughput(t *testing.T) {
 	firstTokenMS := int64(250)
-	response := newAuditResponse(auditdomain.Record{StatusCode: http.StatusOK, Streaming: true, FirstTokenMS: &firstTokenMS, DurationMS: 1250, OutputTokens: 80})
-	if response.FirstTokenMS == nil || *response.FirstTokenMS != 250 || response.OutputTokensPerSecond == nil || *response.OutputTokensPerSecond != 80 {
+	response := newAuditResponse(auditdomain.Record{ClientIP: "203.0.113.8", StatusCode: http.StatusOK, Streaming: true, ReasoningEffort: "high", FirstTokenMS: &firstTokenMS, DurationMS: 1250, OutputTokens: 80})
+	if response.ClientIP != "203.0.113.8" || response.ReasoningEffort != "high" || response.FirstTokenMS == nil || *response.FirstTokenMS != 250 || response.OutputTokensPerSecond == nil || *response.OutputTokensPerSecond != 80 {
 		t.Fatalf("response = %#v", response)
 	}
 
 	unmeasured := newAuditResponse(auditdomain.Record{DurationMS: 1250, OutputTokens: 80})
 	if unmeasured.OutputTokensPerSecond != nil {
 		t.Fatalf("unmeasured throughput = %v", *unmeasured.OutputTokensPerSecond)
+	}
+
+	lateFirst := int64(19763)
+	late := newAuditResponse(auditdomain.Record{StatusCode: http.StatusOK, Streaming: true, FirstTokenMS: &lateFirst, DurationMS: 19827, OutputTokens: 1511, ReasoningTokens: 1400})
+	if late.OutputTokensPerSecond == nil || *late.OutputTokensPerSecond != float64(1511)*1000/19827 {
+		t.Fatalf("late first-token throughput = %#v", late)
+	}
+	burstFirst := int64(10000)
+	burst := newAuditResponse(auditdomain.Record{StatusCode: http.StatusOK, Streaming: true, FirstTokenMS: &burstFirst, DurationMS: 10100, OutputTokens: 2000})
+	if burst.OutputTokensPerSecond == nil || *burst.OutputTokensPerSecond != 20000 {
+		t.Fatalf("no-reasoning burst throughput = %#v", burst)
 	}
 }
 

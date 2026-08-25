@@ -18,8 +18,28 @@ import (
 	"github.com/chenyme/grok2api/backend/internal/application/gateway"
 	clientkeydomain "github.com/chenyme/grok2api/backend/internal/domain/clientkey"
 	mediadomain "github.com/chenyme/grok2api/backend/internal/domain/media"
+	"github.com/chenyme/grok2api/backend/internal/pkg/neterror"
 	"github.com/gin-gonic/gin"
 )
+
+type idleErrorReader struct{}
+
+func (idleErrorReader) Read([]byte) (int, error) {
+	return 0, neterror.ErrUpstreamStreamIdleTimeout
+}
+
+type chunkErrorReader struct {
+	data []byte
+	done bool
+}
+
+func (r *chunkErrorReader) Read(target []byte) (int, error) {
+	if r.done {
+		return 0, io.EOF
+	}
+	r.done = true
+	return copy(target, r.data), errors.New("upstream cut")
+}
 
 func TestVideoGenerationUsesOfficialXAIEndpointsAndFields(t *testing.T) {
 	gin.SetMode(gin.TestMode)
@@ -836,14 +856,29 @@ func TestStreamInspectorMarksFirstGeneratedTokenOnce(t *testing.T) {
 			delta:   `data: {"type":"response.custom_tool_call_input.delta","output_index":1,"item_id":"ctc_1","delta":"{}"}` + "\n\n",
 		},
 		{
+			name: "responses encrypted reasoning item", protocol: streamProtocolResponses,
+			prelude: `data: {"type":"response.created","response":{"id":"resp_1"}}` + "\n\n",
+			delta:   `data: {"type":"response.output_item.added","item":{"id":"rs_1","type":"reasoning","status":"in_progress"}}` + "\n\n",
+		},
+		{
 			name: "chat reasoning", protocol: streamProtocolChat,
 			prelude: `data: {"choices":[{"delta":{"role":"assistant"}}]}` + "\n\n",
 			delta:   `data: {"choices":[{"delta":{"reasoning_content":"thinking"}}]}` + "\n\n",
 		},
 		{
+			name: "chat thinking_content", protocol: streamProtocolChat,
+			prelude: `data: {"choices":[{"delta":{"role":"assistant"}}]}` + "\n\n",
+			delta:   `data: {"choices":[{"delta":{"thinking_content":"thinking"}}]}` + "\n\n",
+		},
+		{
 			name: "anthropic tool input", protocol: streamProtocolAnthropic,
 			prelude: `data: {"type":"message_start","message":{"id":"msg_1"}}` + "\n\n",
 			delta:   `data: {"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{\"q\":"}}` + "\n\n",
+		},
+		{
+			name: "anthropic thinking start", protocol: streamProtocolAnthropic,
+			prelude: `data: {"type":"message_start","message":{"id":"msg_1"}}` + "\n\n",
+			delta:   `data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}` + "\n\n",
 		},
 	}
 	for _, test := range tests {
@@ -875,6 +910,280 @@ func TestStreamInspectorDoesNotMarkImageEvents(t *testing.T) {
 	inspector.markFirstTokenForwarded()
 	if marked != 0 {
 		t.Fatalf("image stream marked first token %d times", marked)
+	}
+}
+
+func TestStreamInspectorMarksChatReasoningComment(t *testing.T) {
+	marked := 0
+	inspector := &responseInspector{protocol: streamProtocolChat, onFirstToken: func() { marked++ }}
+	inspector.Inspect([]byte(": grok2api-reasoning-start\n\n"))
+	if marked != 0 {
+		t.Fatalf("reasoning comment marked first token before forwarding %d times", marked)
+	}
+	inspector.markFirstTokenForwarded()
+	if marked != 1 {
+		t.Fatalf("reasoning comment marked first token %d times", marked)
+	}
+}
+
+func TestInternalSSEMarkerFilterAcrossChunkBoundaries(t *testing.T) {
+	marker := reasoningStartSSEComment + "\n\n"
+	input := []byte("data: before\n\n" + marker + "data: after\n\n")
+	want := "data: before\n\ndata: after\n\n"
+	for split := 0; split <= len(input); split++ {
+		filter := internalSSEMarkerFilter{enabled: true}
+		var output []byte
+		output = append(output, filter.Filter(input[:split], false)...)
+		output = append(output, filter.Filter(input[split:], false)...)
+		output = append(output, filter.Filter(nil, true)...)
+		if string(output) != want {
+			t.Fatalf("split %d output = %q, want %q", split, output, want)
+		}
+	}
+}
+
+func TestCopyStreamConsumesInternalReasoningMarker(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	body := `data: {"choices":[{"delta":{"role":"assistant"}}]}` + "\n\n" +
+		": grok2api-reasoning-start\n\n" +
+		`data: {"choices":[{"delta":{"content":"hello"}}]}` + "\n\n" +
+		"data: [DONE]\n\n"
+	marked := 0
+	if _, err := copyStream(context.Writer, strings.NewReader(body), streamProtocolChat, func() { marked++ }); err != nil {
+		t.Fatal(err)
+	}
+	if marked != 1 {
+		t.Fatalf("first token marked %d times", marked)
+	}
+	if strings.Contains(recorder.Body.String(), "grok2api-reasoning-start") {
+		t.Fatalf("internal marker leaked to client: %q", recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), `"content":"hello"`) {
+		t.Fatalf("visible Chat delta missing: %q", recorder.Body.String())
+	}
+}
+
+func TestCopyStreamPreservesBufferedTailOnReadError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	body := []byte(`data: {"choices":[{"delta":{"content":"partial"}}]}` + "\n\n:")
+	_, err := copyStream(context.Writer, &chunkErrorReader{data: body}, streamProtocolChat, nil)
+	if !errors.Is(err, errUpstreamStreamRead) {
+		t.Fatalf("copy error = %v", err)
+	}
+	got := recorder.Body.Bytes()
+	if !bytes.HasPrefix(got, body) {
+		t.Fatalf("interrupted body prefix = %q, want %q", got, body)
+	}
+	if !bytes.Contains(got, []byte(`"code":"upstream_stream_interrupted"`)) || !bytes.Contains(got, []byte("data: [DONE]")) {
+		t.Fatalf("interrupted body missing terminal SSE: %q", got)
+	}
+}
+
+func TestCopyStreamWritesTerminalOnIdleTimeout(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	tests := []struct {
+		name     string
+		protocol streamProtocol
+		want     []string
+	}{
+		{name: "chat", protocol: streamProtocolChat, want: []string{`"code":"upstream_stream_idle_timeout"`, "data: [DONE]"}},
+		{name: "responses", protocol: streamProtocolResponses, want: []string{`"type":"response.incomplete"`, `"id":"resp_abort"`, `"created_at":`, `"sequence_number":`, `"incomplete_details"`}},
+		{name: "anthropic", protocol: streamProtocolAnthropic, want: []string{`"type":"error"`, "上游流式响应长时间无数据"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			context, _ := gin.CreateTestContext(recorder)
+			_, err := copyStream(context.Writer, &idleErrorReader{}, test.protocol, nil)
+			if !errors.Is(err, errUpstreamStreamRead) || !errors.Is(err, neterror.ErrUpstreamStreamIdleTimeout) {
+				t.Fatalf("copy error = %v", err)
+			}
+			got := recorder.Body.String()
+			for _, fragment := range test.want {
+				if !strings.Contains(got, fragment) {
+					t.Fatalf("body %q missing %q", got, fragment)
+				}
+			}
+		})
+	}
+}
+
+func TestCopyStreamFlushesUnterminatedResponsesTail(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	body := "event: response.completed\n" + `data: {"type":"response.completed","response":{"id":"resp_tail","status":"completed","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`
+	metadata, err := copyStream(context.Writer, strings.NewReader(body), streamProtocolResponses, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := recorder.Body.String()
+	if !strings.Contains(got, `"type":"response.completed"`) || !strings.HasSuffix(got, "\n\n") {
+		t.Fatalf("unterminated Responses tail was not flushed as an SSE event: %q", got)
+	}
+	if metadata.ResponseID != "resp_tail" || metadata.Usage.TotalTokens != 2 {
+		t.Fatalf("metadata = %#v", metadata)
+	}
+}
+
+func TestCopyStreamFlushesUnterminatedResponsesTailBeforeAbort(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	body := []byte(`data: {"type":"response.output_text.delta","delta":"partial"}`)
+	marked := 0
+	metadata, err := copyStream(context.Writer, &chunkErrorReader{data: body}, streamProtocolResponses, func() {
+		marked++
+		if !strings.Contains(recorder.Body.String(), `"delta":"partial"`) {
+			t.Fatalf("first token marked before the unterminated tail was flushed: %q", recorder.Body.String())
+		}
+	})
+	if !errors.Is(err, errUpstreamStreamRead) {
+		t.Fatalf("copy error = %v", err)
+	}
+	got := recorder.Body.String()
+	if !strings.Contains(got, `"delta":"partial"`) || !strings.Contains(got, "\n\nevent: response.incomplete") {
+		t.Fatalf("unterminated tail and abort event were not separated: %q", got)
+	}
+	if marked != 1 {
+		t.Fatalf("first token marked %d times", marked)
+	}
+	if !metadata.Usage.OutputObserved {
+		t.Fatal("forwarded unterminated delta was not recorded as observed output")
+	}
+}
+
+func TestCopyStreamDropsMalformedResponsesTailBeforeAbort(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	malformed := []byte(`data: {"type":"response.output_text.delta","delta":"partial`)
+	_, err := copyStream(context.Writer, &chunkErrorReader{data: malformed}, streamProtocolResponses, nil)
+	if !errors.Is(err, errUpstreamStreamRead) {
+		t.Fatalf("copy error = %v", err)
+	}
+	got := recorder.Body.String()
+	if strings.Contains(got, string(malformed)) {
+		t.Fatalf("malformed tail leaked before terminal event: %q", got)
+	}
+	if !strings.Contains(got, `"type":"response.incomplete"`) {
+		t.Fatalf("abort event missing after malformed tail: %q", got)
+	}
+}
+
+func TestCopyStreamDoesNotAppendAbortAfterUpstreamFailureTerminal(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	body := []byte(`data: {"type":"response.failed","response":{"id":"resp_failed","status":"failed","error":{"message":"failed"}}}` + "\n\n")
+	_, err := copyStream(context.Writer, &chunkErrorReader{data: body}, streamProtocolResponses, nil)
+	if !errors.Is(err, errUpstreamStreamFailed) {
+		t.Fatalf("copy error = %v", err)
+	}
+	got := recorder.Body.String()
+	if strings.Count(got, `"type":"response.failed"`) != 1 || strings.Contains(got, `"type":"response.incomplete"`) {
+		t.Fatalf("upstream terminal was followed by a second terminal event: %q", got)
+	}
+}
+
+func TestCopyStreamWritesTerminalOnIncompleteEOF(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	_, err := copyStream(context.Writer, strings.NewReader(""), streamProtocolResponses, nil)
+	if !errors.Is(err, errUpstreamStreamIncomplete) {
+		t.Fatalf("copy error = %v", err)
+	}
+	got := recorder.Body.String()
+	if !strings.Contains(got, `"type":"response.incomplete"`) || !strings.Contains(got, `"reason":"upstream_stream_incomplete"`) {
+		t.Fatalf("incomplete EOF missing terminal SSE event: %q", got)
+	}
+}
+
+func TestSanitizeResponsesFillsMissingIDs(t *testing.T) {
+	state := &responsesCompatState{}
+	got := rewriteResponsesDataLine([]byte(`data: {"type":"response.output_item.added","item":{"type":"reasoning"}}`+"\n"), state)
+	if !bytes.Contains(got, []byte(`"id":"item_1"`)) {
+		t.Fatalf("item id not filled: %s", got)
+	}
+	got = rewriteResponsesDataLine([]byte(`data: {"type":"response.created","response":{"status":"in_progress"}}`+"\n"), state)
+	if !bytes.Contains(got, []byte(`"id":"resp_abort"`)) || !bytes.Contains(got, []byte(`"created_at":`)) {
+		t.Fatalf("response id/created_at not filled: %s", got)
+	}
+}
+
+func TestSanitizeResponsesKeepsItemIDStableAcrossEvents(t *testing.T) {
+	state := &responsesCompatState{}
+	delta := rewriteResponsesDataLine([]byte(`data: {"type":"response.reasoning_text.delta","output_index":0,"delta":"plan"}`+"\n"), state)
+	added := rewriteResponsesDataLine([]byte(`data: {"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning"}}`+"\n"), state)
+	done := rewriteResponsesDataLine([]byte(`data: {"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning"}}`+"\n"), state)
+	for name, got := range map[string][]byte{"added": added, "done": done, "delta": delta} {
+		if !bytes.Contains(got, []byte(`"id":"item_1"`)) && !bytes.Contains(got, []byte(`"item_id":"item_1"`)) {
+			t.Fatalf("%s event did not reuse item_1: %s", name, got)
+		}
+	}
+}
+
+func TestSanitizeResponsesKeepsGeneratedResponseIDStable(t *testing.T) {
+	state := &responsesCompatState{}
+	created := rewriteResponsesDataLine([]byte(`data: {"type":"response.created","response":{"status":"in_progress"}}`+"\n"), state)
+	completed := rewriteResponsesDataLine([]byte(`data: {"type":"response.completed","id":"resp_late","response":{"id":"resp_late","status":"completed"}}`+"\n"), state)
+	for name, got := range map[string][]byte{"created": created, "completed": completed} {
+		if !bytes.Contains(got, []byte(`"id":"resp_abort"`)) || bytes.Contains(got, []byte("resp_late")) {
+			t.Fatalf("%s event changed response identity: %s", name, got)
+		}
+	}
+}
+
+func TestSanitizeResponsesUsesExistingEventIDForMissingResponseID(t *testing.T) {
+	state := &responsesCompatState{}
+	got := rewriteResponsesDataLine([]byte(`data: {"type":"response.created","id":"resp_real","response":{"status":"in_progress"}}`+"\n"), state)
+	if !bytes.Contains(got, []byte(`"id":"resp_real"`)) || bytes.Contains(got, []byte("resp_abort")) {
+		t.Fatalf("existing event id was not reused for response: %s", got)
+	}
+}
+
+func TestSanitizeResponsesKeepsResponseCreatedAtStable(t *testing.T) {
+	state := &responsesCompatState{}
+	created := rewriteResponsesDataLine([]byte(`data: {"type":"response.created","id":"resp_real","response":{"id":"resp_real","created_at":123,"status":"in_progress"}}`+"\n"), state)
+	completed := rewriteResponsesDataLine([]byte(`data: {"type":"response.completed","id":"resp_real","response":{"id":"resp_real","created_at":456,"status":"completed"}}`+"\n"), state)
+	for name, got := range map[string][]byte{"created": created, "completed": completed} {
+		if !bytes.Contains(got, []byte(`"created_at":123`)) || bytes.Contains(got, []byte(`"created_at":456`)) {
+			t.Fatalf("%s event changed response creation time: %s", name, got)
+		}
+	}
+}
+
+func TestSanitizeResponsesDoesNotAddResponseIDToErrorEvent(t *testing.T) {
+	state := &responsesCompatState{}
+	got := rewriteResponsesDataLine([]byte(`data: {"type":"error","code":"server_error","message":"failed"}`+"\n"), state)
+	if bytes.Contains(got, []byte(`"id":`)) {
+		t.Fatalf("Responses error event gained a non-protocol response id: %s", got)
+	}
+}
+
+func TestResponsesCompatBoundsUnterminatedLineBuffer(t *testing.T) {
+	state := &responsesCompatState{}
+	chunk := bytes.Repeat([]byte{'x'}, maxStreamEventInspectionBytes+1)
+	got := rewriteResponsesStreamChunk(chunk, state)
+	if len(got) != len(chunk) || len(state.pending) != 0 || !state.passingLongLine {
+		t.Fatalf("oversized line was retained: output=%d pending=%d passing=%t", len(got), len(state.pending), state.passingLongLine)
+	}
+	got = rewriteResponsesStreamChunk([]byte("tail\n"), state)
+	if string(got) != "tail\n" || state.passingLongLine {
+		t.Fatalf("oversized line passthrough did not finish: %q passing=%t", got, state.passingLongLine)
+	}
+}
+
+func TestResponseInspectorTreatsOversizedDataLineAsObservedOutput(t *testing.T) {
+	inspector := &responseInspector{protocol: streamProtocolResponses}
+	inspector.Inspect(append([]byte("data: "), bytes.Repeat([]byte{'x'}, maxStreamEventInspectionBytes)...))
+	if !inspector.Metadata().Usage.OutputObserved {
+		t.Fatal("forwarded oversized SSE data line was still classified as empty")
 	}
 }
 
@@ -1057,8 +1366,11 @@ func TestCopyStreamRequiresProtocolTerminalEvent(t *testing.T) {
 			} else if metadata.StreamFailure != nil {
 				t.Fatalf("unexpected stream failure diagnostic = %#v", metadata.StreamFailure)
 			}
-			if recorder.Body.String() != test.body {
+			if test.protocol != streamProtocolResponses && recorder.Body.String() != test.body {
 				t.Fatalf("forwarded = %q", recorder.Body.String())
+			}
+			if test.protocol == streamProtocolResponses && !strings.Contains(recorder.Body.String(), `"type":`) {
+				t.Fatalf("responses stream missing type: %q", recorder.Body.String())
 			}
 		})
 	}
@@ -1088,7 +1400,7 @@ func TestWriteResultRecordsStreamFailureDiagnostic(t *testing.T) {
 	})
 	recorder := httptest.NewRecorder()
 	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
-	if recorder.Code != http.StatusOK || recorder.Body.String() != stream || finalCode != "upstream_stream_error" {
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"type":"response.failed"`) || finalCode != "upstream_stream_error" {
 		t.Fatalf("status=%d body=%q final=%q", recorder.Code, recorder.Body.String(), finalCode)
 	}
 	if diagnostic == nil || !strings.Contains(string(diagnostic.Body), `"code":"server_error"`) {

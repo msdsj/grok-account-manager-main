@@ -1,11 +1,13 @@
 import importlib.util
 import json
+import os
 import stat
 import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 MODULE_PATH = Path(__file__).with_name("quality_guard.py")
@@ -58,11 +60,31 @@ class ClassificationTests(unittest.TestCase):
         cfg = config()
         classification, reason, speed, output = quality_guard.classify_audit({
             "provider": "grok_build", "streaming": True, "statusCode": 200,
-            "firstTokenMs": 1000, "durationMs": 1100,
+            "firstTokenMs": 200, "durationMs": 1200,
             "outputTokens": 1050, "reasoningTokens": 950,
         }, cfg)
         self.assertEqual((classification, reason, output), ("hard", "hard_tps", 1050))
-        self.assertEqual(speed, 10500)
+        self.assertEqual(speed, 1050)
+
+    def test_passive_late_first_token_uses_full_duration(self):
+        cfg = config()
+        classification, reason, speed, output = quality_guard.classify_audit({
+            "provider": "grok_build", "streaming": True, "statusCode": 200,
+            "firstTokenMs": 19763, "durationMs": 19827,
+            "outputTokens": 1511, "reasoningTokens": 1471,
+        }, cfg)
+        self.assertEqual((classification, reason, output), ("healthy", "within_threshold", 1511))
+        self.assertAlmostEqual(speed, 1511 * 1000 / 19827)
+
+    def test_passive_late_first_token_without_reasoning_remains_burst(self):
+        cfg = config(fail_closed=True, min_generation_ms=1000)
+        classification, reason, speed, output = quality_guard.classify_audit({
+            "provider": "grok_build", "streaming": True, "statusCode": 200,
+            "firstTokenMs": 10000, "durationMs": 10100,
+            "outputTokens": 2000, "reasoningTokens": 0,
+        }, cfg)
+        self.assertEqual((classification, reason, output), ("hard", "buffered_burst", 2000))
+        self.assertEqual(speed, 20000)
 
     def test_passive_audit_does_not_infer_thinking_requirement(self):
         cfg = config(fail_closed=True, min_generation_ms=1000)
@@ -206,8 +228,50 @@ class ConfigTests(unittest.TestCase):
                     "rotation_timeout_seconds": 45, "rotatable_node_ids": [],
                 },
             }), encoding="utf-8")
-            loaded = quality_guard.Config.from_bootstrap(path)
+            with mock.patch.dict(os.environ, {}, clear=True):
+                loaded = quality_guard.Config.from_bootstrap(path)
             self.assertEqual((loaded.node_ids, loaded.internal_token), (("2", "9"), "scoped-secret"))
+            self.assertEqual(loaded.base_url, "http://gateway:8000")
+
+    def test_bootstrap_honors_grok2api_base_url(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "bootstrap.json"
+            path.write_text(json.dumps({
+                "version": 1,
+                "enabled": True,
+                "internal_token": "scoped-secret",
+                "config": {
+                    "model": "grok-4.5", "node_ids": ["2"], "mode": "hybrid",
+                    "prompt": "probe", "expected": "QUALITY_OK",
+                    "active_interval_seconds": 1800, "passive_poll_seconds": 5,
+                    "soft_tps": 500, "hard_tps": 1000, "consecutive_soft": 2, "consecutive_errors": 2,
+                    "quarantine_seconds": 300, "no_account_backoff_seconds": 300,
+                    "min_healthy_nodes": 1, "max_output_tokens": 384, "fail_closed": False,
+                    "min_generation_ms": 1000, "rotation_url": "", "rotation_token": "",
+                    "rotation_timeout_seconds": 45, "rotatable_node_ids": [],
+                },
+            }), encoding="utf-8")
+            with mock.patch.dict(os.environ, {"GROK2API_BASE_URL": "  http://127.0.0.1:18182/  "}, clear=True):
+                loaded = quality_guard.Config.from_bootstrap(path)
+            self.assertEqual(loaded.base_url, "http://127.0.0.1:18182")
+
+            with mock.patch.dict(os.environ, {"GROK2API_BASE_URL": "  "}, clear=True):
+                loaded = quality_guard.Config.from_bootstrap(path)
+            self.assertEqual(loaded.base_url, "http://gateway:8000")
+
+    def test_rejects_unsafe_grok2api_base_urls(self):
+        invalid = (
+            "http://127.0.0.1:18182?x=1",
+            "http://127.0.0.1:18182?",
+            "http://127.0.0.1:18182#fragment",
+            "http://127.0.0.1:18182#",
+            "http://user:pass@127.0.0.1:18182",
+            "http://127.0.0.1:invalid",
+            "http://:18182",
+        )
+        for base_url in invalid:
+            with self.subTest(base_url=base_url), self.assertRaisesRegex(ValueError, "GROK2API_BASE_URL"):
+                config(base_url=base_url).validate()
 
     def test_disabled_bootstrap_exits_cleanly(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -515,7 +579,6 @@ class GuardTests(unittest.TestCase):
                 "generationMs": 1500,
             }
             audit = self.audit("user", "1", 600)
-            audit.update({"durationMs": 2500, "outputTokens": 900})
             api = FakeApi(self.nodes(3), [good], [
                 {"items": [], "hasMore": False, "nextCursor": ""},
                 {"items": [audit], "hasMore": False, "nextCursor": ""},
@@ -920,12 +983,12 @@ class GuardTests(unittest.TestCase):
 
     @staticmethod
     def audit(audit_id, node_id, output_tps, quality_probe=False):
-        generation_ms = 100
+        generation_ms = 2000
         output_tokens = int(output_tps * generation_ms / 1000)
         return {
             "id": audit_id, "requestId": f"request-{audit_id}", "qualityProbe": quality_probe,
             "provider": "grok_build", "streaming": True,
-            "statusCode": 200, "firstTokenMs": 1000, "durationMs": 1000 + generation_ms,
+            "statusCode": 200, "firstTokenMs": 200, "durationMs": 200 + generation_ms,
             "outputTokens": output_tokens, "reasoningTokens": min(100, max(0, output_tokens - 1)),
             "egressNodeId": node_id, "errorCode": None,
         }

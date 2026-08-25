@@ -129,6 +129,38 @@ func TestDegradeSummaryMatchesFailClosedShortWindowPolicy(t *testing.T) {
 	}
 }
 
+func TestDegradeSummaryUsesReasoningEvidenceForLateFlushFallback(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "degrade-reasoning.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	repo := relational.NewAuditRepository(database)
+	now := time.Now().UTC()
+	first := int64(10000)
+	accountID := uint64(9)
+	records := []auditdomain.Record{
+		{RequestID: "reasoning-late-flush", ClientKeyID: 1, ModelRouteID: 1, Provider: "grok_build", AccountID: &accountID, StatusCode: 200, Streaming: true, OutputTokens: 2000, ReasoningTokens: 1900, FirstTokenMS: &first, DurationMS: 10100, CreatedAt: now.Add(-2 * time.Minute)},
+		{RequestID: "visible-output-burst", ClientKeyID: 1, ModelRouteID: 1, Provider: "grok_build", AccountID: &accountID, StatusCode: 200, Streaming: true, OutputTokens: 2000, FirstTokenMS: &first, DurationMS: 10100, CreatedAt: now.Add(-time.Minute)},
+	}
+	if err := repo.CreateBatch(ctx, records); err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(repo, slog.Default(), 8, 4, time.Second)
+	service.now = func() time.Time { return now }
+	summary, err := service.DegradeSummary(ctx, "1h", DegradeThresholds{SoftTPS: 500, HardTPS: 1000, FailClosed: true}, DegradeAccountFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Totals.Hits != 1 || summary.Totals.Burst != 1 || len(summary.Events) != 1 || summary.Events[0].RequestID != "visible-output-burst" {
+		t.Fatalf("reasoning-aware summary = totals %#v events %#v", summary.Totals, summary.Events)
+	}
+}
+
 func TestDegradeSummaryPaginatesAccountsInRepository(t *testing.T) {
 	ctx := context.Background()
 	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "degrade-page.db"))
@@ -198,6 +230,58 @@ func TestDegradeSummarySearchesEveryAccountIdentityField(t *testing.T) {
 	}
 	if summary.AccountPage.Total != 1 || len(summary.Accounts) != 1 || summary.Accounts[0].ID != accountValue.ID {
 		t.Fatalf("account search result = %#v", summary)
+	}
+}
+
+func TestDegradeSummaryIncludesQualityDegradedThinkingRetries(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "degrade-thinking.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	repo := relational.NewAuditRepository(database)
+	now := time.Now().UTC()
+	first := int64(100)
+	speedID := uint64(11)
+	thinkingID := uint64(22)
+	records := []auditdomain.Record{
+		{RequestID: "speed-hard", ClientKeyID: 1, ModelRouteID: 1, Provider: "grok_build", AccountID: &speedID, AccountName: "fast", EgressNodeName: "edge-1", StatusCode: 200, Streaming: true, OutputTokens: 2000, FirstTokenMS: &first, DurationMS: 1100, CreatedAt: now.Add(-2 * time.Minute)},
+		{RequestID: "think-retry-1", ClientKeyID: 1, ModelRouteID: 1, Provider: "grok_build", AccountID: &thinkingID, AccountName: "no-think", EgressNodeName: "edge-2", StatusCode: 200, Streaming: true, ErrorCode: auditdomain.ErrorQualityDegraded, OutputTokens: 48, CreatedAt: now.Add(-time.Minute)},
+		{RequestID: "think-retry-2", ClientKeyID: 1, ModelRouteID: 1, Provider: "grok_build", AccountID: &thinkingID, AccountName: "no-think", EgressNodeName: "edge-2", StatusCode: 200, Streaming: true, ErrorCode: auditdomain.ErrorQualityDegraded, OutputTokens: 0, CreatedAt: now.Add(-30 * time.Second)},
+		{RequestID: "think-final-503", ClientKeyID: 1, ModelRouteID: 1, Provider: "grok_build", AccountID: &thinkingID, AccountName: "no-think", StatusCode: 503, Streaming: true, ErrorCode: auditdomain.ErrorQualityDegraded, CreatedAt: now.Add(-20 * time.Second)},
+	}
+	if err := repo.CreateBatch(ctx, records); err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(repo, slog.Default(), 8, 4, time.Second)
+	service.now = func() time.Time { return now }
+	summary, err := service.DegradeSummary(ctx, "1h", DegradeThresholds{SoftTPS: 500, HardTPS: 1000}, DegradeAccountFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Totals.Hits != 3 || summary.Totals.Accounts != 2 || summary.Totals.Hard != 1 || summary.Totals.Thinking != 2 {
+		t.Fatalf("totals = %#v", summary.Totals)
+	}
+	if len(summary.Accounts) != 2 {
+		t.Fatalf("accounts = %#v", summary.Accounts)
+	}
+	byID := map[uint64]DegradeAccount{}
+	for _, account := range summary.Accounts {
+		byID[account.ID] = account
+	}
+	if byID[22].Hits != 2 || byID[22].Classes[auditdomain.DegradeClassThinking] != 2 {
+		t.Fatalf("thinking account = %#v", byID[22])
+	}
+	thinkingOnly, err := service.DegradeSummary(ctx, "1h", DegradeThresholds{SoftTPS: 500, HardTPS: 1000}, DegradeAccountFilter{Class: auditdomain.DegradeClassThinking})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if thinkingOnly.AccountPage.Total != 1 || len(thinkingOnly.Accounts) != 1 || thinkingOnly.Accounts[0].ID != 22 {
+		t.Fatalf("thinking filter = %#v", thinkingOnly)
 	}
 }
 

@@ -15,7 +15,7 @@ Token/s，因此建议先观察 JSON 日志，再根据实际流量调整阈值�
 
 ## 工作流程
 
-1. 被动检测每 5 秒读取普通成功流式请求的新增审计，并按 grok2api 面板同口径的 `输出 Token / (总耗时 - 首字耗时)` 计算速度；输出 Token 故意包含 Reasoning Token。
+1. 被动检测每 5 秒读取普通成功流式请求的新增审计，并按 grok2api 面板同口径计算速度：输出 Token 包含 Reasoning Token，分母是生成窗口。默认是 `总耗时 - 首字耗时`；若这段尾巴既短于首字等待又不足 1 秒，则改用全程，避免加密思考被挤进最后几十毫秒。
 2. 主动检测调用质量守护专用内部探测接口；该凭据不能导出账号、管理管理员或访问其他管理 API。
 3. grok2api 优先使用明确绑定到该节点的账号；如果这些账号不可调度，则借用任意健康账号，但仍强制实际请求走被测节点，再发送固定流式 Prompt。即使其他 Provider 暴露同名模型，后端也会把探测路由固定为 Grok Build。
 4. 普通真实请求达到硬阈值时立即隔离；达到软阈值时触发一次固定 Prompt 主动复测。
@@ -129,6 +129,10 @@ docker compose --profile quality-guard up -d --build
 
 以后修改 `config.yaml` 中的 `qualityGuard` 基础配置时，执行
 `docker compose --profile quality-guard restart grok2api egress-quality-guard` 让主程序重新生成 bootstrap。管理页面保存的运行策略仍会热加载，无需重启。
+
+sidecar 通过 `GROK2API_BASE_URL` 访问主程序，Compose 网络默认是 `http://grok2api:8000`。主服务改名或使用 host 网络时需要覆盖，例如 `GROK2API_BASE_URL=http://127.0.0.1:8000`。
+
+缺 thinking 的**请求路径扣住/换号**（`qualityGuard.requestRetry`）在 grok2api 网关内完成，不经过 sidecar。配置见根目录 `config.example.yaml` 与主 README。
 
 先确认受管节点、模型和最低健康节点数正确，再允许 sidecar 长期运行。不要提交状态卷或生产日志。只停止守护程序可执行
 `docker compose --profile quality-guard stop egress-quality-guard`，不会影响主 API。

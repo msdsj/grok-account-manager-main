@@ -88,12 +88,14 @@ type auditResponse struct {
 	RequestID               string                    `json:"requestId"`
 	ClientKeyID             uint64                    `json:"clientKeyId,string"`
 	ClientKeyName           string                    `json:"clientKeyName,omitempty"`
+	ClientIP                string                    `json:"clientIp,omitempty"`
 	ModelRouteID            uint64                    `json:"modelRouteId,string"`
 	ModelPublicID           string                    `json:"modelPublicId,omitempty"`
 	ModelUpstreamModel      string                    `json:"modelUpstreamModel,omitempty"`
 	Provider                string                    `json:"provider"`
 	Operation               string                    `json:"operation"`
 	UsageSource             string                    `json:"usageSource"`
+	ReasoningEffort         string                    `json:"reasoningEffort,omitempty"`
 	AccountID               *uint64                   `json:"accountId,string,omitempty"`
 	AccountName             string                    `json:"accountName,omitempty"`
 	EgressNodeID            *uint64                   `json:"egressNodeId,string,omitempty"`
@@ -385,7 +387,7 @@ func (h *Handler) degradeAccounts(c *gin.Context) {
 		Totals: degradeTotalsResponse{
 			Hits: result.Totals.Hits, Accounts: result.Totals.Accounts, StillEnabled: result.Totals.StillEnabled,
 			Disabled: result.Totals.Disabled, Deleted: result.Totals.Deleted, Hard: result.Totals.Hard,
-			Soft: result.Totals.Soft, Burst: result.Totals.Burst, MaxTPS: result.Totals.MaxTPS,
+			Soft: result.Totals.Soft, Burst: result.Totals.Burst, Thinking: result.Totals.Thinking, MaxTPS: result.Totals.MaxTPS,
 		},
 		Series: result.Series, Nodes: result.Nodes, Accounts: accounts,
 		AccountPage: degradeAccountPageResponse{
@@ -431,6 +433,7 @@ type degradeTotalsResponse struct {
 	Hard         int64   `json:"hard"`
 	Soft         int64   `json:"soft"`
 	Burst        int64   `json:"burst"`
+	Thinking     int64   `json:"thinking"`
 	MaxTPS       float64 `json:"maxTPS"`
 }
 
@@ -471,10 +474,11 @@ func newListFilter(c *gin.Context) auditapp.ListFilter {
 
 func newAuditResponse(value auditdomain.Record) auditResponse {
 	return auditResponse{
-		ID: value.ID, RequestID: value.RequestID, ClientKeyID: value.ClientKeyID, ClientKeyName: value.ClientKeyName,
+		ID: value.ID, RequestID: value.RequestID, ClientKeyID: value.ClientKeyID, ClientKeyName: value.ClientKeyName, ClientIP: value.ClientIP,
 		ModelRouteID: value.ModelRouteID, ModelPublicID: value.ModelPublicID, ModelUpstreamModel: value.ModelUpstreamModel,
 		Provider: value.Provider, Operation: string(value.Operation), UsageSource: string(value.UsageSource),
-		AccountID: value.AccountID, AccountName: value.AccountName,
+		ReasoningEffort: value.ReasoningEffort,
+		AccountID:       value.AccountID, AccountName: value.AccountName,
 		EgressNodeID: value.EgressNodeID, EgressNodeName: value.EgressNodeName, EgressScope: value.EgressScope, EgressMode: string(value.EgressMode),
 		StatusCode: value.StatusCode, Streaming: value.Streaming,
 		MediaInputImages: value.MediaInputImages, MediaOutputImages: value.MediaOutputImages, MediaOutputSeconds: value.MediaOutputSeconds,
@@ -535,6 +539,9 @@ func auditOutputTokensPerSecond(value auditdomain.Record) *float64 {
 	if !value.Streaming || value.StatusCode < 200 || value.StatusCode >= 300 || value.ErrorCode != "" || value.FirstTokenMS == nil || value.OutputTokens <= 0 || value.DurationMS <= *value.FirstTokenMS {
 		return nil
 	}
-	throughput := float64(value.OutputTokens) * 1000 / float64(value.DurationMS-*value.FirstTokenMS)
+	throughput := auditdomain.OutputTokensPerSecond(value.OutputTokens, value.ReasoningTokens, *value.FirstTokenMS, value.DurationMS)
+	if throughput <= 0 {
+		return nil
+	}
 	return &throughput
 }
