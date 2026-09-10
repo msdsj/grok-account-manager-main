@@ -32,13 +32,13 @@ export type AuditDTO = {
   modelPublicId?: string;
   modelUpstreamModel?: string;
   provider: "grok_build" | "grok_web" | "grok_console";
-  operation: "responses" | "compaction" | "chat" | "messages" | "image" | "image_edit" | "video" | "stt" | "tts" | "realtime";
+  operation: "responses" | "compaction" | "chat" | "messages" | "image" | "image_edit" | "video" | "stt" | "tts" | "realtime" | "voice";
   usageSource: "upstream" | "estimated" | "none";
   accountId?: string;
   accountName?: string;
   egressNodeId?: string;
   egressNodeName?: string;
-  egressScope?: "grok_build" | "grok_web" | "grok_console" | "grok_web_asset";
+  egressScope?: "grok_build" | "grok_web" | "grok_console" | "grok_web_asset" | "grok_console_asset";
   egressMode?: "direct" | "proxy";
   statusCode: number;
   streaming: boolean;
@@ -140,10 +140,10 @@ const auditBillingValidator = hasShape({
 const auditValidator = hasShape({
   id: isString, requestId: isString, clientKeyId: isString, clientKeyName: isOptional(isString), modelRouteId: isString,
   modelPublicId: isOptional(isString), modelUpstreamModel: isOptional(isString), provider: isOneOf("grok_build", "grok_web", "grok_console"),
-  operation: isOneOf("responses", "compaction", "chat", "messages", "image", "image_edit", "video", "stt", "tts", "realtime"), usageSource: isOneOf("upstream", "estimated", "none"),
+  operation: isOneOf("responses", "compaction", "chat", "messages", "image", "image_edit", "video", "stt", "tts", "realtime", "voice"), usageSource: isOneOf("upstream", "estimated", "none"),
   accountId: isOptional(isString), accountName: isOptional(isString),
   egressNodeId: isOptional(isString), egressNodeName: isOptional(isString),
-  egressScope: isOptional(isOneOf("grok_build", "grok_web", "grok_console", "grok_web_asset")), egressMode: isOptional(isOneOf("direct", "proxy")),
+  egressScope: isOptional(isOneOf("grok_build", "grok_web", "grok_console", "grok_web_asset", "grok_console_asset")), egressMode: isOptional(isOneOf("direct", "proxy")),
   statusCode: isNumber, streaming: isBoolean,
   mediaInputImages: isNumber, mediaOutputImages: isNumber, mediaOutputSeconds: isNumber, inputTokens: isNumber,
   cachedInputTokens: isNumber, outputTokens: isNumber, reasoningTokens: isNumber, totalTokens: isNumber,

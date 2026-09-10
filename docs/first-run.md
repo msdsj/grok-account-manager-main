@@ -1,7 +1,8 @@
 # 首次运行
 
-本项目已经内置网关源码和 Dockerfile。新用户不需要安装或拉取其他
-`grok2api` 项目，也不需要预先准备同名 Docker 镜像。
+本地中转默认使用 `ghcr.io/chenyme/grok2api:latest` 作为官方候选镜像，并已内置
+grok2api v3.1.4 源码和 Dockerfile 作为兼容回退。新用户不需要另外克隆或配置
+`grok2api` 项目。
 
 ## 环境
 
@@ -21,9 +22,10 @@ cp .env.example .env
 ./scripts/start.sh
 ```
 
-`start.sh` 会按顺序拉取本项目最新代码、同步 Python 依赖、构建本项目 React
-控制台、从仓库内 `gateway/` 构建 `grok-account-manager-gateway:local`，然后启动
-FastAPI。首次构建需要联网下载基础镜像和 Go/Node 依赖。
+`start.sh` 会按顺序拉取本项目最新代码、同步 Python 依赖、构建 React 控制台、
+预拉取官方候选镜像，并从仓库内 `gateway/` 构建 v3.1.4 回退镜像，然后启动
+FastAPI。启动本地中转时还会解析候选的 `RepoDigest` 并执行隔离探针；候选验证
+失败时自动使用回退镜像。首次准备镜像和依赖需要联网。
 
 打开：<http://127.0.0.1:43187>
 
@@ -51,12 +53,15 @@ npm run dev
 ./scripts/update.sh
 ```
 
-脚本只更新当前仓库及其 `gateway/` 内置源码。如果 Docker Hub 暂时不可达，镜像
-构建会失败并保留源码；网络恢复后重新执行即可。脚本不会读取或删除电脑上其他
-项目的镜像和源码。
+脚本会预拉取当前 shell 环境中 `GROK_ACCOUNT_MANAGER_GATEWAY_IMAGE` 指定的候选；
+未设置时使用 `ghcr.io/chenyme/grok2api:latest`。要预拉取固定版本，可执行
+`GROK_ACCOUNT_MANAGER_GATEWAY_IMAGE=... ./scripts/update.sh`；运行时也可在 `.env`
+填写版本 tag 或 digest。无论候选预拉取是否成功，脚本都会继续构建仓库内置的
+v3.1.4 回退镜像；实际启动仍以 `RepoDigest` 和隔离探针结果为准。脚本不会读取或
+删除电脑上其他项目的源码。
 
 ## 数据与停止
 
-- 账号数据库、凭证和网关数据在 `output/`，更新脚本不会删除它们。
+- 账号数据库和凭证位于 `output/`；网关数据固定在 `output/grok2api-v2-data/`，更新或镜像回退不会删除它们。
 - 按 `Ctrl+C` 停止 FastAPI；再按 `Ctrl+C` 停止 Vite。
 - 需要清理本项目容器时，只处理名称以 `grok-account-manager-` 开头的资源，避免误删其他项目。

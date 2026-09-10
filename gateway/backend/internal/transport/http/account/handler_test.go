@@ -271,6 +271,24 @@ func TestWriteBuildConversionEventUsesSSEFormat(t *testing.T) {
 	}
 }
 
+func TestWebConsoleSyncCompleteIncludesFailedCount(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest("POST", "/api/admin/v1/accounts/web/sync-to-console", nil)
+
+	payload := newAccountImportResponse(
+		accountapp.ImportResult{Created: 1, Updated: 2, Skipped: 3, Failed: 4},
+		accountsyncapp.Result{Succeeded: 5, Failed: 6},
+	)
+	if err := writeAccountEvent(ctx, "complete", payload); err != nil {
+		t.Fatal(err)
+	}
+	if body := recorder.Body.String(); body != "event: complete\ndata: {\"created\":1,\"updated\":2,\"skipped\":3,\"failed\":4,\"synced\":5,\"syncFailed\":6}\n\n" {
+		t.Fatalf("body = %q", body)
+	}
+}
+
 func TestConvertWebToBuildRejectsInvalidStrategy(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()

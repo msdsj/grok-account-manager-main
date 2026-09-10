@@ -125,7 +125,7 @@ export function ModelsPage() {
   });
 
   const syncMutation = useMutation({
-    mutationFn: syncModels,
+    mutationFn: () => syncModels(),
     onSuccess: (result) => {
       void queryClient.invalidateQueries({ queryKey: ["models"] });
       toast.success(t("models.synced", { count: result.synced }));

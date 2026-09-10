@@ -4,7 +4,7 @@
 
 > 本项目默认按本机工具设计，只监听 `127.0.0.1`。请遵守 Grok、邮箱服务和代理服务的条款，不要把账号凭证、Cookie、OAuth token、代理账号或 `.env` 上传到 GitHub，也不要把管理端口直接暴露到公网。
 >
-> **安全边界：** 控制台登录由本项目的内置网关处理，并不等于 FastAPI 的全局访问控制。注册、配置和中转管理 API 不应直接暴露到互联网或不受信任的局域网。远程使用请走 SSH 隧道或受控 VPN，不要使用 `--host 0.0.0.0` 直接开放服务。
+> **安全边界：** 控制台登录由本项目管理的本地网关处理，并不等于 FastAPI 的全局访问控制。注册、配置和中转管理 API 不应直接暴露到互联网或不受信任的局域网。远程使用请走 SSH 隧道或受控 VPN，不要使用 `--host 0.0.0.0` 直接开放服务。
 
 ## 目录
 
@@ -28,9 +28,9 @@
 | CLI | 单机执行注册并写入凭证 | Python、uv、Chrome/Chromium | `uv run grok-account-manager grok ...` |
 | 控制台开发模式 | 修改前端或后端时调试 | CLI 组件，加 Node.js 和 pnpm/npm | 后端 `43187`，前端 `43188` |
 | 控制台构建模式 | 本机日常使用 | CLI 组件，加一次前端构建 | `http://127.0.0.1:43187` |
-| 本地中转 | 使用账号池提供 OpenAI 兼容接口 | 控制台组件，加 Docker Desktop；网关源码已内置 | 控制台的“本地中转”页面 |
+| 本地中转 | 使用账号池提供 OpenAI 兼容接口 | 控制台组件，加 Docker Desktop；官方候选镜像与内置回退源码 | 控制台的“本地中转”页面 |
 
-CLI 注册不依赖本地网关。完整 Web 控制台的登录、账号管理和中转页面会通过本项目自动构建的内置网关工作。
+CLI 注册不依赖本地网关。完整 Web 控制台的登录、账号管理和中转页面会通过本项目选择并管理的网关容器工作。
 
 ## 环境要求
 
@@ -46,7 +46,7 @@ CLI 注册不依赖本地网关。完整 Web 控制台的登录、账号管理�
 - Node.js `20+`
 - pnpm `11+`。仓库带有 `pnpm-lock.yaml`，推荐使用 pnpm；已有 npm 环境也可使用 `npm install` 和 `npm run ...`。
 
-运行本地中转还需要 Docker Desktop，且 Docker daemon 已启动。网关源码、前端和 Dockerfile 已随本仓库分发。
+运行本地中转还需要 Docker Desktop，且 Docker daemon 已启动。项目默认拉取官方候选镜像；用于自动回退的 v3.1.4 网关源码、前端和 Dockerfile 已随本仓库分发。
 
 ### 端口
 
@@ -54,7 +54,7 @@ CLI 注册不依赖本地网关。完整 Web 控制台的登录、账号管理�
 | --- | --- | --- |
 | FastAPI 后端 | `127.0.0.1:43187` | 注册 API、静态前端、OpenAI 代理入口 |
 | Vite 开发服务器 | `127.0.0.1:43188` | 前端热更新开发服务 |
-| 本地中转 | `127.0.0.1:43871` | 由本项目镜像提供的内置网关 |
+| 本地中转 | `127.0.0.1:43871` | 由本项目选择并管理的 grok2api 网关 |
 | 可选 Postgres 容器 | 主机端口 `54329` | 预留开发数据库，不是当前默认运行依赖；现有 Compose 默认会发布端口 |
 
 若端口冲突，请优先改启动参数，而不是结束不明进程。例如后端改为 `43190`：
@@ -358,6 +358,8 @@ uv run grok-account-manager grok \
 | `output/mailboxes/outlook-accounts.txt` | 控制台保存的 Outlook 账号池 |
 | `output/registration-proxies.json` | 控制台保存的注册代理池 |
 | `output/relay-config.json` | 本地中转配置，包含敏感管理信息 |
+| `output/grok2api-v2-data/` | 本地中转 SQLite 与媒体数据，官方和回退镜像共用 |
+| `output/grok2api-v2-backups/` | 新官方 digest 首次正式启动前的私有 SQLite 回滚备份 |
 
 凭证 JSON 损坏时，程序会先创建带时间戳的 `.broken-*` 备份，再拒绝覆盖源文件。`persistence_failed` 队列会在后端下次启动时尝试恢复；`oauth_pending` 只记录已注册但未得到完整 OAuth 凭证的状态，不会伪装成可用 OAuth 账号。
 
@@ -365,16 +367,32 @@ uv run grok-account-manager grok \
 
 ## 本地中转
 
-本项目将网关源码、前端和 Dockerfile 完整内置在 `gateway/`。启动本项目后，后端会从该目录构建并启动唯一的 `grok-account-manager-gateway:local` 镜像；不会读取其他项目目录或镜像。
+本地中转默认以 `ghcr.io/chenyme/grok2api:latest` 作为官方候选镜像。每次准备启动中转时，后端按以下顺序选择实际运行镜像：
 
-首次成功准备中转时，项目会在 `output/` 下生成中转配置和数据目录。中转管理员用户名为 `grok-account-manager`；首次生成的管理员密码保存在仅本机可读的 `output/relay-config.json` 的 `admin_key` 字段中。该值是机密，不能截图、提交或发送给他人；应在可信本机上妥善保存并按需更换。
+1. `docker pull` 所选候选；若拉取失败但本机保留了可验证缓存，仍可继续验证该缓存。
+2. 从本地镜像解析与候选仓库匹配的不可变 `RepoDigest`，不直接以可变 tag 启动正式容器。
+3. 使用临时配置、临时数据目录和随机本机端口执行隔离探针，不挂载正式中转配置或数据。
+4. 探针通过后按该 digest 启动；候选没有可用 `RepoDigest`、探针失败，或拉取失败且无可验证缓存时，回退到仓库内置的 grok2api v3.1.4 镜像 `grok-account-manager-gateway:local`。
+
+FastAPI 每次启动都会把这次启动视为更新边界，停止遗留的同名容器并重新检查候选；正常 API 请求只复用已经健康的容器。
+
+如需指定版本 tag 或 digest，在 `.env` 中设置：
+
+```dotenv
+GROK_ACCOUNT_MANAGER_GATEWAY_IMAGE=ghcr.io/chenyme/grok2api:vX.Y.Z
+# GROK_ACCOUNT_MANAGER_GATEWAY_IMAGE=ghcr.io/chenyme/grok2api@sha256:<64 位摘要>
+```
+
+不设置时使用官方 `latest` 候选。版本 tag 便于选择发行版；需要严格固定内容时应使用 digest。
+
+首次成功准备中转时，项目会在 `output/` 下生成中转配置；正式网关数据始终保存在 `output/grok2api-v2-data/`，官方镜像和 v3.1.4 回退镜像共用该目录，隔离探针不会读取它。新官方 digest 第一次正式启动前，程序会把 SQLite 主文件及 WAL/SHM（如存在）备份到权限为 `0700/0600` 的 `output/grok2api-v2-backups/`；正式启动、健康检查或管理员握手失败时会停止候选、恢复该备份，再启动内置回退。中转管理员用户名为 `grok-account-manager`；首次生成的管理员密码保存在仅本机可读的 `output/relay-config.json` 的 `admin_key` 字段中。该值是机密，不能截图、提交或发送给他人；应在可信本机上妥善保存并按需更换。
 
 在控制台“本地中转”页面可以检查状态、启动或停止中转、同步本地账号和查看可用模型。中转默认地址为 `http://127.0.0.1:43871`。不要把它、后端端口或中转配置直接映射到公网。
 
 如果电脑上的代理客户端使用默认混合端口，项目默认会把网关出口配置为
 `http://127.0.0.1:7890`。由于网关运行在 Docker 容器内，启动时会自动改写为
 `http://host.docker.internal:7890`，并创建/更新名为“本机VPN-Web”的内置 Web 出口节点；
-不需要另外安装或拉取 grok2api 镜像。端口不同或使用 SOCKS5 时，在 `.env` 中填写：
+无需另外克隆或维护 grok2api 项目；候选镜像的拉取和回退镜像的构建由本项目处理。代理端口不同或使用 SOCKS5 时，在 `.env` 中填写：
 
 ```dotenv
 GROK_ACCOUNT_MANAGER_GATEWAY_PROXY=socks5://127.0.0.1:1080
@@ -392,7 +410,21 @@ GROK_ACCOUNT_MANAGER_GATEWAY_PROXY=socks5://127.0.0.1:1080
 git status --short
 ```
 
-正常更新流程：
+推荐使用仓库脚本完成更新：
+
+```bash
+./scripts/update.sh
+```
+
+当前脚本会依次更新代码、同步 Python 依赖、构建前端、预拉取当前 shell 环境中
+`GROK_ACCOUNT_MANAGER_GATEWAY_IMAGE` 指定的候选（默认
+`ghcr.io/chenyme/grok2api:latest`），并构建仓库内置的 v3.1.4 回退镜像。要让脚本
+预拉取固定版本，可使用 `GROK_ACCOUNT_MANAGER_GATEWAY_IMAGE=... ./scripts/update.sh`；
+`.env` 中的同名设置供 FastAPI 运行时读取。候选预拉取失败时脚本仍会继续准备回退
+镜像；预拉取成功也不代表直接采用该镜像，启动中转时仍会重新按 `RepoDigest` 和
+隔离探针结果选择。
+
+需要分步更新应用依赖时可执行：
 
 ```bash
 git pull --rebase --autostash

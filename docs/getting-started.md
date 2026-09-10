@@ -134,10 +134,10 @@ uv run grok-account-manager grok --count 1 --sink json --oauth-exchange
 中转不是 CLI 注册的必需依赖。要使用控制台里的账号测试、模型、图片/视频和 OpenAI 兼容接口：
 
 1. 启动 Docker Desktop。
-2. 启动 FastAPI 后端。首次启动会从仓库内置的 `gateway/` 源码自动构建 `grok-account-manager-gateway:local`。
+2. 启动 FastAPI 后端。启动中转时会以 `ghcr.io/chenyme/grok2api:latest` 为默认候选，完成拉取、`RepoDigest` 解析和隔离探针后，才按通过验证的 digest 启动正式容器。
 3. 在控制台的“本地中转”页面检查状态、同步账号和查看模型。
 
-不需要下载、配置或启动任何外部 grok2api 项目。
+无需另外克隆或配置 grok2api 项目。候选不可用或不兼容时，程序会自动回退到仓库内置的 v3.1.4 镜像；也可通过 `GROK_ACCOUNT_MANAGER_GATEWAY_IMAGE` 指定版本 tag 或 digest。两种镜像都继续使用 `output/grok2api-v2-data/`，切换镜像不会改变数据目录。
 
 中转配置、管理员密钥和账号数据会写入 `output/`，不要提交或公开。当前默认账号数据库是 SQLite，不需要为了启动注册任务执行 `docker compose up`。
 

@@ -169,15 +169,15 @@ const resources = {
       },
       community: {
         title: "交流与店铺",
-        attribution: "本项目将网关能力和 Grok 账号自动注册机统一内置，代码与镜像由本项目独立维护。",
-        attributionSource: "内置网关",
+        attribution: "本项目集成官方 grok2api 镜像与 Grok 账号自动注册机，并保留仓库内置兼容回退。",
+        attributionSource: "官方 grok2api",
         attributionCustom: "项目功能",
         groupHelp: "点击右侧按钮复制群号",
         storeTitle: "打开店铺",
         storeHelp: "查看服务与相关资源",
-        noticeTitle: "本项目内置网关",
-        noticeDescription: "网关源码、镜像构建和账号注册能力都随本项目分发，普通用户无需准备其他项目。",
-        noticeUpstream: "内置网关",
+        noticeTitle: "已集成官方 grok2api",
+        noticeDescription: "项目会自动拉取并验证官方候选镜像，同时保留内置回退；普通用户无需另行克隆 grok2api。",
+        noticeUpstream: "chenyme/grok2api",
         noticeCustom: "本项目",
         noticeAcknowledge: "知道了",
         qqGroup: "QQ 交流群",
@@ -1375,7 +1375,7 @@ const resources = {
       },
       common: { actions: "Actions", cancel: "Cancel", close: "Close", copy: "Copy", copied: "Copied", copyFailed: "Copy failed", create: "Create", delete: "Delete", disabled: "Disabled", disable: "Disable", edit: "Edit", enabled: "Enabled", enable: "Enable", loading: "Loading", importingProgress: "Importing, completed {{completed}} / {{total}}", syncingProgress: "Syncing initial data, completed {{completed}} / {{total}}", noData: "No data", pageOf: "Page {{page}}/{{pages}}", perPage: "Per page", rows: "rows", firstPage: "First page", lastPage: "Last page", previousPage: "Previous page", nextPage: "Next page", selectedCount: "{{count}} selected", selectPage: "Select this page", selectItem: "Select {{name}}", refresh: "Refresh", retry: "Retry", filter: "Filters", all: "All", clearFilters: "Clear filters", save: "Save", reset: "Reset", sortAscending: "Sort {{column}} ascending", sortDescending: "Sort {{column}} descending" },
       updates: { title: "About & updates", noteTitle: "Note", noteDescription: "This project is intended solely for technical research and educational exchange. You must comply with Grok's official terms of use and applicable local laws; you are solely responsible for any consequences.", currentVersion: "Current version", currentVersionHelp: "Version currently running on this service instance.", latestVersion: "Latest version", latestVersionHelp: "Latest version retrieved from the official GitHub Releases feed.", statusLabel: "Update status", statusLabelHelp: "Comparison between the running version and the latest release.", checkedAt: "Last check", checkedAtHelp: "Most recent successful retrieval of official release information.", checkNow: "Check for updates", viewRelease: "View update", openRelease: "Open Release", releaseNotes: "Release notes", releaseNotesHelp: "Version summary published with the official GitHub Release.", noReleaseNotes: "No release notes are available for this version.", notChecked: "Not fetched", neverChecked: "No successful check yet", available: "New version {{version}} available", currentSummary: "Running {{version}}", status: { unchecked: "Not checked", up_to_date: "Up to date", update_available: "Update available", check_failed: "Check failed" } },
-      community: { title: "Community & Store", attribution: "This project ships its gateway and Grok account registration features as one independently maintained distribution.", attributionSource: "Bundled gateway", attributionCustom: "Project features", groupHelp: "Use the button to copy the group number", storeTitle: "Open the store", storeHelp: "Browse services and related resources", noticeTitle: "Bundled gateway", noticeDescription: "The gateway source, image build, and account registration workflow ship with this project. Users do not need another repository.", noticeUpstream: "Bundled gateway", noticeCustom: "This project", noticeAcknowledge: "Got it", qqGroup: "QQ group", copyGroupNumber: "Copy group number", storeLink: "Store", donationAction: "Support", donationTitle: "Thank you for your support", donationDescription: "If this project has been useful, you can scan the code to support it.", donationImageAlt: "Support QR code: thank you for your support", starTitle: "Support this project", starHelp: "If this project helps you, a GitHub Star is appreciated.", starAction: "Star on GitHub" },
+      community: { title: "Community & Store", attribution: "This project integrates the official grok2api image with Grok account registration and keeps a bundled compatibility fallback.", attributionSource: "Official grok2api", attributionCustom: "Project features", groupHelp: "Use the button to copy the group number", storeTitle: "Open the store", storeHelp: "Browse services and related resources", noticeTitle: "Official grok2api integrated", noticeDescription: "The project pulls and validates the official candidate image automatically while retaining a bundled fallback; users do not need to clone grok2api separately.", noticeUpstream: "chenyme/grok2api", noticeCustom: "This project", noticeAcknowledge: "Got it", qqGroup: "QQ group", copyGroupNumber: "Copy group number", storeLink: "Store", donationAction: "Support", donationTitle: "Thank you for your support", donationDescription: "If this project has been useful, you can scan the code to support it.", donationImageAlt: "Support QR code: thank you for your support", starTitle: "Support this project", starHelp: "If this project helps you, a GitHub Star is appreciated.", starAction: "Star on GitHub" },
       nav: { dashboard: "Dashboard", registerTask: "Registration", accounts: "Accounts", models: "Models", clientKeys: "Client keys", creativeConsole: "Creative console", gallery: "Gallery", videoGallery: "Video Gallery", audits: "Request audits", qualityGuard: "Quality guard", docs: "Documentation", settings: "Settings" },
       registerTask: {
         title: "Registration",
@@ -2146,6 +2146,49 @@ Object.assign(resources.en.translation.accounts as unknown as Record<string, str
 });
 Object.assign(resources.en.translation.console as unknown as Record<string, string>, {
   recoveryProbeAt: "Recovery probe after {{time}}",
+});
+
+Object.assign(resources["zh-CN"].translation.settings.web as unknown as Record<string, string>, {
+  clearanceModeHelp: "手动维护 Clearance，使用 FlareSolverr 定期主动刷新，或仅在上游明确拒绝后按需重新求解。",
+  clearanceOnDemand: "按需刷新",
+});
+Object.assign(resources.en.translation.settings.web as unknown as Record<string, string>, {
+  clearanceModeHelp: "Maintain Clearance manually, refresh it proactively with FlareSolverr, or solve on demand only after an explicit upstream rejection.",
+  clearanceOnDemand: "On demand",
+});
+Object.assign(resources["zh-CN"].translation.settings.routing as unknown as Record<string, string>, {
+  videoMaxAttempts: "视频最大尝试次数",
+  videoMaxAttemptsHelp: "仅作用于视频任务创建阶段的切号重试，可单独设置数值，或开启无限制。创建成功后的轮询不会换号。",
+});
+Object.assign(resources.en.translation.settings.routing as unknown as Record<string, string>, {
+  videoMaxAttempts: "Video maximum attempts",
+  videoMaxAttemptsHelp: "Create-phase account failover for video jobs only. Set a number or enable unlimited. Polling after create stays on the same account.",
+});
+Object.assign(resources["zh-CN"].translation.settings.egress as unknown as Record<string, string>, {
+  scopeConsoleAsset: "Grok Console（仅资源）",
+  fallbackConsoleAssetHelp: "Grok Console 资源请求没有可用出口时使用的回退方式；Console 与 Web 节点仍可作为兼容的次级池。",
+});
+Object.assign(resources.en.translation.settings.egress as unknown as Record<string, string>, {
+  scopeConsoleAsset: "Grok Console (assets only)",
+  fallbackConsoleAssetHelp: "Fallback used when no Grok Console asset egress is available; Console and Web nodes remain compatible secondary pools.",
+});
+Object.assign(resources["zh-CN"].translation.audits.operations as unknown as Record<string, string>, {
+  voice: "语音",
+});
+Object.assign(resources.en.translation.audits.operations as unknown as Record<string, string>, {
+  voice: "Voice",
+});
+Object.assign(resources["zh-CN"].translation.accounts as unknown as Record<string, string>, {
+  importedWithFailures: "导入完成：新增 {{created}}，更新 {{updated}}，跳过 {{skipped}}，凭据验证失败 {{failed}}；初始同步成功 {{synced}}，失败 {{syncFailed}}",
+});
+Object.assign(resources.en.translation.accounts as unknown as Record<string, string>, {
+  importedWithFailures: "Import complete: {{created}} created, {{updated}} updated, {{skipped}} skipped, {{failed}} credential validations failed; initial sync {{synced}} succeeded, {{syncFailed}} failed",
+});
+Object.assign(resources["zh-CN"].translation.webConsoleSync as unknown as Record<string, string>, {
+  completed: "转换完成：新增 {{created}}，更新 {{updated}}，跳过 {{skipped}}，转换失败 {{failed}}，初始化成功 {{synced}}，同步失败 {{syncFailed}}",
+});
+Object.assign(resources.en.translation.webConsoleSync as unknown as Record<string, string>, {
+  completed: "Conversion complete: {{created}} created, {{updated}} updated, {{skipped}} skipped, {{failed}} failed conversion, {{synced}} initialized, {{syncFailed}} failed sync",
 });
 
 function readStoredLanguage(): string | null {

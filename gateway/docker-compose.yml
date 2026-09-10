@@ -10,7 +10,9 @@ services:
       dockerfile: Dockerfile
       args:
         GATEWAY_SOURCE_REVISION: "${GATEWAY_SOURCE_REVISION:-local}"
-    image: "${GROK_ACCOUNT_MANAGER_GATEWAY_IMAGE:-grok-account-manager-gateway:local}"
+    # Keep the fallback build separate from GROK_ACCOUNT_MANAGER_GATEWAY_IMAGE,
+    # which selects the official runtime candidate in the parent application.
+    image: "${GROK_ACCOUNT_MANAGER_BUNDLED_GATEWAY_IMAGE:-grok-account-manager-gateway:local}"
     ports:
       - "${GROK_ACCOUNT_MANAGER_GATEWAY_PORT:-43871}:8000"
     environment:
@@ -72,7 +74,7 @@ services:
     environment:
       # Default matches the Compose service name. Override for host networking
       # or a renamed grok2api service, e.g. http://127.0.0.1:8000
-      GROK2API_BASE_URL: ${GROK2API_BASE_URL:-http://grok2api:8000}
+      GROK2API_BASE_URL: ${GROK2API_BASE_URL:-http://gateway:8000}
     depends_on:
       gateway:
         condition: service_healthy

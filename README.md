@@ -2,7 +2,7 @@
  
 Grok 账号注册与凭证管理工具。项目提供 Python 自动化注册流程和 React 本地控制台，支持 DuckMail、Cloud Mail、Outlook/Google 邮箱接码、GrokAccount JSON 凭证归档，以及可选推送到外部 Sub2API 实例。
 
-本项目允许免费使用、学习和二次开发。网关源码和 Dockerfile 已内置在 `gateway/`，运行时不依赖外部 grok2api 仓库或镜像。请勿把 `.env`、邮箱服务 Token/密码、Outlook refresh token、浏览器 cookie、SSO token 或 `output/` 里的凭证提交到 GitHub。
+本项目允许免费使用、学习和二次开发。本地中转默认以 `ghcr.io/chenyme/grok2api:latest` 作为官方候选镜像，同时保留仓库内置的 grok2api v3.1.4 源码和 Dockerfile 作为兼容回退；不需要另外克隆 grok2api 仓库。请勿把 `.env`、邮箱服务 Token/密码、Outlook refresh token、浏览器 cookie、SSO token 或 `output/` 里的凭证提交到 GitHub。
 
 ## 文档
 
@@ -234,7 +234,7 @@ uv run grok-account-manager-api
 
 ### 一键更新
 
-从本仓库拉取代码后，使用下面的脚本同步本仓库、安装依赖、构建前端并重建项目自有网关镜像：
+从本仓库拉取代码后，使用下面的脚本同步本仓库、安装依赖、构建前端、预拉取官方网关候选镜像，并构建仓库内置的 v3.1.4 回退镜像：
 
 ```bash
 ./scripts/update.sh
@@ -246,7 +246,16 @@ uv run grok-account-manager-api
 ./scripts/update-and-run.sh
 ```
 
-脚本只使用本仓库的 `gateway/` 源码，不会下载或引用用户机器上的其他 grok2api 项目。
+默认候选为 `ghcr.io/chenyme/grok2api:latest`。如需指定版本 tag 或固定 digest，可在 `.env` 中设置，例如：
+
+```dotenv
+GROK_ACCOUNT_MANAGER_GATEWAY_IMAGE=ghcr.io/chenyme/grok2api:vX.Y.Z
+# GROK_ACCOUNT_MANAGER_GATEWAY_IMAGE=ghcr.io/chenyme/grok2api@sha256:<64 位摘要>
+```
+
+`update.sh` 的预拉取读取当前 shell 环境；希望它提前准备同一固定版本时，可用 `GROK_ACCOUNT_MANAGER_GATEWAY_IMAGE=... ./scripts/update.sh` 调用。
+
+启动本地中转时，后端会拉取所选候选、解析其 `RepoDigest`，再使用临时配置和临时数据目录执行隔离探针；只有通过验证的不可变 digest 才会用于正式容器。新 digest 首次接触正式 SQLite 前会创建私有备份，正式启动或管理员握手失败时恢复数据库后再回退。候选无法拉取且没有可验证缓存、没有 `RepoDigest` 或探针失败时，会自动回退到仓库内置的 v3.1.4 镜像。FastAPI 每次重启都会执行一次强制更新检查；普通 API 请求会复用当前健康容器，不会反复重启。`update.sh` 的预拉取只是在更新阶段准备候选，不能代替启动时验证。
 
 ## 输出文件
 
@@ -256,6 +265,8 @@ uv run grok-account-manager-api
 - `output/sso-failed.txt`：Sub2API 写入失败时的兜底文本。
 - `output/pending-registration-results.json`：控制台任务的未完成 OAuth checkpoint 和落盘失败恢复队列。
 - `output/registration-proxies.json`：控制台导入的注册节点池，仅当前用户可读写。
+- `output/grok2api-v2-data/`：本地中转 SQLite 与媒体数据，官方和回退镜像共用。
+- `output/grok2api-v2-backups/`：新官方 digest 首次正式启动前创建的私有 SQLite 回滚备份。
 
 `output/` 是运行产物目录，默认不纳入 Git。
 

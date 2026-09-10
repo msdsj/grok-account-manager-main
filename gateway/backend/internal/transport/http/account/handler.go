@@ -909,7 +909,7 @@ func (h *Handler) streamWebToConsoleSync(c *gin.Context, all bool, ids []uint64,
 		stream.WriteError("accountConsoleSyncFailed", "Grok Web 账号同步到 Console 失败")
 		return
 	}
-	_ = stream.Write("complete", accountImportResponse{Created: result.Created, Updated: result.Updated, Skipped: result.Skipped, Synced: syncResult.Succeeded, SyncFailed: syncResult.Failed})
+	_ = stream.Write("complete", newAccountImportResponse(result, syncResult))
 }
 
 func (h *Handler) runWebToBuildConversion(ctx context.Context, all bool, ids []uint64, strategy accountapp.BuildConversionStrategy, progress accountapp.BatchProgressObserver, syncProgress func(completed, total int)) (accountapp.BuildConversionResult, accountsyncapp.Result, error) {
@@ -942,6 +942,13 @@ func (h *Handler) streamWebToBuildConversion(c *gin.Context, all bool, ids []uin
 func newBuildConversionResponse(result accountapp.BuildConversionResult, syncResult accountsyncapp.Result) buildConversionResponse {
 	return buildConversionResponse{
 		Created: result.Created, Linked: result.Linked, Skipped: result.Skipped, Failed: result.Failed,
+		Synced: syncResult.Succeeded, SyncFailed: syncResult.Failed,
+	}
+}
+
+func newAccountImportResponse(result accountapp.ImportResult, syncResult accountsyncapp.Result) accountImportResponse {
+	return accountImportResponse{
+		Created: result.Created, Updated: result.Updated, Skipped: result.Skipped, Failed: result.Failed,
 		Synced: syncResult.Succeeded, SyncFailed: syncResult.Failed,
 	}
 }
@@ -1086,7 +1093,7 @@ func (h *Handler) importFile(c *gin.Context, providerValue accountdomain.Provide
 		stream.WriteError("authImportFailed", "导入账号失败")
 		return
 	}
-	_ = stream.Write("complete", accountImportResponse{Created: result.Created, Updated: result.Updated, Skipped: result.Skipped, Failed: result.Failed, Synced: syncResult.Succeeded, SyncFailed: syncResult.Failed})
+	_ = stream.Write("complete", newAccountImportResponse(result, syncResult))
 }
 
 func readAccountImportDocuments(c *gin.Context, fileDescription string) ([][]byte, bool) {

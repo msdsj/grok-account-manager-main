@@ -13,10 +13,10 @@ if ! command -v docker >/dev/null 2>&1; then
   exit 1
 fi
 
-printf '%s\n' '[1/4] 拉取本仓库最新代码'
+printf '%s\n' '[1/5] 拉取本仓库最新代码'
 git pull --ff-only
 
-printf '%s\n' '[2/4] 同步 Python 依赖'
+printf '%s\n' '[2/5] 同步 Python 依赖'
 if command -v uv >/dev/null 2>&1; then
   uv sync
 else
@@ -24,7 +24,7 @@ else
   exit 1
 fi
 
-printf '%s\n' '[3/4] 构建本项目控制台前端'
+printf '%s\n' '[3/5] 构建本项目控制台前端'
 WEB_DIR="$ROOT_DIR/web"
 FRONTEND_LOCK_STAMP=$(cksum "$WEB_DIR/pnpm-lock.yaml")
 FRONTEND_INSTALL_MARKER="$WEB_DIR/node_modules/.grok-account-manager-lock"
@@ -50,7 +50,15 @@ else
   exit 1
 fi
 
-printf '%s\n' '[4/4] 构建本项目自有网关镜像'
+GATEWAY_CANDIDATE_IMAGE=${GROK_ACCOUNT_MANAGER_GATEWAY_IMAGE:-ghcr.io/chenyme/grok2api:latest}
+printf '%s\n' "[4/5] 预拉取官方网关候选镜像 ($GATEWAY_CANDIDATE_IMAGE)"
+if docker pull "$GATEWAY_CANDIDATE_IMAGE"; then
+  printf '%s\n' '官方候选镜像已更新；启动时仍会先做隔离兼容性探针并按 RepoDigest 运行。'
+else
+  printf '%s\n' '警告：官方候选镜像拉取失败，继续准备仓库内置的离线回退镜像。' >&2
+fi
+
+printf '%s\n' '[5/5] 构建仓库内置的回退网关镜像'
 GATEWAY_REVISION=$(tr -d '[:space:]' < gateway/UPSTREAM_REVISION)
 if [ "${GROK_ACCOUNT_MANAGER_FORCE_REBUILD:-0}" = "1" ]; then
   printf '%s\n' '执行全量 Docker 重建（GROK_ACCOUNT_MANAGER_FORCE_REBUILD=1）。'
@@ -64,11 +72,12 @@ elif [ "${GROK_ACCOUNT_MANAGER_PULL:-0}" = "1" ]; then
     --tag grok-account-manager-gateway:local \
     gateway
 else
-  printf '%s\n' '执行增量 Docker 构建（如需拉取基础镜像可设置 GROK_ACCOUNT_MANAGER_PULL=1）。'
+  printf '%s\n' '执行增量 Docker 构建（如需刷新内置网关的基础镜像，可设置 GROK_ACCOUNT_MANAGER_PULL=1）。'
   docker build \
     --build-arg "GATEWAY_SOURCE_REVISION=$GATEWAY_REVISION" \
     --tag grok-account-manager-gateway:local \
     gateway
 fi
 
-printf '%s\n' '更新完成。运行 ./scripts/update-and-run.sh 启动 FastAPI；注册机位于控制台侧边栏。'
+printf '%s\n' '更新完成。运行时优先使用通过隔离探针的官方镜像；拉取或验证失败时自动回退到内置镜像。'
+printf '%s\n' '运行 ./scripts/update-and-run.sh 启动 FastAPI；注册机位于控制台侧边栏。'

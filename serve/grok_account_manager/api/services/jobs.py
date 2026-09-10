@@ -1926,7 +1926,7 @@ class RegistrationJobManager:
             self._sync_to_relay_async()
 
     def _sync_to_relay_async(self) -> None:
-        """Best-effort push of newly registered accounts into the bundled gateway.
+        """Best-effort push of newly registered accounts into the managed local gateway.
 
         Runs off the job thread so a slow/unavailable relay never blocks or fails
         a registration round; failures are logged and swallowed.
@@ -1939,7 +1939,7 @@ class RegistrationJobManager:
                 try:
                     result = _sync_project_pool_to_relay()
                     print(
-                        f"[RegistrationJobManager] 已将注册账号同步到内置网关："
+                        f"[RegistrationJobManager] 已将注册账号同步到本地网关："
                         f"请求 {result.get('requested', 0)} 个"
                     )
                     return
@@ -1947,7 +1947,7 @@ class RegistrationJobManager:
                     if attempt < 3:
                         time.sleep(attempt * 2)
                         continue
-                    print(f"[RegistrationJobManager] 自动同步账号到内置网关失败: {error}")
+                    print(f"[RegistrationJobManager] 自动同步账号到本地网关失败: {error}")
 
         threading.Thread(target=_sync, name="relay-auto-sync", daemon=True).start()
 

@@ -61,13 +61,16 @@ def create_app() -> FastAPI:
 
     @app.on_event("startup")
     def start_relay_engine() -> None:
-        # The bundled gateway takes tens of seconds to boot (Docker container / Go binary), so start
+        # The managed gateway takes tens of seconds to boot (Docker container / Go binary), so start
         # it in the background instead of blocking the FastAPI startup handshake on it.
         def _boot() -> None:
             try:
-                RELAY_MANAGER.start()
+                # A backend restart is the explicit update boundary: refresh
+                # and validate the requested gateway image once, while normal
+                # API traffic keeps reusing the healthy runtime.
+                RELAY_MANAGER.start(force_update=True)
             except Exception as error:
-                print(f"[app] 内置网关自动启动失败，将在首次使用时重试: {error}")
+                print(f"[app] 本地网关自动启动失败，将在首次使用时重试: {error}")
 
         threading.Thread(target=_boot, name="relay-autostart", daemon=True).start()
 

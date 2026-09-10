@@ -619,7 +619,11 @@ export function AccountsPage() {
     onSuccess: (result) => {
       setWebConversionTargets(null);
       clearSelection();
-      toast.success(t("webConsoleSync.completed", result));
+      if (result.failed > 0 || result.syncFailed > 0) {
+        toast.warning(t("webConsoleSync.completed", result));
+      } else {
+        toast.success(t("webConsoleSync.completed", result));
+      }
     },
     onError: (error) => { if (!isAbortError(error)) showError(error); },
     onSettled: () => {
@@ -673,6 +677,10 @@ export function AccountsPage() {
       importAbortRef.current = null;
       setQuickImportOpen(false);
       setQuickImportTokens("");
+      if (result.failed > 0) {
+        toast.warning(t("accounts.importedWithFailures", result));
+        return;
+      }
       if (result.syncFailed > 0) {
         toast.warning(t("accounts.importedWithSyncFailures", result));
         return;
