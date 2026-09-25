@@ -448,6 +448,9 @@ class RelayManager:
         if not is_admin_api:
             self._ensure_v2_client_key()
         cfg = self._config
+        # The gateway manager may be running outside the current process (for
+        # example via docker compose). Use the configured host port directly;
+        # the health check and admin proxy must address the same listener.
         target_url = f"{cfg.base_url}{path}"
         if query:
             target_url = f"{target_url}?{query}"

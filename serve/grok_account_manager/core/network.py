@@ -33,7 +33,10 @@ def build_requests_session(
     """
 
     session = requests.Session()
-    session.trust_env = False
+    # Browser rounds may rely on the local system proxy (manual xAI OAuth
+    # works through that same route). Only disable ambient proxy variables when
+    # an explicit per-round proxy was supplied.
+    session.trust_env = not bool(proxy_url)
     if proxy_url:
         normalized = normalize_proxy_server(proxy_url)
         session.proxies.update({"http": normalized, "https": normalized})

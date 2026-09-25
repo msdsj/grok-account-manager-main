@@ -205,6 +205,43 @@ class GrokProvider:
         )
         grok_clearance = get_grok_clearance(session)
 
+        # Give the newly-created session a short settling window before
+        # inspecting the final page. This lets the server finish redirecting
+        # and lets Cloudflare render a block page before OAuth is considered.
+        self._interruptible_sleep(random.uniform(2.0, 4.0))
+
+        # A Cloudflare block can appear immediately after the SSO cookie is
+        # issued. Treat it as a failed registration before starting Build/OAuth;
+        # an SSO cookie alone is not evidence that the account is usable.
+        try:
+            final_page = session.refresh_page()
+            page_url = str(final_page.url or "").lower()
+            page_state = final_page.run_js(
+                "return ((document.title || '') + ' ' + (document.body?.innerText || '')).toLowerCase();"
+            )
+            if page_state is None:
+                raise RuntimeError("注册完成后的页面状态为空，无法确认账号是否被封")
+            blocked_text = str(page_state or "").replace(" ", "")
+            if (
+                "sorry,youhavebeenblocked" in blocked_text
+                or "youhavebeenblocked" in blocked_text
+                or "youareunabletoaccess" in blocked_text
+                or "unabletoaccessgrok.com" in blocked_text
+                or ("cloudflare" in blocked_text and "blocked" in blocked_text)
+            ):
+                raise CloudflareBlockedError(
+                    f"注册完成后检测到 Cloudflare 封禁（页面 {page_url}），跳过 Build/OAuth"
+                )
+        except CloudflareBlockedError:
+            raise
+        except CloudflareBlockedError:
+            raise
+        except Exception as error:
+            # Do not start OAuth when the final registration state cannot be
+            # verified. A missing page check is safer than authorizing a
+            # potentially blocked account.
+            raise RuntimeError(f"注册完成后无法确认账号状态，已跳过 refresh_token：{error}") from error
+
         result: RegistrationResult = {
             "email": email,
             "credential": sso_value,
@@ -273,7 +310,10 @@ class GrokProvider:
                             ):
                                 oauth_tokens = candidate_tokens
                                 oauth_error = ""
-                                print("[Grok] 已获取 OAuth refresh_token")
+                                print(
+                                    f"[Grok] 已获取 OAuth refresh_token（账号 {email}，"
+                                    "token 内容已隐藏）"
+                                )
                                 break
                             if candidate_tokens and not candidate_tokens.get("access_token"):
                                 oauth_error = "OAuth token 响应没有 access_token"

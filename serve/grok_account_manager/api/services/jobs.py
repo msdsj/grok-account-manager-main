@@ -81,9 +81,10 @@ def _fingerprint_summary(session: DrissionBrowserSession) -> str:
 
 def _result_has_refresh_token(result: dict) -> bool:
     credential = result.get("full_credential")
-    return isinstance(credential, dict) and bool(
-        str(credential.get("refresh_token") or "").strip()
-    )
+    if not isinstance(credential, dict):
+        return False
+    token = credential.get("refresh_token")
+    return isinstance(token, str) and bool(token.strip())
 
 
 def _is_oauth_access_denied(error: str) -> bool:
@@ -250,7 +251,7 @@ class RegistrationJobManager:
         return self.start(
             total=1,
             concurrency=1,
-            oauth_exchange=cfg.get("oauth_exchange", True),
+            oauth_exchange=cfg.get("oauth_exchange", False),
             auto_import_sub2api=cfg.get("auto_import_sub2api", False),
             minimize_browsers=cfg.get("minimize_browsers", True),
             email_source=cfg.get("email_source", "duckmail"),

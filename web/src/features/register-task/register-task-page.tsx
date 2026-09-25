@@ -62,7 +62,9 @@ export function RegisterTaskPage() {
   const [total, setTotal] = useState(1);
   const [concurrency, setConcurrency] = useState(1);
   const [emailSource, setEmailSource] = useState<EmailSource>("duckmail");
-  const [oauthExchange, setOauthExchange] = useState(true);
+  // Registration and OAuth are separate phases. Keep RT exchange opt-in so a
+  // successful account registration is not immediately sent into device auth.
+  const [oauthExchange, setOauthExchange] = useState(false);
   const [autoImportSub2Api, setAutoImportSub2Api] = useState(false);
   const [minimizeBrowsers, setMinimizeBrowsers] = useState(true);
   // Undefined keeps the backend's automatic discovery behavior: use the

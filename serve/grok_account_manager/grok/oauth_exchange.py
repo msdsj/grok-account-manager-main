@@ -38,6 +38,55 @@ class OAuthTokens(TypedDict, total=False):
     redirect_uri: str
 
 
+def _normalize_token_payload(payload: object) -> OAuthTokens:
+    """Normalize xAI token responses across current and legacy response shapes.
+
+    xAI has returned both a flat OAuth response and a wrapped ``token``/``data``
+    object in different deployments.  Keep the raw token values private while
+    accepting the aliases used by those responses.
+    """
+    if not isinstance(payload, dict):
+        return {}
+    source = payload
+    for key in ("token", "tokens", "data", "result"):
+        nested = payload.get(key)
+        if isinstance(nested, dict) and any(
+            nested.get(name) for name in ("access_token", "refresh_token", "refreshToken")
+        ):
+            source = nested
+            break
+
+    def value(*names: str) -> str:
+        for name in names:
+            candidate = source.get(name)
+            if candidate is not None and str(candidate).strip():
+                return str(candidate).strip()
+        return ""
+
+    normalized: OAuthTokens = {}
+    for target, names in {
+        "access_token": ("access_token", "accessToken", "access"),
+        "refresh_token": ("refresh_token", "refreshToken", "refresh", "rt"),
+        "id_token": ("id_token", "idToken"),
+        "token_type": ("token_type", "tokenType"),
+        "token_endpoint": ("token_endpoint", "tokenEndpoint"),
+        "redirect_uri": ("redirect_uri", "redirectUri"),
+    }.items():
+        item = value(*names)
+        if item:
+            normalized[target] = item
+    expires = source.get("expires_in", source.get("expiresIn"))
+    try:
+        if expires is not None:
+            normalized["expires_in"] = int(expires)
+    except (TypeError, ValueError):
+        pass
+    scope = value("scope")
+    if scope:
+        normalized["scope"] = scope
+    return normalized
+
+
 OIDC_ISSUER = "https://auth.x.ai"
 OIDC_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
 OIDC_SCOPE = (
@@ -55,7 +104,10 @@ MAX_LOGIN_SECONDS = 30 * 60
 MAX_CONSECUTIVE_POLL_TRANSPORT_ERRORS = 3
 MAX_CONSECUTIVE_PAGE_ERRORS = 6
 DISCOVERY_TIMEOUT_SECONDS = 8
-DEVICE_CODE_TIMEOUT_SECONDS = 15
+# xAI can take more than 15 seconds to answer device-code requests on a
+# healthy direct/CloudMail egress.  A short timeout was incorrectly reported as
+# an OAuth failure immediately after registration.
+DEVICE_CODE_TIMEOUT_SECONDS = 45
 OAUTH_ENDPOINT_CACHE_TTL_SECONDS = 10 * 60
 
 _SESSION_ENDPOINT_CACHE_LOCK = threading.Lock()
@@ -163,7 +215,7 @@ def _discover_oauth_endpoints(
             cached = _SESSION_ENDPOINT_CACHE
             if cached is not None and now - cached[0] < OAUTH_ENDPOINT_CACHE_TTL_SECONDS:
                 return dict(cached[1])
-        result = _discover_oauth_endpoints_uncached(http_session, timeout=timeout)
+        result = _discover_oauth_endpoints_uncached(http_session, timeout=max(timeout, 30))
         with _SESSION_ENDPOINT_CACHE_LOCK:
             _SESSION_ENDPOINT_CACHE = (time.monotonic(), dict(result))
         return result
@@ -466,7 +518,11 @@ def exchange_sso_for_oauth_tokens(
 
             tokens["token_endpoint"] = token_endpoint
             if not tokens.get("refresh_token"):
-                print("[OAuth Exchange] 警告：token 响应没有 refresh_token")
+                keys = ", ".join(sorted(str(key) for key in tokens.keys())) or "无字段"
+                raise RuntimeError(
+                    "xAI 已完成授权但 token 响应没有 refresh_token（已收到字段："
+                    f"{keys}）。请重新授权，不会保存不完整凭证。"
+                )
             else:
                 print("[OAuth Exchange] 成功获取 OAuth tokens 和 refresh_token!")
             return tokens
@@ -506,9 +562,10 @@ def _poll_device_token_once(
         data = {"raw": response.text[:300]}
 
     if response.status_code == 200:
-        if not str(data.get("access_token") or "").strip():
+        normalized = _normalize_token_payload(data)
+        if not normalized.get("access_token"):
             return "fatal", "xAI token response missing access_token"
-        return "complete", data
+        return "complete", normalized
 
     if response.status_code in {408, 425, 429} or 500 <= response.status_code < 600:
         return "transport_error", f"HTTP {response.status_code}: {data}"
@@ -904,6 +961,12 @@ function turnstileState() {
 const host = location.hostname.toLowerCase();
 const path = location.pathname.toLowerCase();
 const pageUrl = location.href.toLowerCase();
+const isXaiHost = (
+    host === 'x.ai' ||
+    host.endsWith('.x.ai') ||
+    host === 'grok.com' ||
+    host.endsWith('.grok.com')
+);
 const bodyText = (document.body?.innerText || document.body?.textContent || '').toLowerCase();
 const bodyCompact = bodyText.replace(/\s+/g, '');
 
@@ -926,6 +989,7 @@ if (
     bodyText.includes('successfully authorized') ||
     bodyText.includes('authorization complete') ||
     bodyText.includes('you may close') ||
+    (isXaiHost && path.includes('/oauth2/device/done')) ||
     bodyCompact.includes('授权成功') ||
     bodyCompact.includes('已授权') ||
     bodyCompact.includes('可以关闭')
@@ -933,12 +997,6 @@ if (
     return 'authorized-page';
 }
 
-const isXaiHost = (
-    host === 'x.ai' ||
-    host.endsWith('.x.ai') ||
-    host === 'grok.com' ||
-    host.endsWith('.grok.com')
-);
 if (isXaiHost && path.includes('/oauth2/device/approve') && bodyCompact.includes('invalidaction')) {
     return 'device-invalid-action';
 }
@@ -1078,14 +1136,28 @@ if (host.includes('accounts.google.') || host === 'google.com' || host.endsWith(
     return 'idle';
 }
 
-const userCodeInput = visibleInputs('input[name*="user_code" i], input[id*="user_code" i], input[name*="code" i], input[id*="code" i], input[type="text"]').find((node) => {
-    const marker = String(node.name || node.id || node.autocomplete || '').toLowerCase();
-    return marker.includes('user') ||
-        bodyText.includes('device code') ||
-        bodyText.includes('user code') ||
-        bodyCompact.includes('设备代码') ||
-        bodyCompact.includes('设备码');
-});
+const devicePath = isXaiHost && (
+    path.includes('/oauth2/device') || path.includes('/oauth/device')
+);
+const userCodeInput = visibleInputs('input[name*="user_code" i], input[id*="user_code" i], input[name*="code" i], input[id*="code" i], input[autocomplete="one-time-code"], input[type="text"]')
+    .filter((node) => {
+        const marker = String(node.name || node.id || node.autocomplete || '').toLowerCase();
+        const placeholder = String(node.placeholder || '').toLowerCase();
+        const hint = `${marker} ${placeholder}`;
+        return marker.includes('user') ||
+            hint.includes('device') ||
+            hint.includes('code') ||
+            bodyText.includes('device code') ||
+            bodyText.includes('user code') ||
+            bodyCompact.includes('设备代码') ||
+            bodyCompact.includes('设备码');
+    })
+    .find((node) => {
+        const marker = String(node.name || node.id || node.autocomplete || '').toLowerCase();
+        return devicePath || marker.includes('user') || marker.includes('code') ||
+            bodyText.includes('device code') || bodyText.includes('user code') ||
+            bodyCompact.includes('设备代码') || bodyCompact.includes('设备码');
+    });
 if (userCodeInput && userCode) {
     const compactCurrent = String(userCodeInput.value || '').replace(/\s|-/g, '').toLowerCase();
     const compactCode = String(userCode || '').replace(/\s|-/g, '').toLowerCase();
