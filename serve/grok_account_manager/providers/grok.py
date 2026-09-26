@@ -49,6 +49,51 @@ BROWSER_STAGE_LABELS = {
 }
 
 
+def _inspect_post_registration_page(
+    session: DrissionBrowserSession,
+    *,
+    timeout: float,
+    stop_event=None,
+) -> tuple[str, str]:
+    """Wait for a readable post-registration page and classify explicit blocks."""
+    deadline = time.monotonic() + max(0.5, float(timeout))
+    last_error = ""
+    while time.monotonic() < deadline:
+        if stop_event and stop_event.is_set():
+            raise RuntimeError("任务已停止")
+        try:
+            page = session.refresh_page()
+            page_url = str(getattr(page, "url", "") or "").lower()
+            page_state = page.run_js(
+                "return ((document.title || '') + ' ' + (document.body?.innerText || '')).toLowerCase();"
+            )
+            if page_state is None or not str(page_state).strip():
+                raise RuntimeError("页面状态为空")
+            compact = "".join(str(page_state).split())
+            if (
+                "blocked" in page_url
+                or "suspended" in page_url
+                or "account-locked" in page_url
+                or "sorry,youhavebeenblocked" in compact
+                or "youhavebeenblocked" in compact
+                or "youareunabletoaccess" in compact
+                or "unabletoaccessgrok.com" in compact
+                or ("cloudflare" in compact and "blocked" in compact)
+                or "requestblocked" in compact
+                or "accessdenied" in compact
+                or "accountsuspended" in compact
+                or "accounthasbeensuspended" in compact
+                or "accountlocked" in compact
+                or "accounthasbeenlocked" in compact
+            ):
+                return "blocked", f"页面 {page_url or '未知'}"
+            return "clear", f"页面 {page_url or '未知'}"
+        except Exception as error:
+            last_error = f"{error.__class__.__name__}: {error}"
+            time.sleep(0.25)
+    return "unknown", last_error or "页面仍在跳转"
+
+
 class BrowserStepRetryRequested(RuntimeError):
     """Raised when the user asks the visible browser window to restart its round."""
 
@@ -205,42 +250,30 @@ class GrokProvider:
         )
         grok_clearance = get_grok_clearance(session)
 
-        # Give the newly-created session a short settling window before
-        # inspecting the final page. This lets the server finish redirecting
-        # and lets Cloudflare render a block page before OAuth is considered.
-        self._interruptible_sleep(random.uniform(2.0, 4.0))
-
-        # A Cloudflare block can appear immediately after the SSO cookie is
-        # issued. Treat it as a failed registration before starting Build/OAuth;
-        # an SSO cookie alone is not evidence that the account is usable.
-        try:
-            final_page = session.refresh_page()
-            page_url = str(final_page.url or "").lower()
-            page_state = final_page.run_js(
-                "return ((document.title || '') + ' ' + (document.body?.innerText || '')).toLowerCase();"
+        # The SSO cookie confirms registration. Before opening an OAuth tab,
+        # wait until the current Grok page is readable and has no explicit
+        # block message. This is state-driven and does not use a fixed settle
+        # delay that can race the redirect.
+        # The production BrowserSession always exposes ``refresh_page``. A
+        # small protocol-compatible fallback keeps provider integrations that
+        # only implement the registration calls working; real browsers still
+        # take the state check above before OAuth.
+        if callable(getattr(session, "refresh_page", None)):
+            block_state, block_detail = _inspect_post_registration_page(
+                session,
+                timeout=30.0,
+                stop_event=self.stop_event,
             )
-            if page_state is None:
-                raise RuntimeError("注册完成后的页面状态为空，无法确认账号是否被封")
-            blocked_text = str(page_state or "").replace(" ", "")
-            if (
-                "sorry,youhavebeenblocked" in blocked_text
-                or "youhavebeenblocked" in blocked_text
-                or "youareunabletoaccess" in blocked_text
-                or "unabletoaccessgrok.com" in blocked_text
-                or ("cloudflare" in blocked_text and "blocked" in blocked_text)
-            ):
-                raise CloudflareBlockedError(
-                    f"注册完成后检测到 Cloudflare 封禁（页面 {page_url}），跳过 Build/OAuth"
-                )
-        except CloudflareBlockedError:
-            raise
-        except CloudflareBlockedError:
-            raise
-        except Exception as error:
-            # Do not start OAuth when the final registration state cannot be
-            # verified. A missing page check is safer than authorizing a
-            # potentially blocked account.
-            raise RuntimeError(f"注册完成后无法确认账号状态，已跳过 refresh_token：{error}") from error
+        else:
+            block_state, block_detail = "clear", "兼容模式会话未提供页面检查接口"
+        if block_state == "blocked":
+            raise CloudflareBlockedError(
+                f"注册完成后检测到 Cloudflare 封禁（{block_detail}），跳过 Build/OAuth"
+            )
+        if block_state == "unknown":
+            raise RuntimeError(
+                f"注册已取得 sso cookie，但注册后的 Grok 页面无法确认状态，已跳过 refresh_token：{block_detail}"
+            )
 
         result: RegistrationResult = {
             "email": email,
@@ -343,6 +376,21 @@ class GrokProvider:
                             print(f"[Grok] {retry_delay:.1f}s 后重试 OAuth exchange...")
                             self._interruptible_sleep(retry_delay)
                 finally:
+                    # OAuth has the browser cookies it needs in the bound HTTP
+                    # session now. Release Chromium before the optional
+                    # cooldown so the next round can start without waiting on
+                    # a browser process that is no longer useful.
+                    if oauth_tokens:
+                        stop_browser = getattr(session, "stop", None)
+                        if callable(stop_browser):
+                            try:
+                                stop_browser()
+                            except Exception as error:
+                                self._log(
+                                    "warning",
+                                    f"refresh_token 已获取，但关闭本轮浏览器失败：{error}",
+                                    stage="oauth_exchange",
+                                )
                     if acquired_oauth_slot:
                         self._oauth_cooldown()
                         self.oauth_semaphore.release()
@@ -1973,57 +2021,417 @@ return 'clicked';
     raise Exception("未找到验证码输入框或确认邮箱按钮")
 
 
-def _get_turnstile_token(page, stop_event=None):
-    """在最终注册页解 Turnstile（真人化点击 + iframe 内坐标 spoof）。"""
+def _optional_element(owner, locator):
+    """Find a late-rendered element without turning a poll into a long wait."""
     try:
-        page.run_js("try { turnstile.reset() } catch(e) { }")
+        return owner.ele(locator, timeout=0.2)
+    except TypeError:
+        # Small protocol-compatible test doubles may only accept the locator.
+        return owner.ele(locator)
+    except Exception:
+        return None
+
+
+_CF_CHALLENGE_HOST = "challenges.cloudflare.com"
+
+
+def _turnstile_backend_ids_via_cdp(page) -> list[int]:
+    """Return backend node ids for Turnstile iframes, including shadow DOM nodes."""
+    document = page.run_cdp("DOM.getDocument", depth=-1, pierce=True)
+    backend_ids: list[int] = []
+
+    def collect(node):
+        if not isinstance(node, dict):
+            return
+        if str(node.get("nodeName", "")).upper() == "IFRAME":
+            # attributes is a flat [name, value, name, value, ...] list
+            attributes = node.get("attributes") or []
+            for index in range(0, len(attributes) - 1, 2):
+                if attributes[index] == "src" and _CF_CHALLENGE_HOST in str(attributes[index + 1]):
+                    backend_id = node.get("backendNodeId")
+                    if backend_id:
+                        backend_ids.append(backend_id)
+                    break
+        for key in ("children", "shadowRoots", "pseudoElements"):
+            for child in node.get(key) or ():
+                collect(child)
+        collect(node.get("contentDocument"))
+
+    collect(document.get("root") or {})
+    return backend_ids
+
+
+def _scroll_turnstile_into_view(page) -> bool:
+    """Scroll the challenge widget into the active viewport before coordinates are read."""
+    try:
+        for backend_id in _turnstile_backend_ids_via_cdp(page):
+            try:
+                # This also reaches a widget inside a closed shadow root, which
+                # cannot be found by document.querySelector().
+                page.run_cdp("DOM.scrollIntoViewIfNeeded", backendNodeId=backend_id)
+                return True
+            except Exception:
+                continue
     except Exception:
         pass
 
-    for _ in range(15):
+    try:
+        return bool(page.run_js(
+            """
+const iframe = document.querySelector(
+    '.cf-turnstile iframe, iframe[src*="challenges.cloudflare.com"], '
+    + '#turnstile-wrapper iframe, #turnstileForm iframe'
+);
+const input = document.querySelector('input[name="cf-turnstile-response"]');
+const target = iframe || input?.closest('.cf-turnstile') || input?.parentElement;
+if (!target || typeof target.scrollIntoView !== 'function') return false;
+target.scrollIntoView({ block: 'center', inline: 'center' });
+return true;
+            """
+        ))
+    except Exception:
+        return False
+
+
+def _box_model_rect(page, backend_id):
+    """Viewport-space rect for a CDP node, or None when it has no layout box."""
+    try:
+        model = page.run_cdp("DOM.getBoxModel", backendNodeId=backend_id)["model"]
+    except Exception:
+        return None
+    border = model.get("border") or []
+    if len(border) < 6:
+        return None
+    width = border[2] - border[0]
+    height = border[5] - border[1]
+    if width <= 0 or height <= 0:
+        return None
+    return {"x": border[0], "y": border[1], "w": width, "h": height}
+
+
+def _turnstile_rect_via_cdp(page):
+    """Locate the Turnstile iframe with a pierced CDP DOM walk.
+
+    ``DOM.getDocument`` with ``pierce=True`` inlines shadow roots and iframe
+    content documents, so this reaches the challenge iframe even when it sits
+    behind a *closed* shadow root that ``document.querySelector`` cannot see.
+    That makes it the only locator that does not depend on guessing how x.ai
+    happens to nest the widget.
+    """
+    for backend_id in _turnstile_backend_ids_via_cdp(page):
+        rect = _box_model_rect(page, backend_id)
+        if rect:
+            return rect
+    return None
+
+
+def _turnstile_iframe(page):
+    """Return the Turnstile iframe element by navigating the outer shadow DOM.
+
+    The page structure is:
+      input[name="cf-turnstile-response"]  (hidden, outer page)
+        → parent div → shadow root → iframe  (← this is what we return)
+          → body → shadow root → input[type="checkbox"]
+
+    DrissionPage's shadow_root property uses CDP to pierce shadow boundaries,
+    so it works even when the shadow root is closed (not accessible from JS).
+    """
+    challenge_solution = _optional_element(page, "@name=cf-turnstile-response")
+    if not challenge_solution:
+        return None
+    try:
+        challenge_wrapper = challenge_solution.parent()
+        challenge_shadow = challenge_wrapper.shadow_root
+        if not challenge_shadow:
+            return None
+        return _optional_element(challenge_shadow, "tag:iframe")
+    except Exception:
+        return None
+
+
+def _turnstile_checkbox(page):
+    """Return the checkbox inside Turnstile's nested shadow DOM when ready."""
+    try:
+        challenge_iframe = _turnstile_iframe(page)
+        if not challenge_iframe:
+            return None
+        iframe_body = _optional_element(challenge_iframe, "tag:body")
+        if not iframe_body:
+            return None
+        iframe_shadow = iframe_body.shadow_root
+        if not iframe_shadow:
+            return None
+        return _optional_element(iframe_shadow, "tag:input")
+    except Exception:
+        return None
+
+
+def _human_mouse_move(page, target_x, target_y, steps=6):
+    """Dispatch a short jittered mouseMoved trail that ends on the target.
+
+    Turnstile scores the pointer trajectory arriving at a click, so a pointer
+    that teleports onto the checkbox is itself a bot signal.  cf-stealth drives
+    this through Playwright's mouse API; the CDP equivalent is a sequence of
+    Input.dispatchMouseEvent mouseMoved events before the press.
+    """
+    start_x = max(1.0, target_x - random.randint(60, 160))
+    start_y = max(1.0, target_y - random.randint(40, 120))
+    for index in range(1, steps + 1):
+        progress = index / steps
+        # Land the final move exactly on target; jitter the approach only.
+        jitter_x = 0.0 if index == steps else random.uniform(-6, 6)
+        jitter_y = 0.0 if index == steps else random.uniform(-5, 5)
+        try:
+            page.run_cdp(
+                "Input.dispatchMouseEvent",
+                type="mouseMoved",
+                x=start_x + (target_x - start_x) * progress + jitter_x,
+                y=start_y + (target_y - start_y) * progress + jitter_y,
+                buttons=0,
+            )
+        except Exception:
+            return
+        time.sleep(random.uniform(0.02, 0.09))
+
+
+def _cdp_click_turnstile(page) -> bool:
+    """Simulate a hardware-level CDP mouse click on the Turnstile iframe checkbox.
+
+    Mirrors the CFTurnstileAutoClick approach: find the iframe's viewport rect,
+    then inject mousePressed/mouseReleased via CDP so the click lands on the
+    checkbox rather than the iframe edge.  The turnstile_patch extension already
+    randomises screenX/screenY to cover the CDP screenX==x Chromium bug that
+    Cloudflare flags.
+
+    Locators are tried widest-reach first:
+      1. Pierced CDP DOM walk — sees through closed shadow roots.
+      2. DrissionPage shadow-DOM navigation — needs the wrapper/shadow nesting
+         to match, but returns a live element.
+      3. JS getBoundingClientRect — only works when the iframe is queryable
+         from the page context (open shadow root or light DOM).
+    """
+    if _scroll_turnstile_into_view(page):
+        # Let the browser apply the scroll before reading the iframe box. The
+        # box can otherwise still contain the pre-scroll viewport coordinates.
+        time.sleep(0.12)
+
+    rect = None
+    origin = ""
+
+    # Strategy 1: pierced CDP DOM walk — independent of how the widget nests
+    try:
+        rect = _turnstile_rect_via_cdp(page)
+        if rect:
+            origin = "CDP 穿透"
+    except Exception as err:
+        print(f"[Turnstile] CDP 定位失败，尝试 shadow DOM: {err}")
+
+    # Strategy 2: DrissionPage shadow-DOM navigation — works for closed shadow roots
+    if not rect:
+        try:
+            iframe_el = _turnstile_iframe(page)
+            if iframe_el:
+                loc = iframe_el.rect.viewport_location   # (x, y) top-left in viewport
+                size = iframe_el.rect.size               # (width, height)
+                if size[0] > 0 and size[1] > 0:
+                    rect = {"x": loc[0], "y": loc[1], "w": size[0], "h": size[1]}
+                    origin = "shadow DOM"
+        except Exception as err:
+            print(f"[Turnstile] shadow DOM 定位失败，尝试 JS 方式: {err}")
+
+    # Strategy 3: JS getBoundingClientRect — works when shadow root is open/accessible
+    if not rect:
+        try:
+            js_rect = page.run_js(
+                """
+const selectors = [
+    '.cf-turnstile iframe',
+    'iframe[src*="challenges.cloudflare.com"]',
+    '#turnstile-wrapper iframe',
+    '#turnstileForm iframe',
+];
+let iframe = null;
+for (const sel of selectors) {
+    iframe = document.querySelector(sel);
+    if (iframe) break;
+}
+if (!iframe) {
+    const inp = document.querySelector('input[name="cf-turnstile-response"]');
+    if (inp && inp.parentElement && inp.parentElement.shadowRoot) {
+        iframe = inp.parentElement.shadowRoot.querySelector('iframe');
+    }
+}
+if (!iframe) return null;
+const r = iframe.getBoundingClientRect();
+if (r.width === 0 || r.height === 0) return null;
+return {x: r.x, y: r.y, w: r.width, h: r.height};
+                """
+            )
+            if js_rect:
+                rect = js_rect
+                origin = "JS"
+        except Exception as err:
+            print(f"[Turnstile] JS 定位也失败: {err}")
+
+    if not rect:
+        return False
+
+    # The checkbox sits near the widget's left edge (~30px in on a 300x65 widget),
+    # vertically centred.  Narrow/compact renderings fall back to the rect centre.
+    offset_x = 30.0 if rect["w"] >= 90 else rect["w"] / 2
+    offset_y = rect["h"] / 2
+    x = rect["x"] + offset_x + random.uniform(-4, 6)
+    y = rect["y"] + offset_y + random.uniform(-4, 4)
+    # Keep the point inside the iframe no matter how the widget rendered.
+    x = max(rect["x"] + 2, min(x, rect["x"] + rect["w"] - 2))
+    y = max(rect["y"] + 2, min(y, rect["y"] + rect["h"] - 2))
+
+    print(
+        f"[Turnstile] {origin}定位到 iframe "
+        f"({rect['x']:.0f}, {rect['y']:.0f}) {rect['w']:.0f}x{rect['h']:.0f}，"
+        f"点击 ({x:.0f}, {y:.0f})"
+    )
+
+    try:
+        # Approach the checkbox before pressing: Turnstile scores the pointer path.
+        _human_mouse_move(page, x, y)
+        time.sleep(random.uniform(0.05, 0.18))
+        page.run_cdp(
+            "Input.dispatchMouseEvent",
+            type="mousePressed", x=x, y=y,
+            button="left", clickCount=1, modifiers=0, buttons=1,
+        )
+        time.sleep(random.uniform(0.05, 0.14))  # human press duration, not 0ms
+        page.run_cdp(
+            "Input.dispatchMouseEvent",
+            type="mouseReleased", x=x, y=y,
+            button="left", clickCount=1, modifiers=0, buttons=0,
+        )
+        return True
+    except Exception as err:
+        print(f"[Turnstile] CDP 点击异常，回退至元素点击: {err}")
+        return False
+
+
+def _get_turnstile_token(
+    page,
+    stop_event=None,
+    *,
+    timeout: float = 240.0,
+    deadline: float | None = None,
+):
+    """Wait for the slow Turnstile widget, click it once it is ready, and read its token.
+
+    Click strategy (tried in order each attempt):
+      1. CDP mouse event via _cdp_click_turnstile — hardware-level, matches what
+         CFTurnstileAutoClick does; the turnstile_patch extension covers the
+         Chromium screenX/screenY bug so Cloudflare sees a realistic event.
+      2. Shadow-DOM element click via _turnstile_checkbox — fallback for
+         environments where run_cdp is unavailable.
+    """
+    deadline = deadline if deadline is not None else time.monotonic() + max(1.0, float(timeout))
+    click_attempts = 0
+    # The iframe can be present before it is ready to receive the first
+    # pointer event. Keep the previous bounded retry behavior so a late mount
+    # does not look like a missing click, while still avoiding an unbounded
+    # click loop.
+    max_click_attempts = 5
+    last_notice = ""
+
+    while time.monotonic() < deadline:
         if stop_event and stop_event.is_set():
             raise RuntimeError("任务已停止")
         try:
-            turnstile_response = page.run_js("try { return turnstile.getResponse() } catch(e) { return null }")
-            if turnstile_response:
-                return turnstile_response
+            token = page.run_js("""
+try {
+    var t = typeof turnstile !== 'undefined' ? turnstile.getResponse() : null;
+    if (t) return t;
+} catch(e) {}
+var inp = document.querySelector('input[name="cf-turnstile-response"]');
+if (inp && inp.value) return inp.value;
+return '';
+""")
+            if token:
+                print(f"[Turnstile] ✓ 获取到 token（长度 {len(str(token))}）")
+                return str(token)
 
-            challenge_solution = page.ele("@name=cf-turnstile-response")
-            challenge_wrapper = challenge_solution.parent()
-            challenge_iframe = challenge_wrapper.shadow_root.ele("tag:iframe")
+            if click_attempts < max_click_attempts:
+                # Prefer CDP hardware click; shadow-DOM element click as fallback
+                cdp_ok = _cdp_click_turnstile(page)
+                if cdp_ok:
+                    print(
+                        f"[Turnstile] ✓ CDP 鼠标事件已发送（第 {click_attempts + 1} 次），"
+                        "等待 Cloudflare 返回验证结果…"
+                    )
+                    click_attempts += 1
+                else:
+                    checkbox = _turnstile_checkbox(page)
+                    if checkbox:
+                        print(
+                            f"[Turnstile] ✓ 控件已加载，使用元素点击 checkbox（第 {click_attempts + 1} 次）"
+                        )
+                        checkbox.click()
+                        click_attempts += 1
+                        print("[Turnstile] 已点击 checkbox，等待 Cloudflare 返回验证结果…")
+                    else:
+                        notice = "[Turnstile] 控件尚未加载，继续等待…"
+                        if notice != last_notice:
+                            print(notice)
+                            last_notice = notice
+            else:
+                notice = "[Turnstile] 已达最大点击次数，等待控件自动完成验证…"
+                if notice != last_notice:
+                    print(notice)
+                    last_notice = notice
+        except Exception as error:
+            if _is_transient_page_error(error):
+                # The caller must reacquire the active tab. Keeping a stale
+                # page object here can wait until the deadline without ever
+                # seeing the response written by the new document.
+                raise
+            print(f"[Turnstile] 等待控件时出现可重试错误: {error}")
 
-            try:
-                challenge_iframe.run_js("""
-window.dtp = 1
-function getRandomInt(min, max) {
-    return Math.floor(Math.random() * (max - min + 1)) + min;
-}
+        time.sleep(1.0)
 
-// 旧方案在 4K 屏下不稳定，这里给出更自然的屏幕坐标。
-let screenX = getRandomInt(800, 1200);
-let screenY = getRandomInt(400, 700);
+    raise RuntimeError("Cloudflare 真人验证超时，未能完成验证")
 
-for (const [name, value] of [['screenX', screenX], ['screenY', screenY]]) {
-    const current = Object.getOwnPropertyDescriptor(MouseEvent.prototype, name);
-    if (!current || current.configurable) {
-        Object.defineProperty(MouseEvent.prototype, name, {
-            configurable: true,
-            get: function () { return value; },
-        });
-    }
-}
-                        """)
-            except Exception:
-                # 坐标增强是可选的，失败时仍应尝试点击已定位的 checkbox。
-                pass
 
-            challenge_iframe_body = challenge_iframe.ele("tag:body").shadow_root
-            challenge_button = challenge_iframe_body.ele("tag:input")
-            challenge_button.click()
+_TURNSTILE_STATE_JS = """
+const challengeInput = document.querySelector('input[name="cf-turnstile-response"]');
+const challengeWidget = document.querySelector(
+    '.cf-turnstile, iframe[src*="challenges.cloudflare.com"]'
+);
+if (!challengeInput && !challengeWidget) return 'absent';
+const value = challengeInput ? String(challengeInput.value || '').trim() : '';
+return value ? 'ready' : 'pending';
+"""
+
+
+def _detect_turnstile_state(page, wait_seconds=0.0, stop_event=None) -> str:
+    """Return 'ready' / 'pending' / 'absent', polling for the late-mounting widget.
+
+    x.ai mounts the challenge a few seconds after the name/password inputs, so a
+    single early probe reports 'absent' for a form that does require verification.
+    Poll until the deadline, and treat a challenge iframe found through the
+    pierced CDP walk as 'pending' even when the light-DOM query misses it — the
+    widget can be nested inside a closed shadow root.
+    """
+    deadline = time.monotonic() + max(0.0, wait_seconds)
+    state = "absent"
+    while True:
+        if stop_event and stop_event.is_set():
+            raise RuntimeError("任务已停止")
+        state = page.run_js(_TURNSTILE_STATE_JS)
+        if state != "absent":
+            return state
+        try:
+            if _turnstile_rect_via_cdp(page):
+                return "pending"
         except Exception:
             pass
-        time.sleep(1)
-    raise Exception("failed to solve turnstile")
+        if time.monotonic() >= deadline:
+            return state
+        time.sleep(0.5)
 
 
 def _build_profile() -> dict[str, str]:
@@ -2046,42 +2454,62 @@ def _build_profile() -> dict[str, str]:
 
 def _fill_profile_and_submit(
     session: DrissionBrowserSession,
-    timeout: int = 180,
+    timeout: int = 300,
     stop_event=None,
     action_handler=None,
 ) -> dict[str, str]:
+    """填写注册资料并提交。
+
+    两阶段状态机：
+      阶段 1 — 填写姓名/密码，成功后设 form_filled=True，不再重填。
+      阶段 2 — 处理 Turnstile 验证，获取 token，提交表单。
+    form_filled=True 之后循环只做 Turnstile + 提交，不再 refresh_page 重填，
+    避免每次循环重填表单导致 token 失效的死循环。
+    """
     profile = _build_profile()
     given_name = profile["given_name"]
     family_name = profile["family_name"]
     password = profile["password"]
 
-    deadline = time.time() + timeout
+    # Use one monotonic deadline for field rendering, challenge rendering,
+    # token propagation, and the final submit. This prevents nested 180s
+    # waits from expiring at different points in the same browser round.
+    deadline = time.monotonic() + max(1.0, float(timeout))
     turnstile_token = ""
+    form_filled = False
 
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         if stop_event and stop_event.is_set():
             raise RuntimeError("任务已停止")
-        page = session.refresh_page()
+
+        try:
+            page = session.refresh_page()
+        except Exception as error:
+            if _is_transient_page_error(error):
+                form_filled = False
+                turnstile_token = ""
+                time.sleep(0.8)
+                continue
+            raise
         if action_handler is not None:
             action_handler(page)
         if _dismiss_cookie_banner(page):
             time.sleep(0.3)
             continue
-        try:
-            filled = page.run_js(
-                """
+
+        # ── 阶段 1：填写表单（form_filled=True 后跳过）──────────────────────
+        if not form_filled:
+            try:
+                filled = page.run_js(
+                    """
 const givenName = arguments[0];
 const familyName = arguments[1];
 const password = arguments[2];
 
 function isVisible(node) {
-    if (!node) {
-        return false;
-    }
+    if (!node) return false;
     const style = window.getComputedStyle(node);
-    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
-        return false;
-    }
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
     const rect = node.getBoundingClientRect();
     return rect.width > 0 && rect.height > 0;
 }
@@ -2093,18 +2521,12 @@ function pickInput(selector) {
 }
 
 function setInputValue(input, value) {
-    if (!input) {
-        return false;
-    }
+    if (!input) return false;
     input.focus();
     input.click();
-
     const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
     const tracker = input._valueTracker;
-    if (tracker) {
-        tracker.setValue('');
-    }
-
+    if (tracker) tracker.setValue('');
     if (nativeSetter) {
         nativeSetter.call(input, '');
         nativeSetter.call(input, value);
@@ -2112,22 +2534,10 @@ function setInputValue(input, value) {
         input.value = '';
         input.value = value;
     }
-
-    input.dispatchEvent(new InputEvent('beforeinput', {
-        bubbles: true,
-        cancelable: true,
-        data: value,
-        inputType: 'insertText',
-    }));
-    input.dispatchEvent(new InputEvent('input', {
-        bubbles: true,
-        cancelable: true,
-        data: value,
-        inputType: 'insertText',
-    }));
+    input.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, cancelable: true, data: value, inputType: 'insertText' }));
+    input.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, data: value, inputType: 'insertText' }));
     input.dispatchEvent(new Event('change', { bubbles: true }));
-    input.dispatchEvent(new Event('blur', { bubbles: true }));
-
+    // 不 dispatch blur：React 受控组件收到 blur 后会重置 password 字段的值
     return String(input.value || '') === String(value || '');
 }
 
@@ -2136,150 +2546,109 @@ const familyInput = pickInput('input[data-testid="familyName"], input[name="fami
 const passwordInput = pickInput('input[data-testid="password"], input[name="password"], input[type="password"]');
 
 if (!givenInput || !familyInput || !passwordInput) {
-    return 'not-ready';
+    return 'not-ready:' + (!givenInput ? 'no-given' : '') + (!familyInput ? 'no-family' : '') + (!passwordInput ? 'no-password' : '');
 }
 
 const givenOk = setInputValue(givenInput, givenName);
 const familyOk = setInputValue(familyInput, familyName);
 const passwordOk = setInputValue(passwordInput, password);
 
-if (!givenOk || !familyOk || !passwordOk) {
-    return 'filled-failed';
-}
+if (!givenOk || !familyOk) return 'filled-failed:given=' + givenOk + ',family=' + familyOk + ',pw=' + passwordOk;
+// 密码字段即使校验失败（React 受控组件问题）也继续，肉眼可见已填上
+return 'filled';
+                    """,
+                    given_name,
+                    family_name,
+                    password,
+                )
+            except Exception as error:
+                if _is_transient_page_error(error):
+                    time.sleep(0.8)
+                    continue
+                raise
 
-return [
-    String(givenInput.value || '').trim() === String(givenName || '').trim(),
-    String(familyInput.value || '').trim() === String(familyName || '').trim(),
-    String(passwordInput.value || '') === String(password || ''),
-].every(Boolean) ? 'filled' : 'verify-failed';
-                """,
-                given_name,
-                family_name,
-                password,
-            )
-        except Exception as error:
-            if _is_transient_page_error(error):
-                time.sleep(0.8)
+            print(f"[Debug] 填写结果: filled={filled!r}")
+            # not-ready 及其带冒号的详细变体（如 not-ready:no-given）都表示页面未就绪
+            if str(filled).startswith('not-ready'):
+                time.sleep(0.5)
                 continue
-            raise
 
-        if filled == 'not-ready':
-            time.sleep(0.5)
-            continue
+            # filled / filled-failed:... 都表示找到了输入框并完成写入
+            # 无论密码校验是否通过（React 受控组件问题），都继续进入 Turnstile 检测
+            print(f"[*] 表单已填写（{filled}）：{given_name} {family_name}")
+            form_filled = True
 
-        if filled != 'filled':
-            print(f"[Debug] 最终注册页输入框已出现，但姓名/密码写入失败: {filled}")
-            time.sleep(0.5)
-            continue
-
-        page = session.refresh_page()
+        # ── 阶段 2：Turnstile 验证 ──────────────────────────────────────────
         try:
-            values_ok = page.run_js(
-                """
-const expectedGiven = arguments[0];
-const expectedFamily = arguments[1];
-const expectedPassword = arguments[2];
-
-function isVisible(node) {
-    if (!node) {
-        return false;
-    }
-    const style = window.getComputedStyle(node);
-    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
-        return false;
-    }
-    const rect = node.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
-}
-
-function pickInput(selector) {
-    return Array.from(document.querySelectorAll(selector)).find((node) => {
-        return isVisible(node) && !node.disabled && !node.readOnly;
-    }) || null;
-}
-
-const givenInput = pickInput('input[data-testid="givenName"], input[name="givenName"], input[autocomplete="given-name"]');
-const familyInput = pickInput('input[data-testid="familyName"], input[name="familyName"], input[autocomplete="family-name"]');
-const passwordInput = pickInput('input[data-testid="password"], input[name="password"], input[type="password"]');
-
-if (!givenInput || !familyInput || !passwordInput) {
-    return false;
-}
-
-return String(givenInput.value || '').trim() === String(expectedGiven || '').trim()
-    && String(familyInput.value || '').trim() === String(expectedFamily || '').trim()
-    && String(passwordInput.value || '') === String(expectedPassword || '');
-                """,
-                given_name,
-                family_name,
-                password,
+            # 控件比输入框晚几秒挂载，首轮多等一会儿再判定 absent
+            turnstile_state = _detect_turnstile_state(
+                page,
+                wait_seconds=min(8.0, max(0.0, deadline - time.monotonic()))
+                if not turnstile_token
+                else 0.0,
+                stop_event=stop_event,
             )
         except Exception as error:
             if _is_transient_page_error(error):
-                time.sleep(0.8)
-                continue
-            raise
-        if not values_ok:
-            print("[Debug] 最终注册页字段值校验失败，继续重试填写。")
-            time.sleep(0.5)
-            continue
-
-        page = session.refresh_page()
-        try:
-            turnstile_state = page.run_js(
-                """
-const challengeInput = document.querySelector('input[name="cf-turnstile-response"]');
-if (!challengeInput) {
-    return 'not-found';
-}
-const value = String(challengeInput.value || '').trim();
-return value ? 'ready' : 'pending';
-                """
-            )
-        except Exception as error:
-            if _is_transient_page_error(error):
+                form_filled = False
+                turnstile_token = ""
                 time.sleep(0.8)
                 continue
             raise
 
-        if turnstile_state == "pending" and not turnstile_token:
-            print("[*] 检测到最终注册页存在 Turnstile，开始使用现有真人化点击逻辑。")
-            turnstile_token = _get_turnstile_token(page, stop_event=stop_event)
+        if turnstile_state == "absent":
+            print("[Turnstile] 页面无 Turnstile 元素，直接提交。")
+        elif turnstile_state == "ready":
+            print("[Turnstile] token 已就绪，直接提交。")
+        elif turnstile_state == "pending" and not turnstile_token:
+            print("[Turnstile] 检测到「请验证您是真人」，开始自动点击……")
+            try:
+                turnstile_token = _get_turnstile_token(
+                    page,
+                    stop_event=stop_event,
+                    deadline=deadline,
+                )
+            except Exception as error:
+                if _is_transient_page_error(error):
+                    print("[Turnstile] 当前页面已切换，重新读取验证状态。")
+                    form_filled = False
+                    turnstile_token = ""
+                    time.sleep(0.8)
+                    continue
+                raise
             if turnstile_token:
-                page = session.refresh_page()
+                print(f"[Turnstile] ✓ 获取到 token（长度 {len(turnstile_token)}），保留当前页面状态。")
                 try:
                     synced = page.run_js(
                         """
-const token = arguments[0];
 const challengeInput = document.querySelector('input[name="cf-turnstile-response"]');
-if (!challengeInput) {
-    return false;
-}
-const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
-if (nativeSetter) {
-    nativeSetter.call(challengeInput, token);
-} else {
-    challengeInput.value = token;
-}
-challengeInput.dispatchEvent(new Event('input', { bubbles: true }));
-challengeInput.dispatchEvent(new Event('change', { bubbles: true }));
-return String(challengeInput.value || '').trim() === String(token || '').trim();
+if (!challengeInput) return true;
+return Boolean(String(challengeInput.value || '').trim());
                         """,
-                        turnstile_token,
                     )
                 except Exception as error:
                     if _is_transient_page_error(error):
+                        form_filled = False
+                        turnstile_token = ""
                         time.sleep(0.8)
                         continue
                     raise
                 if synced:
-                    print("[*] Turnstile 响应已同步到最终注册表单。")
+                    print("[Turnstile] ✓ token 已由控件写入，准备提交。")
+                else:
+                    print("[Turnstile] ✗ token 写入失败，下一轮重试。")
+                    turnstile_token = ""
+                    time.sleep(0.5)
+                    continue
+            else:
+                print("[Turnstile] ✗ 未能获取 token，下一轮重试。")
+                time.sleep(0.5)
+                continue
+        elif turnstile_state == "pending" and turnstile_token:
+            print(f"[Turnstile] 已持有 token（长度 {len(turnstile_token)}），直接提交。")
 
-        time.sleep(1.2)
-
-        page = session.refresh_page()
-        if action_handler is not None:
-            action_handler(page)
+        # ── 阶段 3：点击「完成注册」提交 ────────────────────────────────────
+        time.sleep(0.5)
         if _dismiss_cookie_banner(page):
             time.sleep(0.3)
             continue
@@ -2315,12 +2684,14 @@ return true;
             )
         except Exception as error:
             if _is_transient_page_error(error):
+                form_filled = False
+                turnstile_token = ""
                 time.sleep(0.8)
                 continue
             raise
 
         if clicked:
-            print(f"[*] 已填写注册资料并点击完成注册: {given_name} {family_name}")
+            print(f"[*] 已点击完成注册：{given_name} {family_name}")
             return profile
 
         time.sleep(0.5)

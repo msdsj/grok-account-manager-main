@@ -23,7 +23,11 @@ PROXY_POOL_FILE_ENV = "GROK_ACCOUNT_MANAGER_PROXY_FILE"
 DEFAULT_MAX_CONCURRENCY = 20
 DEFAULT_MAX_OAUTH_CONCURRENCY = 2
 DEFAULT_OAUTH_ACCESS_DENIED_CIRCUIT_THRESHOLD = 2
-REGISTRATION_ROUND_TIMEOUT_SECONDS = 300
+# Registration can spend several minutes waiting for a late-mounted human
+# verification widget before the SSO cookie and post-registration checks run.
+# Keep the job-level deadline longer than the provider's profile-stage wait so
+# a successful submit still has time to finish the redirect.
+REGISTRATION_ROUND_TIMEOUT_SECONDS = 600
 OAUTH_ROUND_TIMEOUT_SECONDS = 1200
 
 # 同一个 worker 完成一轮注册、重启浏览器之后，到抢下一轮之前的随机等待区间（秒）。

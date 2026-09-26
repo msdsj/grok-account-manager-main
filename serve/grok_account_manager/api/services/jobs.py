@@ -1473,21 +1473,13 @@ class RegistrationJobManager:
                 )
                 provider.event_callback = self._provider_event_callback(worker_index, round_index)
                 try:
-                    # Each top-level round claims an endpoint before the first
-                    # page request. Later rounds restart the browser with a
-                    # fresh profile and proxy.
-                    if not is_first_round and session is not None:
-                        if self._proxy_pool is not None or get_fixed_egress_proxy():
-                            current_proxy = self._acquire_proxy(worker_index, round_index)
-                            session.restart(proxy_server=current_proxy)
-                        else:
-                            session.restart()
-                        self._event(
-                            "info",
-                            f"Worker {worker_index} 已切换到本轮独立浏览器{_fingerprint_summary(session)}",
-                            worker=worker_index,
-                            round=round_index,
-                        )
+                    # Each top-level round gets a fresh browser process and
+                    # profile. The previous round releases its browser in the
+                    # round-finally block below as soon as its result is known.
+                    # This lets the first completed worker claim the next
+                    # mailbox without waiting for other workers.
+                    if not is_first_round:
+                        current_proxy = None
                     if session is None:
                         if (
                             self._proxy_pool is not None or get_fixed_egress_proxy()
@@ -1811,11 +1803,24 @@ class RegistrationJobManager:
                         )
                         traceback.print_exc()
                 finally:
-                    # A failed fresh-browser launch consumed its endpoint, so
-                    # the next round must claim a new one rather than carrying
-                    # the stale value forward.
-                    if session is None:
-                        current_proxy = None
+                    # A browser belongs to exactly one registration round.
+                    # Closing it here releases the profile, tab and process as
+                    # soon as this round completes, including after a
+                    # successful refresh_token exchange. The next round will
+                    # start a new isolated browser only after claiming work.
+                    if session is not None:
+                        try:
+                            session.stop()
+                        except Exception as error:
+                            self._event(
+                                "warning",
+                                f"Worker {worker_index} 关闭第 {round_index} 轮浏览器失败：{error}",
+                                worker=worker_index,
+                                round=round_index,
+                            )
+                        self._unregister_session(session)
+                        session = None
+                    current_proxy = None
                     self._round_finished(ok, cancelled=cancelled)
                     if self._stop_event.is_set():
                         break
@@ -1823,19 +1828,9 @@ class RegistrationJobManager:
                         has_more = self._job is not None and self._job["issued"] < self._job["total"]
                     if not has_more:
                         break
-                    try:
-                        if session is None:
-                            continue
-                        self._pace_before_next_round(worker_index)
-                    except Exception as error:
-                        self._event("warning", f"Worker {worker_index} 浏览器重启失败：{error}", worker=worker_index)
-                        try:
-                            session.stop()
-                        except Exception:
-                            pass
-                        self._unregister_session(session)
-                        session = None
-                        current_proxy = None
+                    # The next loop iteration claims the next round and starts
+                    # its browser immediately. No timer is used to decide
+                    # whether registration or OAuth succeeded.
         finally:
             if session is not None:
                 try:
