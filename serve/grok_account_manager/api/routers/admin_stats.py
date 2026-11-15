@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Request
 
 from ...gateway import catalog
+from ...gateway.pool import normalize_provider
 from ...core import database as db
 
 router = APIRouter(tags=["admin-stats"])
@@ -112,6 +113,54 @@ def dashboard(request: Request, period: str = "24h", timezone: str = "") -> dict
         cursor += bucket_ms
 
     failed_total = max(0, requests_total - success_total)
+    test_results = db.list_account_test_results()
+    job_runs = db.list_job_runs(limit=50).get("items") or []
+    account_pools: list[dict] = []
+    for provider in ("grok", "kiro", "chatgpt"):
+        pool = [account for account in accounts if normalize_provider(str(account.get("provider") or "")) == provider]
+        pool_keys = [str(account.get("exportKey") or "") for account in pool]
+        weekly_used = 0
+        weekly_total = 0
+        quota_accounts = 0
+        for account in pool:
+            quota = account.get("quota") or {}
+            used = quota.get("weeklyUsed")
+            total_value = quota.get("weeklyTotal")
+            if isinstance(used, (int, float)) and isinstance(total_value, (int, float)):
+                weekly_used += int(used)
+                weekly_total += int(total_value)
+                quota_accounts += 1
+        last_run = next(
+            (run for run in job_runs if normalize_provider(str(run.get("provider") or "")) == provider),
+            None,
+        )
+        account_pools.append(
+            {
+                "provider": provider,
+                "total": len(pool),
+                "active": sum(
+                    1 for account in pool if account.get("hasAccessToken") or account.get("hasRefreshToken")
+                ),
+                "chatAvailable": sum(
+                    1
+                    for key in pool_keys
+                    if (test_results.get(key) or {}).get("chatAvailable")
+                    or (test_results.get(key) or {}).get("baseAvailable")
+                ),
+                "imageAvailable": sum(
+                    1 for key in pool_keys if (test_results.get(key) or {}).get("imageAvailable")
+                ),
+                "videoAvailable": sum(
+                    1 for key in pool_keys if (test_results.get(key) or {}).get("videoAvailable")
+                ),
+                "quotaAccounts": quota_accounts,
+                "weeklyUsed": weekly_used,
+                "weeklyTotal": weekly_total,
+                "lastJobStatus": str((last_run or {}).get("status") or ""),
+                "lastJobAt": int((last_run or {}).get("startedAt") or 0),
+                "running": str((last_run or {}).get("status") or "") in {"running", "stopping"},
+            }
+        )
     return {
         "data": {
             "period": period if period in _PERIODS else "24h",
@@ -160,5 +209,6 @@ def dashboard(request: Request, period: str = "24h", timezone: str = "") -> dict
                 reverse=True,
             )[:8],
             "providers": sorted(provider_rows.values(), key=lambda item: item["requests"], reverse=True),
+            "accountPools": account_pools,
         }
     }

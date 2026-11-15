@@ -42,8 +42,14 @@ if [ "$ok" != "1" ]; then
   exit 1
 fi
 
+auth_args=()
+default_key=$(curl -s http://127.0.0.1:43999/api/gateway/keys/default | sed -n 's/.*"key":"\([^"]*\)".*/\1/p')
+if [ -n "$default_key" ]; then
+  auth_args=(-H "Authorization: Bearer $default_key")
+fi
+
 for path in /healthz /readyz /v1/models /api/gateway/models /api/admin/v1/dashboard; do
-  code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:43999$path")
+  code=$(curl -s -o /dev/null -w '%{http_code}' "${auth_args[@]}" "http://127.0.0.1:43999$path")
   printf '  %-32s %s\n' "$path" "$code"
   if [ "$code" != "200" ]; then
     printf '%s\n' "错误：$path 返回 $code。" >&2

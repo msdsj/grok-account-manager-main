@@ -61,18 +61,16 @@ function statusTone(status?: JobStatus): "default" | "secondary" | "destructive"
 export function RegisterTaskPage() {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
-  const [provider, setProvider] = useState<"grok" | "chatgpt">("grok");
+  const [provider, setProvider] = useState<"grok" | "chatgpt" | "kiro">("grok");
   const [total, setTotal] = useState(1);
   const [concurrency, setConcurrency] = useState(1);
   const [emailSource, setEmailSource] = useState<EmailSource>("duckmail");
-  // Registration and OAuth are separate phases. Keep RT exchange opt-in so a
-  // successful account registration is not immediately sent into device auth.
-  const [oauthExchange, setOauthExchange] = useState(false);
+  // 注册成功后自动尝试换取 refresh_token。
+  const [oauthExchange] = useState(true);
   const [autoImportSub2Api, setAutoImportSub2Api] = useState(false);
   const [minimizeBrowsers, setMinimizeBrowsers] = useState(true);
-  // Undefined keeps the backend's automatic discovery behavior: use the
-  // default file or saved nodes when present, otherwise stay on direct mode.
-  const [proxyPoolEnabled, setProxyPoolEnabled] = useState<boolean | undefined>(undefined);
+  // 注册代理池默认关闭，需要用户主动开启。
+  const [proxyPoolEnabled, setProxyPoolEnabled] = useState(false);
   const [proxyFile, setProxyFile] = useState("");
   const [proxyDialogOpen, setProxyDialogOpen] = useState(false);
   const [proxyData, setProxyData] = useState("");
@@ -157,8 +155,8 @@ export function RegisterTaskPage() {
         total,
         concurrency,
         oauthExchange,
-        autoImportSub2Api,
-        minimizeBrowsers,
+        autoImportSub2Api: provider === "grok" ? autoImportSub2Api : false,
+        minimizeBrowsers: provider === "grok" ? minimizeBrowsers : false,
         emailSource,
         outlookData: emailSource === "outlook" ? outlookData : "",
         googleData: emailSource === "google" ? googleData : "",
@@ -279,6 +277,7 @@ export function RegisterTaskPage() {
 
   const job = jobQuery.data ?? null;
   const running = job?.status === "running" || job?.status === "stopping";
+  const availableEmailSources = provider === "kiro" ? (["google"] as EmailSource[]) : EMAIL_SOURCES;
   const events = job?.events?.slice().reverse().slice(0, 50) ?? [];
   const outlookAccountCount = countOutlookAccounts(outlookData);
   const googleAccountCount = countGoogleAccounts(googleData);
@@ -301,7 +300,8 @@ export function RegisterTaskPage() {
     || (emailSource === "outlook" && outlookAccountCount === 0)
     || (emailSource === "google" && googleAccountCount === 0)
     || (emailSource === "duckmail" && !duckMailReady)
-    || (emailSource === "cloud_mail" && !cloudMailReady);
+    || (emailSource === "cloud_mail" && !cloudMailReady)
+    || (provider === "kiro" && emailSource !== "google");
 
   return (
     <div className="space-y-5">
@@ -311,22 +311,34 @@ export function RegisterTaskPage() {
         <Label htmlFor="reg-provider">{t("registerTask.providerLabel")}</Label>
         <Select
           value={provider}
-          onValueChange={(value) => setProvider(value as "grok" | "chatgpt")}
+          onValueChange={(value) => {
+            const next = value as "grok" | "chatgpt" | "kiro";
+            setProvider(next);
+            if (next === "kiro") {
+              setEmailSource("google");
+            }
+            if (next !== "grok") {
+              setAutoImportSub2Api(false);
+            }
+          }}
           disabled={running}
         >
           <SelectTrigger id="reg-provider" className="w-full"><SelectValue /></SelectTrigger>
           <SelectContent>
             <SelectItem value="grok">Grok (X.com)</SelectItem>
-            <SelectItem value="chatgpt">ChatGPT (OpenAI)</SelectItem>
+            <SelectItem value="kiro">Kiro (AWS)</SelectItem>
+            <SelectItem value="chatgpt">GPT (OpenAI)</SelectItem>
           </SelectContent>
         </Select>
       </div>
 
-      {provider === "chatgpt" ? (
-        <p className="max-w-sm text-xs text-muted-foreground">
-          {t("registerTask.chatgptHelp")}
-        </p>
-      ) : null}
+      <p className="max-w-2xl text-xs leading-5 text-muted-foreground">
+        {provider === "grok"
+          ? t("registerTask.grokHelp")
+          : provider === "kiro"
+            ? t("registerTask.kiroHelp")
+            : t("registerTask.chatgptHelp")}
+      </p>
 
       <div className="grid gap-4 lg:grid-cols-2">
         <DashboardPanel id="register-form" title={t("registerTask.title")}>
@@ -361,9 +373,9 @@ export function RegisterTaskPage() {
             <div className="space-y-1.5">
               <Label>{t("registerTask.emailSourceLabel")}</Label>
               <Select value={emailSource} onValueChange={(value) => setEmailSource(value as EmailSource)} disabled={running}>
-                <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                <SelectTrigger id="reg-email-source" className="w-full"><SelectValue /></SelectTrigger>
                 <SelectContent>
-                  {EMAIL_SOURCES.map((source) => (
+                  {availableEmailSources.map((source) => (
                     <SelectItem key={source} value={source}>{t(EMAIL_SOURCE_I18N_KEY[source])}</SelectItem>
                   ))}
                 </SelectContent>
@@ -566,58 +578,60 @@ export function RegisterTaskPage() {
                 </div>
               </div>
             ) : null}
-            <div className="space-y-1.5">
-              <div className="flex items-center justify-between">
-                <Label htmlFor="reg-proxy-pool">{t("registerTask.proxyPoolLabel")}</Label>
-                <Switch
-                  id="reg-proxy-pool"
-                  checked={proxyPoolEnabled !== false}
-                  disabled={running}
-                  onCheckedChange={(checked) => setProxyPoolEnabled(checked)}
-                />
+            {provider === "grok" ? (
+              <>
+                <div className="space-y-1.5">
+                  <div className="flex items-center justify-between">
+                    <Label htmlFor="reg-proxy-pool">{t("registerTask.proxyPoolLabel")}</Label>
+                    <Switch
+                      id="reg-proxy-pool"
+                      checked={proxyPoolEnabled}
+                      disabled={running}
+                      onCheckedChange={setProxyPoolEnabled}
+                    />
+                  </div>
+                  <Input
+                    id="reg-proxy-file"
+                    value={proxyFile}
+                    disabled={running || !proxyPoolEnabled}
+                    placeholder={t("registerTask.proxyFilePlaceholder")}
+                    onChange={(event) => setProxyFile(event.target.value)}
+                  />
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <p className="text-xs text-muted-foreground">
+                      {t("registerTask.proxyPoolHelp")}
+                      {proxyPoolQuery.data ? ` ${t("registerTask.proxySavedCount", { count: proxyPoolQuery.data.count })}` : ""}
+                    </p>
+                    <Button type="button" size="sm" variant="secondary" disabled={running || !proxyPoolEnabled} onClick={openProxyDialog}>
+                      <Upload />{t("registerTask.manageProxyPool")}
+                    </Button>
+                  </div>
+                </div>
+                <div className="flex items-center justify-between">
+                  <Label htmlFor="reg-sub2api">{t("registerTask.autoImportSub2ApiLabel")}</Label>
+                  <Switch
+                    id="reg-sub2api"
+                    checked={autoImportSub2Api}
+                    disabled={running}
+                    onCheckedChange={setAutoImportSub2Api}
+                  />
+                </div>
+                <div className="flex items-center justify-between">
+                  <Label htmlFor="reg-minimize">{t("registerTask.minimizeBrowsersLabel")}</Label>
+                  <Switch id="reg-minimize" checked={minimizeBrowsers} disabled={running} onCheckedChange={setMinimizeBrowsers} />
+                </div>
+              </>
+            ) : null}
+            {provider !== "chatgpt" ? (
+              <div className="rounded-lg border border-border/70 bg-secondary/30 px-3 py-2.5 text-xs leading-5 text-muted-foreground">
+                {t("registerTask.autoOauthNotice")}
               </div>
-              <Input
-                id="reg-proxy-file"
-                value={proxyFile}
-                disabled={running || proxyPoolEnabled === false}
-                placeholder={t("registerTask.proxyFilePlaceholder")}
-                onChange={(event) => setProxyFile(event.target.value)}
-              />
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <p className="text-xs text-muted-foreground">
-                  {t("registerTask.proxyPoolHelp")}
-                  {proxyPoolQuery.data ? ` ${t("registerTask.proxySavedCount", { count: proxyPoolQuery.data.count })}` : ""}
-                </p>
-                <Button type="button" size="sm" variant="secondary" disabled={running} onClick={openProxyDialog}>
-                  <Upload />{t("registerTask.manageProxyPool")}
-                </Button>
+            ) : null}
+            {provider === "kiro" ? (
+              <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 px-3 py-2.5 text-xs leading-5 text-amber-700 dark:text-amber-300">
+                {t("registerTask.kiroEmailOnlyNotice")}
               </div>
-            </div>
-            <div className="flex items-center justify-between">
-              <Label htmlFor="reg-oauth">{t("registerTask.oauthExchangeLabel")}</Label>
-              <Switch
-                id="reg-oauth"
-                checked={oauthExchange}
-                disabled={running}
-                onCheckedChange={(checked) => {
-                  setOauthExchange(checked);
-                  if (!checked) setAutoImportSub2Api(false);
-                }}
-              />
-            </div>
-            <div className="flex items-center justify-between">
-              <Label htmlFor="reg-sub2api">{t("registerTask.autoImportSub2ApiLabel")}</Label>
-              <Switch
-                id="reg-sub2api"
-                checked={autoImportSub2Api}
-                disabled={running || !oauthExchange}
-                onCheckedChange={setAutoImportSub2Api}
-              />
-            </div>
-            <div className="flex items-center justify-between">
-              <Label htmlFor="reg-minimize">{t("registerTask.minimizeBrowsersLabel")}</Label>
-              <Switch id="reg-minimize" checked={minimizeBrowsers} disabled={running} onCheckedChange={setMinimizeBrowsers} />
-            </div>
+            ) : null}
             <div className="flex flex-wrap gap-2 pt-1">
               <Button size="sm" disabled={startDisabled} onClick={() => startMutation.mutate()}>
                 <Play />{t("registerTask.start")}

@@ -28,6 +28,8 @@ from ..base import RegistrationResult
 # Google 第三方登录的分步处理器，与 grok 共用同一份实现，
 # 避免每个 provider 各写一套 Google 页面选择器。
 from ..grok.registration import _handle_google_login_step
+from . import humanize
+from .gateway.upstream import stable_device_id, stable_session_id
 from .utils import (
     SentinelTokenGenerator,
     generate_datadog_trace_headers,
@@ -146,6 +148,7 @@ class ChatGPTProvider:
         try:
             _wait_and_click_signup_button(
                 session,
+                timeout=self._signup_button_timeout(),
                 stop_event=self.stop_event,
                 action_handler=self._handle_browser_overlay_action,
             )
@@ -203,6 +206,7 @@ class ChatGPTProvider:
                 email = _fill_email_and_continue(
                     session,
                     mailbox.email,
+                    timeout=self._scaled_timeout(30),
                     stop_event=self.stop_event,
                     action_handler=self._handle_browser_overlay_action,
                 )
@@ -222,6 +226,7 @@ class ChatGPTProvider:
                     email,
                     mailbox,
                     self.stop_event,
+                    timeout=self._scaled_timeout(180),
                     action_handler=self._handle_browser_overlay_action,
                 )
                 self._log("success", f"验证码 {code} 已验证，准备设置密码")
@@ -236,6 +241,7 @@ class ChatGPTProvider:
         try:
             _fill_name_and_age(
                 session,
+                timeout=self._scaled_timeout(60),
                 stop_event=self.stop_event,
                 action_handler=self._handle_browser_overlay_action,
             )
@@ -280,17 +286,32 @@ class ChatGPTProvider:
 
             self._log("success", f"成功获取完整会话信息")
 
-            # 从 session_data 中提取 session token（如果有的话）
-            session_token = None
+            # 从完整 session 中提取 AT/RT；浏览器 cookie 由 _fetch_session_data 一并保存。
+            session_token = ""
+            access_token = ""
+            refresh_token = ""
+            id_token = ""
             if session_data and isinstance(session_data, dict):
-                # 尝试从多个可能的字段提取 token
-                session_token = (
-                    session_data.get("accessToken") or
-                    session_data.get("session_token") or
-                    session_data.get("token") or
-                    ""
-                )
-                print(f"[DEBUG] 提取到的 session_token 长度: {len(session_token) if session_token else 0}")
+                access_token = str(
+                    session_data.get("access_token")
+                    or session_data.get("accessToken")
+                    or session_data.get("auth0AccessToken")
+                    or ""
+                ).strip()
+                refresh_token = str(
+                    session_data.get("refresh_token")
+                    or session_data.get("refreshToken")
+                    or ""
+                ).strip()
+                id_token = str(session_data.get("id_token") or session_data.get("idToken") or "").strip()
+                session_token = str(
+                    session_data.get("session_token")
+                    or session_data.get("sessionToken")
+                    or session_data.get("token")
+                    or session_data.get("session_cookie")
+                    or ""
+                ).strip()
+                print(f"[DEBUG] 提取到 AT 长度: {len(access_token)}，RT 长度: {len(refresh_token)}，Session 长度: {len(session_token)}")
         except Exception as e:
             print(f"[ERROR] 获取会话信息异常: {e}")
             import traceback
@@ -304,16 +325,82 @@ class ChatGPTProvider:
         print(f"[DEBUG] session_token: {session_token[:20] if session_token else 'None'}...")
         print(f"[DEBUG] session_data 类型: {type(session_data)}")
 
+        session_data = session_data if isinstance(session_data, dict) else {}
+        cookies = session_data.get("cookies") if isinstance(session_data.get("cookies"), list) else []
+        cookie_header = str(session_data.get("cookie") or "").strip()
+        session_token = session_token or str(session_data.get("session_cookie") or "").strip()
+        access_token = access_token or str(session_data.get("access_token") or session_data.get("accessToken") or "").strip()
+        refresh_token = refresh_token or str(session_data.get("refresh_token") or session_data.get("refreshToken") or "").strip()
+        id_token = id_token or str(session_data.get("id_token") or session_data.get("idToken") or "").strip()
+
+        # 采集本轮浏览器的身份快照（UA / Client Hints / 语言 / 屏幕 / 设备 id）。
+        # 账号是这台浏览器注册的，后续网关侧续用这个账号时必须复述同一套特征，
+        # 否则服务端看到的是「注册用 Chrome、使用用别的客户端」，账号会被回收。
+        identity: dict[str, Any] = {}
+        try:
+            identity = session.capture_identity() or {}
+        except Exception as error:
+            self._log("warning", f"采集浏览器身份快照失败，将使用保守默认值: {error}")
+            identity = {}
+        if identity:
+            self._log(
+                "info",
+                "已记录浏览器身份: "
+                f"UA={identity.get('user_agent', '')[:60]} / "
+                f"平台={identity.get('sec_ch_ua_platform', '')} / "
+                f"语言={identity.get('accept_language', '')}",
+            )
+
+        full_credential: dict[str, Any] = {
+            "email": email,
+            "provider": "chatgpt",
+            "access_token": access_token,
+            "accessToken": access_token,
+            "refresh_token": refresh_token,
+            "refreshToken": refresh_token,
+            "id_token": id_token,
+            "session": session_token,
+            "session_token": session_token,
+            "cookie": cookie_header,
+            "cookies": cookies,
+            "session_data": session_data,
+            "auth_raw": session_data,
+            # —— 浏览器身份：注册环境与使用环境必须同源 ——
+            "browser_identity": identity,
+            "user_agent": str(identity.get("user_agent") or ""),
+            "client_version": str(identity.get("client_version") or ""),
+            "client_build_number": str(identity.get("client_build_number") or ""),
+        }
+        # 设备标识必须是账号级稳定值：优先用浏览器自己下发的 oai-did，
+        # 没有就从账号信息派生一个固定值，绝不能每次请求都换。
+        full_credential["oai_device_id"] = stable_device_id(full_credential)
+        full_credential["oai_session_id"] = stable_session_id(full_credential)
+        if not refresh_token:
+            token_bundle = session_data.get("tokens") or session_data.get("oauth") or {}
+            if isinstance(token_bundle, dict):
+                refresh_token = str(token_bundle.get("refresh_token") or token_bundle.get("refreshToken") or "").strip()
+                access_token = access_token or str(token_bundle.get("access_token") or token_bundle.get("accessToken") or "").strip()
+                id_token = id_token or str(token_bundle.get("id_token") or token_bundle.get("idToken") or "").strip()
+            full_credential["refresh_token"] = refresh_token
+            full_credential["refreshToken"] = refresh_token
+            full_credential["access_token"] = access_token
+            full_credential["accessToken"] = access_token
+            full_credential["id_token"] = id_token
+        expires_at = session_data.get("expires_at") or session_data.get("expiresAt")
+        if expires_at not in (None, ""):
+            full_credential["expires_at"] = expires_at
         result: RegistrationResult = {
             "email": email,
-            "credential": session_token or "pending",
+            "credential": access_token or session_token or "pending",
+            "full_credential": full_credential,
             "profile": {
                 "email": email,
-                "password": None,  # OpenAI 新流程不需要密码
+                "password": None,
                 "auth_provider": "email",
-                "session_data": session_data,  # 保存完整的 session 数据
+                "session_data": session_data,
             },
-            "oauth_status": "ready",  # 标记为 ready，因为已经获取到完整 session 数据
+            "oauth_status": "ready" if refresh_token else "partial",
+            "oauth_error": "" if refresh_token else "注册流程未返回 refresh_token；已保留完整 session、Cookie 和 access_token",
         }
 
         print(f"[DEBUG] result 对象已构建，包含字段: {list(result.keys())}")
@@ -333,6 +420,26 @@ class ChatGPTProvider:
             if self.stop_event and self.stop_event.is_set():
                 raise RuntimeError("任务已停止")
             time.sleep(min(0.2, max(0.0, deadline - time.monotonic())))
+
+    def _signup_button_timeout(self) -> int:
+        """按并发数放大「等注册按钮」的超时时间。
+
+        并发多开时每个 Chrome 都要抢 CPU 和带宽：chatgpt.com 的首屏加载和
+        前端 hydration 都会明显变慢。固定 60 秒在 5~10 并发时不够用，表现为
+        「卡在打开注册页」直到整轮超时。
+        """
+        workers = max(1, int(getattr(self, "window_count", 1) or 1))
+        return min(180, 60 + 15 * (workers - 1))
+
+    def _scaled_timeout(self, base_seconds: int) -> int:
+        """按并发数放大任意步骤的超时时间。
+
+        并发 1 个时保持原值；并发越高，每个 Chrome 分到的 CPU 和带宽越少，
+        页面响应越慢，超时需要相应放宽（最多放大到 3 倍）。
+        """
+        workers = max(1, int(getattr(self, "window_count", 1) or 1))
+        factor = min(3.0, 1.0 + 0.15 * (workers - 1))
+        return max(1, int(base_seconds * factor))
 
     def _set_stage(self, stage: str, message: str | None = None) -> None:
         """设置当前阶段"""
@@ -508,28 +615,27 @@ def _is_transient_page_error(error: Exception) -> bool:
     )
 
 
-def _wait_and_click_signup_button(
-    session: DrissionBrowserSession,
-    timeout=60,
-    stop_event=None,
-    action_handler=None,
-):
-    """等待并点击注册按钮和 Continue with email 按钮。
+def _run_js_expr(page, script: str, *args) -> Any:
+    """执行一个 IIFE 形式的脚本并返回它的值。
 
-    并发多开时页面加载更慢，这里把超时放宽到 60 秒；点击也改成更稳健的实现
-    （见下方 JS 注释），避免点到外层容器或页面还没稳定就点空。
+    DrissionPage 默认会把脚本包进 ``function(){ ... }`` 再求值，IIFE 的返回值
+    会因此被丢掉（外层没有 return）。这里显式用 ``as_expr=True`` 按表达式求值，
+    拿到真正的返回值。
     """
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if stop_event and stop_event.is_set():
-            raise RuntimeError("任务已停止")
+    if args:
+        script = script % args
+    return page.run_js(script, as_expr=True)
 
-        page = session.refresh_page()
-        if action_handler is not None:
-            action_handler(page)
 
-        try:
-            state = page.run_js(r"""
+# 「找到注册按钮并点击」的完整脚本。
+#
+# 查找与点击在同一次 run_js 里完成——并发下页面随时可能跳转，把两件事拆开
+# 就会出现「标记还在、元素已销毁、点击永远发不出去」的情况。
+#
+# __HUMAN_CLICK__ 由调用方替换成 humanize.CLICK_TARGET_JS；
+# __FORCE__ 替换成 true/false：连等几次页面都还没接管元素时，强制点一次。
+_SIGNUP_CLICK_SCRIPT = r"""
+(function () {
 function isVisible(node) {
     if (!node) return false;
     const style = window.getComputedStyle(node);
@@ -570,35 +676,73 @@ function pick(nodes, needles) {
     return matched[0].node;
 }
 
-// 用完整的指针事件序列点击，比裸 .click() 更接近真实用户操作，
-// 能触发那些监听 mousedown / pointerdown 的下拉与弹层组件。
-function robustClick(node) {
-    if (!node) return false;
-    try { node.scrollIntoView({ block: 'center', inline: 'center' }); } catch (error) {}
-    let x = 0;
-    let y = 0;
+// React 在 hydration 完成之前渲染出来的是纯静态 HTML：DOM 里有按钮，
+// 但没有挂事件处理器，点击是空操作。React 接管后会在元素上挂
+// __reactProps$ / __reactFiber$ 之类的键，用它判断最直接。
+//
+// ⚠️ 只有在**确认这是 React 页面**时才用这个门槛：addEventListener 注册的
+// 监听器从 JS 侧看不出来，如果对非 React 页面也用这个判断，会把正常按钮
+// 误判成「还没接管」而白白等待。
+function isReactPage() {
     try {
-        const rect = node.getBoundingClientRect();
-        x = rect.left + rect.width / 2;
-        y = rect.top + rect.height / 2;
+        const roots = [
+            document.getElementById('__next'),
+            document.body,
+            document.documentElement,
+        ];
+        for (const root of roots) {
+            if (!root) continue;
+            for (const key in root) {
+                if (key.indexOf('__reactContainer$') === 0 || key.indexOf('__reactFiber$') === 0) {
+                    return true;
+                }
+            }
+        }
     } catch (error) {}
-    const options = {
-        bubbles: true, cancelable: true, composed: true, view: window,
-        clientX: x, clientY: y, button: 0,
-    };
-    const fire = (type, ctor) => {
-        try { node.dispatchEvent(new ctor(type, options)); } catch (error) {}
-    };
-    fire('pointerdown', window.PointerEvent || window.MouseEvent);
-    fire('mousedown', window.MouseEvent);
-    try { node.focus({ preventScroll: true }); } catch (error) {}
-    fire('pointerup', window.PointerEvent || window.MouseEvent);
-    fire('mouseup', window.MouseEvent);
-    fire('click', window.MouseEvent);
-    return true;
+    return false;
 }
 
+function isWired(node) {
+    try {
+        for (const key in node) {
+            if (key.indexOf('__reactProps$') === 0 || key.indexOf('__reactFiber$') === 0) {
+                return true;
+            }
+        }
+    } catch (error) {}
+    try { if (typeof node.onclick === 'function') return true; } catch (error) {}
+    return false;
+}
+
+// 只有 React 页面才需要等 hydration；其它页面直接点。
+function needsHydration(node) {
+    if (__FORCE__) return false;
+    if (!isReactPage()) return false;
+    return !isWired(node);
+}
+
+__HUMAN_CLICK__
+
 const buttons = Array.from(document.querySelectorAll('button, a, [role="button"], [role="link"]'));
+
+// 诊断信息：点击失败时把它带出去，下次就能直接看出页面到底长什么样。
+const diagnostics = {
+    readyState: document.readyState,
+    url: String(location.href || ''),
+    viewport: window.innerWidth + 'x' + window.innerHeight,
+    screen: screen.width + 'x' + screen.height,
+    candidates: buttons
+        .filter(node => isVisible(node) && !isOwnOverlay(node))
+        .map(node => textOf(node))
+        .filter(Boolean)
+        .slice(0, 12),
+};
+
+// 文档还没加载完时不要动：按钮可能只是服务端渲染出来的骨架，
+// 页面脚本还没接管，点下去什么也不会发生。
+if (document.readyState !== 'complete') {
+    return { status: 'loading', diagnostics: diagnostics };
+}
 
 // 已经在邮箱输入页面（邮箱输入框可见且可交互）
 const emailInput = Array.from(document.querySelectorAll(
@@ -610,15 +754,18 @@ if (emailInput) {
     // 否则已经进入邮箱填写页面。
     const continueWithEmail = pick(buttons, ['continue', 'email']);
     if (!continueWithEmail) {
-        return { status: 'ready', url: location.href };
+        return { status: 'ready', diagnostics: diagnostics };
     }
 }
 
 // 优先查找 "Continue with email" 按钮（在选择登录方式的模态框中）
 const continueWithEmailButton = pick(buttons, ['continue', 'email']);
 if (continueWithEmailButton) {
-    robustClick(continueWithEmailButton);
-    return { status: 'clicked_email', url: location.href };
+    if (needsHydration(continueWithEmailButton)) {
+        return { status: 'not-hydrated', diagnostics: diagnostics };
+    }
+    const result = __humanClick(continueWithEmailButton);
+    return { status: result === 'clicked' ? 'clicked_email' : 'click-failed', diagnostics: diagnostics };
 }
 
 // 查找注册按钮：按更具体的文案依次匹配，避免笼统的 register 先命中别的元素
@@ -629,29 +776,201 @@ const signupButton = pick(buttons, ['sign up'])
     || pick(buttons, ['register']);
 
 if (signupButton) {
-    robustClick(signupButton);
-    return { status: 'clicked_signup', url: location.href };
+    if (needsHydration(signupButton)) {
+        return { status: 'not-hydrated', diagnostics: diagnostics };
+    }
+    const result = __humanClick(signupButton);
+    return { status: result === 'clicked' ? 'clicked_signup' : 'click-failed', diagnostics: diagnostics };
 }
 
-return { status: 'waiting', url: location.href };
-            """)
+return { status: 'waiting', diagnostics: diagnostics };
+})()
+"""
+
+
+def _click_first_matching(page, matcher_js: str) -> str:
+    """在**同一次**调用里找到匹配的按钮并点击。
+
+    ``matcher_js`` 必须是一个返回元素（或 null）的 JS 表达式。
+
+    查找与点击必须原子完成：并发下页面随时会跳转，如果拆成两次调用，
+    第二次拿到的元素引用可能已经指向被销毁的节点，点击就发不出去。
+    返回 ``clicked`` / ``not-found`` / ``not-visible`` / ``missing``。
+    """
+    script = (
+        "(function () {\n"
+        + humanize.CLICK_TARGET_JS
+        + "\nconst target = "
+        + matcher_js
+        + ";\n"
+        + "if (!target) return 'not-found';\n"
+        + "return __humanClick(target);\n"
+        + "})()"
+    )
+    try:
+        return str(page.run_js(script, as_expr=True) or "")
+    except Exception:
+        return ""
+
+
+# 「Continue / Next」提交按钮的定位表达式（返回元素或 null）。
+_CONTINUE_BUTTON_MATCHER = """
+(function () {
+function isVisible(node) {
+    if (!node) return false;
+    const style = window.getComputedStyle(node);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+}
+const buttons = Array.from(document.querySelectorAll('button[type="submit"], button'));
+return buttons.find(node => {
+    if (!isVisible(node) || node.disabled || node.getAttribute('aria-disabled') === 'true') return false;
+    const text = (node.innerText || node.textContent || '').toLowerCase().trim();
+    // 排除第三方登录按钮
+    const thirdPartyKeywords = ['phone', 'mobile', 'email', 'google', 'apple', 'microsoft', 'facebook', 'github'];
+    if (thirdPartyKeywords.some(keyword => text.includes(keyword))) return false;
+    return text.includes('continue') || text.includes('next');
+}) || null;
+})()
+"""
+
+# 验证码页 Continue 按钮（文案固定为 continue）。
+_OTP_CONTINUE_MATCHER = """
+(function () {
+const buttons = Array.from(document.querySelectorAll('button'));
+return buttons.find(btn => {
+    const text = (btn.innerText || btn.textContent || '').toLowerCase().trim();
+    return text === 'continue' && !btn.disabled;
+}) || null;
+})()
+"""
+
+# 资料页 Continue 按钮（文案固定为 continue）。
+_PROFILE_CONTINUE_MATCHER = """
+(function () {
+function isVisible(node) {
+    if (!node) return false;
+    const style = window.getComputedStyle(node);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+}
+const buttons = Array.from(document.querySelectorAll('button'));
+return buttons.find(btn => {
+    if (!isVisible(btn) || btn.disabled) return false;
+    const text = (btn.innerText || btn.textContent || '').toLowerCase().trim();
+    return text === 'continue';
+}) || null;
+})()
+"""
+
+
+def _wait_and_click_signup_button(
+    session: DrissionBrowserSession,
+    timeout=60,
+    stop_event=None,
+    action_handler=None,
+):
+    """等待并点击注册按钮和 Continue with email 按钮。
+
+    并发多开时这里最容易出问题，原因是三个叠加的坑：
+
+    1. **查找与点击必须同一次调用完成**。之前拆成「先记下元素、下一轮再点」，
+       页面一旦跳转，元素引用就指向已销毁的节点，点击永远发不出去——
+       表现就是「有时候没有点到注册登录按钮」。
+    2. **要等前端接管元素**。OpenAI 页面是 React 渲染的，hydration 完成之前
+       DOM 里有按钮但没有事件处理器，点击是空操作。并发时机器负载高、
+       hydration 完成得晚，于是连续点空。
+    3. **并发越高，页面越慢**，固定 60 秒不够用（见调用方按并发数放大超时）。
+    """
+    deadline = time.time() + timeout
+    not_hydrated_rounds = 0
+    waiting_rounds = 0
+    last_diagnostics: dict[str, Any] = {}
+
+    while time.time() < deadline:
+        if stop_event and stop_event.is_set():
+            raise RuntimeError("任务已停止")
+
+        page = session.refresh_page()
+        if action_handler is not None:
+            action_handler(page)
+
+        # 连等几次都是「页面还没接管」，就直接点，不再无限等 hydration。
+        force = not_hydrated_rounds >= 3
+        try:
+            state = page.run_js(
+                _SIGNUP_CLICK_SCRIPT.replace("__HUMAN_CLICK__", humanize.CLICK_TARGET_JS).replace(
+                    "__FORCE__", "true" if force else "false"
+                )
+            )
         except Exception as error:
             if _is_transient_page_error(error):
                 time.sleep(0.8)
                 continue
             raise
 
-        if isinstance(state, dict):
-            status = state.get("status")
-            if status == "ready":
-                return True
-            if status in ("clicked_email", "clicked_signup"):
-                time.sleep(1)
-                continue
+        if not isinstance(state, dict):
+            time.sleep(0.5)
+            continue
 
+        status = str(state.get("status") or "")
+        diagnostics = state.get("diagnostics")
+        if isinstance(diagnostics, dict):
+            last_diagnostics = diagnostics
+
+        if status == "ready":
+            return True
+
+        if status == "not-hydrated":
+            not_hydrated_rounds += 1
+            waiting_rounds = 0
+            time.sleep(0.6)
+            continue
+
+        if status == "loading":
+            # 文档还没加载完，等它先加载完。
+            waiting_rounds = 0
+            time.sleep(0.4)
+            continue
+
+        not_hydrated_rounds = 0
+
+        if status in ("clicked_email", "clicked_signup"):
+            # 点击已经发出。等页面响应，给一点自然停顿再判断结果。
+            waiting_rounds = 0
+            humanize.human_pause(0.5, 1.4)
+            continue
+
+        if status == "click-failed":
+            # 元素找到了但点不动（尺寸为 0 / 被遮挡）：滚动后再试。
+            waiting_rounds = 0
+            time.sleep(0.4)
+            continue
+
+        # status == 'waiting'：页面上根本找不到注册按钮。
+        # 可能是页面没加载完、被错误页/风控页替换，或者停在某个意外状态。
+        # 连续等太久就重新加载一次，给它一个干净的首屏。
+        waiting_rounds += 1
+        if waiting_rounds == 8:
+            waiting_rounds = 0
+            print("[*] 迟迟找不到注册按钮，重新加载页面再试…")
+            try:
+                page.refresh()
+            except Exception:
+                try:
+                    session.open_url("https://chatgpt.com/")
+                except Exception:
+                    pass
+            time.sleep(2.0)
+            continue
         time.sleep(0.5)
 
-    raise Exception("未找到注册按钮或超时")
+    raise Exception(
+        "未找到注册按钮或超时"
+        + (f"；最后一次页面状态: {last_diagnostics}" if last_diagnostics else "")
+    )
 
 
 def _fill_email_and_continue(
@@ -663,6 +982,9 @@ def _fill_email_and_continue(
 ) -> str:
     """填写邮箱并继续"""
     deadline = time.time() + timeout
+    email_input_js = humanize.visible_input_js(
+        "input[type=\"email\"], input[name=\"email\"], input[autocomplete=\"username\"], input#login-email"
+    )
     while time.time() < deadline:
         if stop_event and stop_event.is_set():
             raise RuntimeError("任务已停止")
@@ -672,10 +994,41 @@ def _fill_email_and_continue(
             action_handler(page)
 
         try:
-            filled = page.run_js(
-                """
-const email = arguments[0];
+            ready = page.run_js("return !!(%s);" % email_input_js)
+        except Exception as error:
+            if _is_transient_page_error(error):
+                time.sleep(0.8)
+                continue
+            raise
 
+        if not ready:
+            time.sleep(0.5)
+            continue
+
+        # 逐字符输入：模拟真人敲键盘，而不是一次性把整串塞进去。
+        try:
+            typed = humanize.type_text(
+                page,
+                email,
+                locate_js=email_input_js,
+                stop_event=stop_event,
+            )
+        except Exception as error:
+            if _is_transient_page_error(error):
+                time.sleep(0.8)
+                continue
+            raise
+        if not typed:
+            time.sleep(0.5)
+            continue
+
+        try:
+            filled = _run_js_expr(
+                page,
+                """
+(function () {
+const input = %s;
+const expected = %s;
 function isVisible(node) {
     if (!node) return false;
     const style = window.getComputedStyle(node);
@@ -683,37 +1036,16 @@ function isVisible(node) {
     const rect = node.getBoundingClientRect();
     return rect.width > 0 && rect.height > 0;
 }
-
-const input = Array.from(document.querySelectorAll(
-    'input[type="email"], input[name="email"], input[autocomplete="username"], input#login-email'
-)).find(node => isVisible(node) && !node.disabled && !node.readOnly);
-
-if (!input) return 'not-ready';
-
-input.focus();
-input.click();
-
-const valueSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
-const tracker = input._valueTracker;
-if (tracker) tracker.setValue('');
-if (valueSetter) {
-    valueSetter.call(input, email);
-} else {
-    input.value = email;
-}
-
-input.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, data: email, inputType: 'insertText' }));
-input.dispatchEvent(new InputEvent('input', { bubbles: true, data: email, inputType: 'insertText' }));
-input.dispatchEvent(new Event('change', { bubbles: true }));
-
-if ((input.value || '').trim() !== email || !input.checkValidity()) {
+if (!input || !isVisible(input)) return 'not-ready';
+if ((input.value || '').trim() !== expected || !input.checkValidity()) {
     return false;
 }
-
 input.blur();
 return 'filled';
+})()
                 """,
-                email,
+                email_input_js,
+                json.dumps(email),
             )
         except Exception as error:
             if _is_transient_page_error(error):
@@ -730,48 +1062,26 @@ return 'filled';
             continue
 
         if filled == 'filled':
-            time.sleep(0.8)
+            # 停顿一下再提交：真人不会填完立刻点按钮。
+            humanize.human_pause(0.25, 0.9)
             page = session.refresh_page()
             try:
-                clicked = page.run_js(
-                    r"""
-function isVisible(node) {
-    if (!node) return false;
-    const style = window.getComputedStyle(node);
-    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-    const rect = node.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
-}
-
-// 查找提交按钮，排除第三方登录按钮
-const buttons = Array.from(document.querySelectorAll('button[type="submit"], button'));
-const continueButton = buttons.find(node => {
-    if (!isVisible(node) || node.disabled || node.getAttribute('aria-disabled') === 'true') return false;
-    const text = (node.innerText || node.textContent || '').toLowerCase().trim();
-
-    // 排除第三方登录按钮
-    const thirdPartyKeywords = ['phone', 'mobile', 'email', 'google', 'apple', 'microsoft', 'facebook', 'github'];
-    if (thirdPartyKeywords.some(keyword => text.includes(keyword))) return false;
-
-    // 查找包含 continue 或 next 的按钮
-    return text.includes('continue') || text.includes('next');
-});
-
-if (!continueButton) return false;
-continueButton.click();
-return true;
-                    """
-                )
+                # 查找与点击在同一次调用里完成，避免并发下页面跳转把元素引用作废。
+                clicked = _click_first_matching(page, _CONTINUE_BUTTON_MATCHER)
             except Exception as error:
                 if _is_transient_page_error(error):
                     time.sleep(0.8)
                     continue
                 raise
 
-            if clicked:
-                time.sleep(1)
+            if clicked == 'clicked':
+                humanize.human_pause(0.6, 1.6)
                 print(f"[*] 已填写邮箱并点击继续: {email}")
                 return email
+            if clicked in ('not-found', 'not-visible'):
+                # 按钮还没渲染出来，等下一轮。
+                time.sleep(0.5)
+                continue
 
         time.sleep(0.5)
 
@@ -792,6 +1102,9 @@ def _fill_otp_and_continue(
         raise Exception("获取验证码失败")
 
     deadline = time.time() + timeout
+    otp_input_js = humanize.visible_input_js(
+        "input[inputmode='numeric'], input[autocomplete='one-time-code'], input[type='tel']"
+    )
     while time.time() < deadline:
         if stop_event and stop_event.is_set():
             raise RuntimeError("任务已停止")
@@ -801,52 +1114,52 @@ def _fill_otp_and_continue(
             action_handler(page)
 
         try:
-            filled = page.run_js(
+            ready = page.run_js("return !!(%s);" % otp_input_js)
+        except Exception as error:
+            if _is_transient_page_error(error):
+                time.sleep(1)
+                continue
+            raise
+
+        if not ready:
+            time.sleep(0.5)
+            continue
+
+        # 验证码同样是逐位敲进去的，不是整串一次性塞入。
+        try:
+            typed = humanize.type_text(
+                page,
+                code,
+                locate_js=otp_input_js,
+                stop_event=stop_event,
+                per_char=(0.09, 0.28),
+            )
+        except Exception as error:
+            if _is_transient_page_error(error):
+                time.sleep(1)
+                continue
+            raise
+        if not typed:
+            time.sleep(0.5)
+            continue
+
+        try:
+            filled = _run_js_expr(
+                page,
                 """
-const code = String(arguments[0] || '').trim();
-
-function isVisible(node) {
-    if (!node) return false;
-    const style = window.getComputedStyle(node);
-    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-    const rect = node.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
-}
-
-function setNativeValue(input, value) {
-    const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
-    const tracker = input._valueTracker;
-    if (tracker) tracker.setValue('');
-    if (nativeSetter) {
-        nativeSetter.call(input, '');
-        nativeSetter.call(input, value);
-    } else {
-        input.value = '';
-        input.value = value;
-    }
-}
-
-const input = Array.from(document.querySelectorAll(
-    "input[inputmode='numeric'], input[autocomplete='one-time-code'], input[type='tel']"
-)).find(node => isVisible(node) && !node.disabled && !node.readOnly);
-
+(function () {
+const input = %s;
+const expected = %s;
 if (!input) return 'not-ready';
-
-input.focus();
-input.click();
-setNativeValue(input, code);
-input.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, data: code, inputType: 'insertText' }));
-input.dispatchEvent(new InputEvent('input', { bubbles: true, data: code, inputType: 'insertText' }));
-input.dispatchEvent(new Event('change', { bubbles: true }));
-
-if (String(input.value || '').trim() !== code) {
+if (String(input.value || '').trim() !== expected) {
     return 'mismatch';
 }
-
 input.blur();
 return 'filled';
+})()
                 """,
-                code,
+                otp_input_js,
+                json.dumps(code),
             )
         except Exception as error:
             if _is_transient_page_error(error):
@@ -866,23 +1179,12 @@ return 'filled';
             print(f"[*] 已填写验证码: {code}")
 
             # 填写完验证码后，点击 Continue 按钮
-            time.sleep(1)
+            humanize.human_pause(0.3, 1.1)
             try:
-                clicked = page.run_js("""
-const buttons = Array.from(document.querySelectorAll('button'));
-const continueBtn = buttons.find(btn => {
-    const text = (btn.innerText || btn.textContent || '').toLowerCase().trim();
-    return text === 'continue' && !btn.disabled;
-});
-if (continueBtn) {
-    continueBtn.click();
-    return 'clicked';
-}
-return 'not-found';
-                """)
+                clicked = _click_first_matching(page, _OTP_CONTINUE_MATCHER)
                 if clicked == 'clicked':
                     print("[*] 已点击 Continue 按钮")
-                    time.sleep(2)
+                    humanize.human_pause(1.0, 2.4)
                 else:
                     print("[警告] 未找到 Continue 按钮，等待自动跳转")
                     time.sleep(2)
@@ -1293,11 +1595,10 @@ def _fill_name_and_age(
             action_handler(page)
 
         try:
-            result = page.run_js(
-                r"""
-const fullName = String(arguments[0] || '');
-const age = String(arguments[1] || '');
-
+            located = _run_js_expr(
+                page,
+                """
+(function () {
 function isVisible(node) {
     if (!node) return false;
     const style = window.getComputedStyle(node);
@@ -1305,75 +1606,24 @@ function isVisible(node) {
     const rect = node.getBoundingClientRect();
     return rect.width > 0 && rect.height > 0;
 }
-
-function setNativeValue(input, value) {
-    const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
-    const tracker = input._valueTracker;
-    if (tracker) tracker.setValue('');
-    if (nativeSetter) {
-        nativeSetter.call(input, '');
-        nativeSetter.call(input, value);
-    } else {
-        input.value = '';
-        input.value = value;
-    }
-}
-
-// 查找姓名输入框
 const nameInputs = Array.from(document.querySelectorAll('input[type="text"], input:not([type])'));
 const nameInput = nameInputs.find(input => {
     if (!isVisible(input) || input.disabled || input.readOnly) return false;
     const label = input.getAttribute('aria-label') || input.placeholder || '';
     return label.toLowerCase().includes('name');
 });
-
-// 查找年龄输入框
 const ageInputs = Array.from(document.querySelectorAll('input[type="text"], input[type="number"], input:not([type])'));
 const ageInput = ageInputs.find(input => {
     if (!isVisible(input) || input.disabled || input.readOnly) return false;
     const label = input.getAttribute('aria-label') || input.placeholder || '';
     return label.toLowerCase().includes('age');
 });
-
-if (!nameInput || !ageInput) {
-    return 'not-ready';
-}
-
-// 填写姓名
-nameInput.focus();
-nameInput.click();
-setNativeValue(nameInput, fullName);
-nameInput.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, data: fullName, inputType: 'insertText' }));
-nameInput.dispatchEvent(new InputEvent('input', { bubbles: true, data: fullName, inputType: 'insertText' }));
-nameInput.dispatchEvent(new Event('change', { bubbles: true }));
-nameInput.blur();
-
-// 填写年龄
-ageInput.focus();
-ageInput.click();
-setNativeValue(ageInput, age);
-ageInput.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, data: age, inputType: 'insertText' }));
-ageInput.dispatchEvent(new InputEvent('input', { bubbles: true, data: age, inputType: 'insertText' }));
-ageInput.dispatchEvent(new Event('change', { bubbles: true }));
-ageInput.blur();
-
-// 查找并点击 Continue 按钮
-const buttons = Array.from(document.querySelectorAll('button'));
-const continueBtn = buttons.find(btn => {
-    if (!isVisible(btn) || btn.disabled) return false;
-    const text = (btn.innerText || btn.textContent || '').toLowerCase().trim();
-    return text === 'continue';
-});
-
-if (continueBtn) {
-    continueBtn.click();
-    return 'submitted';
-}
-
-return 'filled';
+if (!nameInput || !ageInput) return 'not-ready';
+window.__grokNameInput = nameInput;
+window.__grokAgeInput = ageInput;
+return 'ready';
+})()
                 """,
-                full_name,
-                str(age),
             )
         except Exception as error:
             if _is_transient_page_error(error):
@@ -1381,13 +1631,74 @@ return 'filled';
                 continue
             raise
 
-        if result == 'not-ready':
+        if located == 'not-ready':
             time.sleep(0.5)
             continue
+
+        try:
+            # 姓名、年龄都逐字符输入。
+            if not humanize.type_text(
+                page,
+                full_name,
+                locate_js="window.__grokNameInput",
+                stop_event=stop_event,
+            ):
+                time.sleep(0.5)
+                continue
+            humanize.human_pause(0.2, 0.7)
+            if not humanize.type_text(
+                page,
+                str(age),
+                locate_js="window.__grokAgeInput",
+                stop_event=stop_event,
+                per_char=(0.09, 0.26),
+            ):
+                time.sleep(0.5)
+                continue
+        except Exception as error:
+            if _is_transient_page_error(error):
+                time.sleep(1)
+                continue
+            raise
+
+        try:
+            result = _run_js_expr(
+                page,
+                """
+(function () {
+function isVisible(node) {
+    if (!node) return false;
+    const style = window.getComputedStyle(node);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+}
+const buttons = Array.from(document.querySelectorAll('button'));
+const continueBtn = buttons.find(btn => {
+    if (!isVisible(btn) || btn.disabled) return false;
+    const text = (btn.innerText || btn.textContent || '').toLowerCase().trim();
+    return text === 'continue';
+});
+if (continueBtn) {
+    window.__grokProfileContinue = continueBtn;
+    return 'submitted';
+}
+return 'filled';
+})()
+                """,
+            )
+        except Exception as error:
+            if _is_transient_page_error(error):
+                time.sleep(1)
+                continue
+            raise
 
         if result in ('filled', 'submitted'):
             print(f"[*] 已填写姓名: {full_name}, 年龄: {age}")
             if result == 'submitted':
+                humanize.human_pause(0.3, 1.0)
+                # 查找与点击原子完成，元素引用不会在两次调用之间失效。
+                _click_first_matching(page, _PROFILE_CONTINUE_MATCHER)
                 print("[*] 已点击 Continue 按钮，等待页面跳转...")
                 time.sleep(5)  # 增加等待时间，让页面有足够时间跳转到密码页
             else:
@@ -1449,13 +1760,84 @@ def _fetch_session_data(
         return None
 
 
+# 注册最后一步之后的引导页（"You're all set"）。
+#
+# 这个页面 URL 已经是 chatgpt.com，但页面上没有聊天输入框，只有一个
+# "Continue" 按钮——不点它就永远进不了主页，注册会在「等待 ChatGPT 主页」
+# 这一步超时失败（表现就是浏览器停在 "You're all set" 页面不动）。
+_ONBOARDING_CONTINUE_JS = """
+(function () {
+function isVisible(node) {
+    if (!node) return false;
+    const style = window.getComputedStyle(node);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+}
+function textOf(node) {
+    return String(node.innerText || node.textContent || '').toLowerCase().replace(/\\s+/g, ' ').trim();
+}
+
+__HUMAN_CLICK__
+
+const bodyText = String(document.body ? (document.body.innerText || '') : '').toLowerCase();
+
+// 只在引导页上才点：页面出现 "all set" 之类的完成提示时才认为需要点 Continue。
+const isOnboarding = bodyText.includes("all set");
+const hasChatBox = !!document.querySelector(
+    'textarea[placeholder*="Ask"], input[placeholder*="Ask"], [contenteditable="true"]'
+);
+if (!isOnboarding && hasChatBox) return 'not-onboarding';
+
+const buttons = Array.from(document.querySelectorAll('button, a, [role="button"]'))
+    .filter(node => isVisible(node) && !node.disabled);
+const candidates = buttons.filter(node => {
+    const text = textOf(node);
+    return text === 'continue' || text === 'get started' || text === 'continue to chatgpt';
+});
+if (!candidates.length) return 'not-found';
+
+// 文本最短的那个最可能是主按钮。
+candidates.sort((a, b) => textOf(a).length - textOf(b).length);
+return __humanClick(candidates[0]);
+})()
+"""
+
+
+def _click_onboarding_continue(page) -> str:
+    """点掉引导页（"You're all set"）上的 Continue 按钮。
+
+    页面刚跳转完时执行上下文可能还没准备好（执行上下文被销毁、页面正在加载），
+    这类瞬时错误要重试几次，否则会白白丢掉这一次点击机会。
+    """
+    script = _ONBOARDING_CONTINUE_JS.replace("__HUMAN_CLICK__", humanize.CLICK_TARGET_JS)
+    last = ""
+    for attempt in range(3):
+        try:
+            last = str(page.run_js(script, as_expr=True) or "")
+        except Exception as error:
+            last = ""
+            if _is_transient_page_error(error):
+                time.sleep(0.4)
+                continue
+            return ""
+        if last in ("clicked", "not-found", "not-onboarding"):
+            return last
+        time.sleep(0.3)
+    return last
+
+
 def _wait_for_chatgpt_homepage(
     session: DrissionBrowserSession,
     timeout: int = 30,
     stop_event=None,
     action_handler=None,
 ) -> None:
-    """等待页面跳转到 ChatGPT 主页，确认注册成功"""
+    """等待页面跳转到 ChatGPT 主页，确认注册成功。
+
+    注册最后一步之后 OpenAI 会先弹一个引导页（"You're all set" + Continue 按钮），
+    必须点掉它才会真正进入主页——这里在等待过程中顺带把这个按钮点掉。
+    """
     deadline = time.time() + timeout
 
     while time.time() < deadline:
@@ -1467,6 +1849,12 @@ def _wait_for_chatgpt_homepage(
             action_handler(page)
 
         try:
+            # 先把引导页（"You're all set"）上的 Continue 点掉。
+            if _click_onboarding_continue(page) == "clicked":
+                print("[*] 已点击引导页的 Continue 按钮，等待进入主页…")
+                time.sleep(1.5)
+                continue
+
             # 检查是否已经进入 ChatGPT 主页
             # 主页特征：URL 是 chatgpt.com 且包含 "What's on the agenda" 或输入框
             current_url = page.url.lower()

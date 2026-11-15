@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { Button } from "@/components/ui/button";
+import { DashboardAccountPools } from "@/features/dashboard/dashboard-account-pools";
 import { DashboardActivity } from "@/features/dashboard/dashboard-activity";
 import { getDashboard, type DashboardPeriod } from "@/features/dashboard/dashboard-api";
 import { DashboardCommunity } from "@/features/dashboard/dashboard-community";
@@ -86,6 +87,8 @@ export function DashboardPage() {
           </>
         )}
       />
+
+      <DashboardAccountPools dashboard={dashboard} locale={i18n.language} loading={loading} />
 
       <DashboardOverview dashboard={dashboard} locale={i18n.language} loading={loading} />
 

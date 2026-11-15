@@ -59,16 +59,63 @@ def parse_pow_resources(html_content: str) -> tuple[list[str], str]:
     return script_sources, data_build
 
 
-def _legacy_parse_time() -> str:
-    now = datetime.now(timezone(timedelta(hours=-5)))
-    return now.strftime("%a %b %d %Y %H:%M:%S") + " GMT-0500 (Eastern Standard Time)"
+def _legacy_parse_time(timezone_offset_minutes: int | None = None) -> str:
+    if timezone_offset_minutes is None:
+        timezone_offset_minutes = -480
+    localized = datetime.now(timezone.utc) + timedelta(minutes=timezone_offset_minutes)
+    sign = "-" if timezone_offset_minutes <= 0 else "+"
+    hours = abs(int(timezone_offset_minutes)) // 60
+    return localized.strftime("%a %b %d %Y %H:%M:%S") + f" GMT{sign}{hours:02d}00"
+
+
+def _device_facts(device: dict | None) -> dict[str, Any]:
+    """把浏览器身份快照里的设备信息整理成 PoW 配置需要的字段。
+
+    这里的每一个值都会原样上报给 OpenAI 的 sentinel 接口：如果它写的是
+    「1920x1080 / 32 核 / 美国东部时间」，而账号实际是在 macOS 笔记本的
+    Chrome 里注册出来的，服务端一眼就能看出两边不是同一台设备。
+    """
+    facts = device if isinstance(device, dict) else {}
+    screen = facts.get("screen") if isinstance(facts.get("screen"), dict) else {}
+    try:
+        width = int(screen.get("width") or 0)
+    except (TypeError, ValueError):
+        width = 0
+    try:
+        height = int(screen.get("height") or 0)
+    except (TypeError, ValueError):
+        height = 0
+    try:
+        cores = int(facts.get("hardware_concurrency") or 0)
+    except (TypeError, ValueError):
+        cores = 0
+    language = str(facts.get("navigator_language") or "en-US").strip() or "en-US"
+    accept_language = str(facts.get("accept_language") or "").strip() or (
+        f"{language},{language.split('-')[0]};q=0.9,en;q=0.8"
+    )
+    try:
+        offset_minutes = int(facts.get("timezone_offset_minutes"))
+    except (TypeError, ValueError):
+        offset_minutes = -480
+    return {
+        "screen_width": width or 1920,
+        "screen_height": height or 1080,
+        "cores": cores or 8,
+        "language": language,
+        "accept_language": accept_language,
+        "timezone_offset_minutes": offset_minutes,
+    }
 
 
 def _build_pow_config(
     user_agent: str,
     script_sources: Sequence[str] | None = None,
     data_build: str = "",
+    device: dict | None = None,
 ) -> list[Any]:
+    facts = _device_facts(device)
+    cores = facts["cores"]
+    language = facts["language"]
     navigator_key = random.choice(
         [
             "registerProtocolHandler−function registerProtocolHandler() { [native code] }",
@@ -98,12 +145,12 @@ def _build_pow_config(
             "doNotTrack",
             "serial−[object Serial]",
             "pdfViewerEnabled−true",
-            "language−zh-CN",
+            f"language−{language}",
             "geolocation−[object Geolocation]",
             "userAgentData−[object NavigatorUAData]",
             "getUserMedia−function getUserMedia() { [native code] }",
             "sendBeacon−function sendBeacon() { [native code] }",
-            "hardwareConcurrency−32",
+            f"hardwareConcurrency−{cores}",
             "windowControlsOverlay−[object WindowControlsOverlay]",
         ]
     )
@@ -156,15 +203,15 @@ def _build_pow_config(
     )
     script_source = random.choice(list(script_sources)) if script_sources else DEFAULT_POW_SCRIPT
     return [
-        sum(random.choices(SCREEN_RESOLUTIONS, k=1)[0]),
-        _legacy_parse_time(),
+        facts["screen_width"] + facts["screen_height"],
+        _legacy_parse_time(facts["timezone_offset_minutes"]),
         4294705152,
         1,
         user_agent,
         script_source,
         data_build,
-        "en-US",
-        "en-US,es-US,en,es",
+        language,
+        facts["accept_language"],
         random.random(),
         navigator_key,
         random.choice(DOCUMENT_KEYS),
@@ -172,7 +219,7 @@ def _build_pow_config(
         time.perf_counter() * 1000,
         uuid.uuid4().hex,
         "",
-        random.choice(CORES),
+        cores,
         time.time() * 1000 - (time.perf_counter() * 1000),
         0,
         0,
@@ -205,8 +252,11 @@ def build_legacy_requirements_token(
     user_agent: str,
     script_sources: Sequence[str] | None = None,
     data_build: str = "",
+    device: dict | None = None,
 ) -> str:
-    config = _build_pow_config(user_agent, script_sources=script_sources, data_build=data_build)
+    config = _build_pow_config(
+        user_agent, script_sources=script_sources, data_build=data_build, device=device
+    )
     return "gAAAAAC" + base64.b64encode(
         json.dumps(config, separators=(",", ":"), ensure_ascii=False).encode()
     ).decode()
@@ -218,8 +268,11 @@ def build_proof_token(
     user_agent: str,
     script_sources: Sequence[str] | None = None,
     data_build: str = "",
+    device: dict | None = None,
 ) -> str:
-    config = _build_pow_config(user_agent, script_sources=script_sources, data_build=data_build)
+    config = _build_pow_config(
+        user_agent, script_sources=script_sources, data_build=data_build, device=device
+    )
     answer, solved = _pow_generate(seed, difficulty, config)
     if not solved:
         raise RuntimeError(f"failed to solve proof token: difficulty={difficulty}")

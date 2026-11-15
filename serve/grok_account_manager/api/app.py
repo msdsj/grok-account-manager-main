@@ -12,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
 from ..gateway import catalog as model_catalog
+from ..gateway.auth import ensure_default_client_key
 from ..core.paths import CREDENTIALS_DIR, WEB_DIST_DIR
 from .routers import accounts, admin_auth, admin_stats, gateway, logs, mailboxes, register, state
 from ..core import audit
@@ -27,6 +28,7 @@ def create_app() -> FastAPI:
     init_db()
     migrate_legacy_storage_once()
     model_catalog.ensure_seeded()
+    ensure_default_client_key()
     admin_auth.ensure_admin()
 
     app = FastAPI(

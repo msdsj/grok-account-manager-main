@@ -43,6 +43,17 @@ export type ManagedAccount = {
 
 export type AccountTag = { tag: string; count: number };
 
+export type ManagedAccountCredential = {
+  exportKey: string;
+  provider?: string;
+  email?: string;
+  access_token?: string;
+  refresh_token?: string;
+  session?: string;
+  cookie?: string;
+  credential?: Record<string, unknown>;
+};
+
 export type AccountTestImage = {
   url?: string;
   b64_json?: string;
@@ -92,6 +103,20 @@ export async function listManagedAccounts(input: {
   if (input.tag) query.set("tag", input.tag);
   const suffix = query.toString() ? `?${query.toString()}` : "";
   return api<{ accounts: ManagedAccount[]; total: number }>(`/api/accounts${suffix}`);
+}
+
+export function importManagedAccounts(input: {
+  provider: string;
+  data: string;
+}): Promise<{ imported: number; skipped: number; accounts: ManagedAccount[] }> {
+  return api<{ imported: number; skipped: number; accounts: ManagedAccount[] }>("/api/accounts/import", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export function getManagedAccountCredential(exportKey: string): Promise<ManagedAccountCredential> {
+  return api<ManagedAccountCredential>(`/api/accounts/${encodeURIComponent(exportKey)}/credential`);
 }
 
 export async function listAccountTags(): Promise<AccountTag[]> {

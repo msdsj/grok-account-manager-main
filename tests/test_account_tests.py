@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,6 +10,7 @@ from unittest.mock import patch
 
 from grok_account_manager.api.services import accounts as account_service
 from grok_account_manager.core import database as db
+from grok_account_manager.gateway import auth as gateway_auth
 
 
 class FakeAdapter:
@@ -138,6 +140,72 @@ class AccountTestRoutingTests(unittest.TestCase):
             account_service.test_account_video("db:kiro:one", "", "a cat", 6, "720p", "16:9")
         with self.assertRaisesRegex(ValueError, "仅 Grok 账号支持视频任务查询"):
             account_service.test_account_video_status("db:chatgpt:one", "video-1")
+
+
+class AccountImportTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._patchers = [
+            patch.object(db, "DB_PATH", Path(self._tmpdir.name) / "app.db"),
+            patch.object(db, "OUTPUT_DIR", Path(self._tmpdir.name) / "output"),
+        ]
+        for patcher in self._patchers:
+            patcher.start()
+        db.init_db()
+
+    def tearDown(self) -> None:
+        for patcher in reversed(self._patchers):
+            patcher.stop()
+        self._tmpdir.cleanup()
+
+    def test_import_json_and_line_formats(self) -> None:
+        result = account_service.import_accounts(
+            "grok",
+            json.dumps([{"email": "grok@example.test", "access_token": "token", "refresh_token": "rt"}]),
+        )
+        self.assertEqual(result["imported"], 1)
+        self.assertEqual(result["skipped"], 0)
+        grok_accounts = [item for item in db.list_accounts() if item["provider"] == "grok"]
+        self.assertEqual(len(grok_accounts), 1)
+        self.assertEqual(grok_accounts[0]["email"], "grok@example.test")
+
+        result = account_service.import_accounts("kiro", "kiro@example.test----access----refresh")
+        self.assertEqual(result["imported"], 1)
+        kiro = next(item for item in db.list_accounts() if item["provider"] == "kiro")
+        refs = db.get_credential_refs([kiro["exportKey"]])
+        self.assertEqual(refs[0]["credential"]["accessToken"], "access")
+        self.assertEqual(refs[0]["credential"]["refreshToken"], "refresh")
+
+    def test_import_rejects_unknown_provider(self) -> None:
+        with self.assertRaisesRegex(ValueError, "不支持的账号类型"):
+            account_service.import_accounts("unknown", "{}")
+
+
+class DefaultClientKeyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._patchers = [
+            patch.object(db, "DB_PATH", Path(self._tmpdir.name) / "app.db"),
+            patch.object(db, "OUTPUT_DIR", Path(self._tmpdir.name) / "output"),
+        ]
+        for patcher in self._patchers:
+            patcher.start()
+        db.init_db()
+
+    def tearDown(self) -> None:
+        for patcher in reversed(self._patchers):
+            patcher.stop()
+        self._tmpdir.cleanup()
+
+    def test_default_key_is_seeded_and_readable(self) -> None:
+        created = gateway_auth.ensure_default_client_key()
+        self.assertIsNotNone(created)
+        self.assertEqual(db.count_client_keys(), 1)
+        stored = gateway_auth.read_default_client_key()
+        self.assertIsNotNone(stored)
+        self.assertEqual(stored["key"], created["key"])
+        self.assertEqual(gateway_auth.ensure_default_client_key(), None)
+        self.assertEqual(db.count_client_keys(), 1)
 
 
 if __name__ == "__main__":

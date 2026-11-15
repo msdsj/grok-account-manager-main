@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Bot,
+  Copy,
   Download,
   FlaskConical,
   ImageIcon,
@@ -11,6 +12,7 @@ import {
   Sparkles,
   Tags,
   Trash2,
+  Upload,
   Video,
   type LucideIcon,
 } from "lucide-react";
@@ -43,7 +45,9 @@ import { DashboardPanel } from "@/features/dashboard/dashboard-panel";
 import {
   deleteManagedAccounts,
   exportManagedAccounts,
+  getManagedAccountCredential,
   getManagedAccountVideoStatus,
+  importManagedAccounts,
   listAccountTags,
   listManagedAccounts,
   refreshManagedAccountQuota,
@@ -56,6 +60,7 @@ import {
   type ManagedAccount,
 } from "@/features/managed-accounts/managed-accounts-api";
 import { listGatewayModels, type GatewayModelDTO } from "@/shared/api/gateway";
+import { CopyButton } from "@/shared/components/copy-button";
 import { PageHeader } from "@/shared/components/page-header";
 import { useDebouncedValue } from "@/shared/hooks/use-debounced-value";
 import { formatNumber } from "@/shared/lib/format";
@@ -204,10 +209,10 @@ function imageSource(image: { url?: string; b64_json?: string }): string {
   return "";
 }
 
-export function ManagedAccountsPage() {
+export function ManagedAccountsPage({ fixedTab }: { fixedTab?: PoolTabKey } = {}) {
   const { t, i18n } = useTranslation();
   const queryClient = useQueryClient();
-  const [activeTab, setActiveTab] = useState<PoolTabKey>("grok");
+  const [activeTab, setActiveTab] = useState<PoolTabKey>(fixedTab ?? "grok");
   const [search, setSearch] = useState("");
   const [tagFilter, setTagFilter] = useState("all");
   const [selected, setSelected] = useState<Set<string>>(() => new Set());
@@ -215,6 +220,8 @@ export function ManagedAccountsPage() {
   const [tagValue, setTagValue] = useState("");
   const [deleteKeys, setDeleteKeys] = useState<string[] | null>(null);
   const [testTarget, setTestTarget] = useState<{ account: ManagedAccount; mode: AccountTestMode } | null>(null);
+  const [importOpen, setImportOpen] = useState(false);
+  const [importData, setImportData] = useState("");
   const debouncedSearch = useDebouncedValue(search, 250);
   const activeTabDef = POOL_TABS.find((tab) => tab.key === activeTab) ?? POOL_TABS[0];
 
@@ -255,6 +262,10 @@ export function ManagedAccountsPage() {
   useEffect(() => {
     setSelected(new Set());
   }, [activeTab]);
+
+  useEffect(() => {
+    if (fixedTab) setActiveTab(fixedTab);
+  }, [fixedTab]);
 
   const invalidate = () => {
     void queryClient.invalidateQueries({ queryKey: ["managed-accounts"] });
@@ -301,6 +312,17 @@ export function ManagedAccountsPage() {
     onError: (error) => toast.error(error instanceof Error ? error.message : t("errors.generic")),
   });
 
+  const importMutation = useMutation({
+    mutationFn: () => importManagedAccounts({ provider: activeTabDef.provider, data: importData }),
+    onSuccess: (result) => {
+      setImportOpen(false);
+      setImportData("");
+      invalidate();
+      toast.success(t("managedAccounts.imported", { count: result.imported, skipped: result.skipped }));
+    },
+    onError: (error) => toast.error(error instanceof Error ? error.message : t("errors.generic")),
+  });
+
   const toggleAll = (checked: boolean) => {
     setSelected(checked ? new Set(tabAccounts.map((account) => account.exportKey)) : new Set());
   };
@@ -327,33 +349,40 @@ export function ManagedAccountsPage() {
   return (
     <div className="space-y-5">
       <PageHeader
-        title={t("managedAccounts.title")}
-        description={t("managedAccounts.description")}
+        title={fixedTab ? t(activeTabDef.labelKey) : t("managedAccounts.title")}
+        description={fixedTab ? t(activeTabDef.descriptionKey) : t("managedAccounts.description")}
         actions={(
-          <Button variant="secondary" size="sm" onClick={() => void accountsQuery.refetch()} disabled={accountsQuery.isFetching}>
-            <RefreshCw />{t("operationLogs.refresh")}
-          </Button>
+          <>
+            <Button variant="secondary" size="sm" onClick={() => setImportOpen(true)}>
+              <Upload />{t("managedAccounts.importAction")}
+            </Button>
+            <Button variant="secondary" size="sm" onClick={() => void accountsQuery.refetch()} disabled={accountsQuery.isFetching}>
+              <RefreshCw />{t("operationLogs.refresh")}
+            </Button>
+          </>
         )}
       />
 
       <Tabs value={activeTab} onValueChange={(value) => setActiveTab(value as PoolTabKey)}>
-        <div className="min-w-0 overflow-x-auto rounded-xl border border-border/80 bg-card p-1.5 shadow-[var(--shadow-card)]">
-          <TabsList className="w-full min-w-[280px]">
-            {POOL_TABS.map((tab) => {
-              const Icon = tab.icon;
-              return (
-                <TabsTrigger key={tab.key} value={tab.key} className="flex-1">
-                  <Icon className="size-3.5" strokeWidth={1.8} />
-                  <span className="hidden sm:inline">{t(tab.labelKey)}</span>
-                  <span className="sm:hidden">{tab.key === "gpt" ? "GPT" : tab.key === "kiro" ? "Kiro" : "Grok"}</span>
-                  <Badge variant="secondary" className="ml-0.5 h-4 min-w-4 px-1 text-[10px] tabular-nums">
-                    {counts[tab.key]}
-                  </Badge>
-                </TabsTrigger>
-              );
-            })}
-          </TabsList>
-        </div>
+        {fixedTab ? null : (
+          <div className="min-w-0 overflow-x-auto rounded-xl border border-border/80 bg-card p-1.5 shadow-[var(--shadow-card)]">
+            <TabsList className="w-full min-w-[280px]">
+              {POOL_TABS.map((tab) => {
+                const Icon = tab.icon;
+                return (
+                  <TabsTrigger key={tab.key} value={tab.key} className="flex-1">
+                    <Icon className="size-3.5" strokeWidth={1.8} />
+                    <span className="hidden sm:inline">{t(tab.labelKey)}</span>
+                    <span className="sm:hidden">{tab.key === "gpt" ? "GPT" : tab.key === "kiro" ? "Kiro" : "Grok"}</span>
+                    <Badge variant="secondary" className="ml-0.5 h-4 min-w-4 px-1 text-[10px] tabular-nums">
+                      {counts[tab.key]}
+                    </Badge>
+                  </TabsTrigger>
+                );
+              })}
+            </TabsList>
+          </div>
+        )}
 
         <TabsContent value={activeTab} className="mt-4 space-y-4">
           <div className="flex flex-wrap items-start justify-between gap-3 px-0.5">
@@ -537,6 +566,9 @@ export function ManagedAccountsPage() {
                               <Button size="sm" variant="secondary" onClick={() => openTest(account)}>
                                 <FlaskConical />{t("managedAccounts.test")}
                               </Button>
+                              {normalizeProvider(String(account.provider)) === "chatgpt" ? (
+                                <CredentialActions exportKey={account.exportKey} />
+                              ) : null}
                               <Button size="icon" variant="ghost" className="size-7" title={t("managedAccounts.editTags")} onClick={() => openTagDialog([account.exportKey])}>
                                 <Pencil />
                               </Button>
@@ -562,6 +594,42 @@ export function ManagedAccountsPage() {
           </DashboardPanel>
         </TabsContent>
       </Tabs>
+
+      <Dialog open={importOpen} onOpenChange={setImportOpen}>
+        <DialogContent className="max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>{t("managedAccounts.importTitle", { provider: t(activeTabDef.labelKey) })}</DialogTitle>
+            <DialogDescription>{t("managedAccounts.importDescription")}</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3">
+            <Input
+              type="file"
+              accept=".json,.jsonl,.txt"
+              onChange={(event) => {
+                const file = event.target.files?.[0];
+                if (file) {
+                  void file.text().then(setImportData);
+                }
+                event.target.value = "";
+              }}
+            />
+            <Textarea
+              className="min-h-52 font-mono text-xs"
+              value={importData}
+              onChange={(event) => setImportData(event.target.value)}
+              placeholder={t("managedAccounts.importPlaceholder")}
+              spellCheck={false}
+            />
+          </div>
+          <DialogFooter>
+            <Button variant="secondary" size="sm" onClick={() => setImportOpen(false)}>{t("common.cancel")}</Button>
+            <Button size="sm" disabled={!importData.trim() || importMutation.isPending} onClick={() => importMutation.mutate()}>
+              {importMutation.isPending ? <Spinner className="size-3.5" /> : <Upload />}
+              {t("managedAccounts.importAction")}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <Dialog open={tagDialogKeys !== null} onOpenChange={(open) => { if (!open) setTagDialogKeys(null); }}>
         <DialogContent>
@@ -616,6 +684,33 @@ export function ManagedAccountsPage() {
   );
 }
 
+function CredentialActions({ exportKey }: { exportKey: string }) {
+  const { t } = useTranslation();
+  const credentialQuery = useQuery({
+    queryKey: ["managed-account-credential", exportKey],
+    queryFn: () => getManagedAccountCredential(exportKey),
+    enabled: false,
+  });
+  const credential = credentialQuery.data;
+  const loadCredential = () => {
+    void credentialQuery.refetch().catch((error) => {
+      toast.error(error instanceof Error ? error.message : t("errors.generic"));
+    });
+  };
+  const copyJson = credential?.credential ? JSON.stringify(credential.credential, null, 2) : "";
+  return (
+    <div className="flex items-center gap-0.5 rounded-md border border-border/70 px-0.5" title={t("managedAccounts.credentialActions") }>
+      <Button type="button" size="icon" variant="ghost" className="size-7" aria-label={t("managedAccounts.loadCredential")} onClick={loadCredential} disabled={credentialQuery.isFetching}>
+        {credentialQuery.isFetching ? <Spinner className="size-3.5" /> : <Copy />}
+      </Button>
+      <CopyButton value={credential?.session ?? ""} disabled={!credential?.session} copyLabel={t("managedAccounts.copySession")} />
+      <CopyButton value={credential?.refresh_token ?? ""} disabled={!credential?.refresh_token} copyLabel={t("managedAccounts.copyRefreshToken")} />
+      <CopyButton value={credential?.access_token ?? ""} disabled={!credential?.access_token} copyLabel={t("managedAccounts.copyAccessToken")} />
+      <CopyButton value={copyJson} disabled={!copyJson} copyLabel={t("managedAccounts.copyCredential")} />
+    </div>
+  );
+}
+
 type AccountTestDialogProps = {
   account: ManagedAccount;
   initialMode: AccountTestMode;
@@ -624,7 +719,7 @@ type AccountTestDialogProps = {
   onCompleted: () => void;
 };
 
-function AccountTestDialog({ account, initialMode, models, onClose, onCompleted }: AccountTestDialogProps) {
+export function AccountTestDialog({ account, initialMode, models, onClose, onCompleted }: AccountTestDialogProps) {
   const { t } = useTranslation();
   const provider = normalizeProvider(String(account.provider));
   const supportedModes = POOL_TABS.find((tab) => tab.provider === provider)?.modes ?? [];

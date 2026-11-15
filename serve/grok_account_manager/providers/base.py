@@ -9,7 +9,7 @@ from typing import Any, Protocol, TypedDict, runtime_checkable
 class RegistrationResult(TypedDict, total=False):
     email: str
     credential: str
-    profile: dict[str, str]
+    profile: dict[str, Any]
     full_credential: dict[str, Any]
     oauth_status: str
     oauth_error: str

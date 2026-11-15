@@ -44,6 +44,11 @@ class ExportRequest(BaseModel):
     exportKeys: list[str] = Field(default_factory=list)
 
 
+class ImportAccountsRequest(BaseModel):
+    provider: str = ""
+    data: str = Field(default="", max_length=5_000_000)
+
+
 class OutlookMailboxPoolRequest(BaseModel):
     data: str = Field(default="", max_length=1_000_000)
 

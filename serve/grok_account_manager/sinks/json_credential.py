@@ -150,12 +150,25 @@ class JsonCredentialSink:
         if "full_credential" in result:
             credential = dict(result["full_credential"])
         elif normalized == "chatgpt":
-            # ChatGPT 凭证格式 - 只保留必要字段
             session_data = result.get("profile", {}).get("session_data", {})
+            session_data = session_data if isinstance(session_data, dict) else {}
+            access_token = session_data.get("access_token") or session_data.get("accessToken") or result.get("credential") or ""
+            refresh_token = session_data.get("refresh_token") or session_data.get("refreshToken") or ""
+            session_token = session_data.get("session") or session_data.get("session_token") or session_data.get("session_cookie") or ""
             credential = {
                 "email": result["email"],
-                "accessToken": session_data.get("accessToken") or result["credential"],
                 "provider": "chatgpt",
+                "access_token": access_token,
+                "accessToken": access_token,
+                "refresh_token": refresh_token,
+                "refreshToken": refresh_token,
+                "id_token": session_data.get("id_token") or session_data.get("idToken") or "",
+                "session": session_token,
+                "session_token": session_token,
+                "cookie": session_data.get("cookie") or "",
+                "cookies": session_data.get("cookies") or [],
+                "session_data": session_data,
+                "auth_raw": session_data,
             }
         else:
             # Grok 凭证格式

@@ -1,11 +1,13 @@
 import { zodResolver } from "@hookform/resolvers/zod";
 import {
   BookOpen,
+  Bot,
   Box,
   ChevronDown,
   ChevronRight,
   Eye,
   ExternalLink,
+  FlaskConical,
   HeartHandshake,
   Image,
   KeyRound,
@@ -24,7 +26,6 @@ import {
   Settings,
   Sparkles,
   Sun,
-  Tags,
   Video,
   type LucideIcon,
 } from "lucide-react";
@@ -62,7 +63,9 @@ const navigationGroups: NavGroup[] = [
     key: "resources",
     label: "navGroups.resources",
     items: [
-      { href: "/managed-accounts", label: "nav.managedAccounts", title: "managedAccounts.title", description: "managedAccounts.description", icon: Tags },
+      { href: "/accounts/grok", label: "nav.grokPool", title: "managedAccounts.tabs.grok", description: "managedAccounts.tabDescriptions.grok", icon: Sparkles },
+      { href: "/accounts/kiro", label: "nav.kiroPool", title: "managedAccounts.tabs.kiro", description: "managedAccounts.tabDescriptions.kiro", icon: Bot },
+      { href: "/accounts/gpt", label: "nav.gptPool", title: "managedAccounts.tabs.gpt", description: "managedAccounts.tabDescriptions.gpt", icon: Image },
       { href: "/models", label: "nav.models", title: "models.title", description: "models.description", icon: Box },
     ],
   },
@@ -78,6 +81,7 @@ const navigationGroups: NavGroup[] = [
     key: "gateway",
     label: "navGroups.gateway",
     items: [
+      { href: "/account-tests", label: "nav.accountTests", title: "accountTests.title", description: "accountTests.description", icon: FlaskConical },
       { href: "/client-keys", label: "nav.clientKeys", title: "keys.title", description: "keys.description", icon: KeyRound },
       { href: "/request-audits", label: "nav.audits", title: "audits.title", description: "audits.description", icon: Eye },
     ],

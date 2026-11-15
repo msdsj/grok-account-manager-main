@@ -168,8 +168,119 @@ def export_credentials(export_keys: list[str]) -> list[dict]:
     return exported
 
 
+def get_account_credential(export_key: str) -> dict:
+    key = str(export_key or "").strip()
+    if not key:
+        raise ValueError("exportKey 必填")
+    refs = account_db.get_credential_refs([key])
+    if not refs:
+        raise ValueError("没有找到指定账号")
+    credential = dict(refs[0]["credential"])
+    access_token = str(credential.get("access_token") or credential.get("accessToken") or "").strip()
+    refresh_token = str(credential.get("refresh_token") or credential.get("refreshToken") or "").strip()
+    session = str(
+        credential.get("session")
+        or credential.get("session_token")
+        or credential.get("sessionToken")
+        or credential.get("session_cookie")
+        or ""
+    ).strip()
+    cookie = str(credential.get("cookie") or "").strip()
+    return {
+        "exportKey": key,
+        "provider": credential.get("provider") or refs[0]["account"].get("provider"),
+        "email": credential.get("email") or refs[0]["account"].get("email"),
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "session": session,
+        "cookie": cookie,
+        "credential": credential,
+    }
+
+
 def export_all_credentials() -> list[dict]:
     return account_db.export_credentials()
+
+
+def _import_payloads(data: str, provider: str) -> list[dict]:
+    text = str(data or "").strip()
+    if not text:
+        raise ValueError("请粘贴账号 JSON 或凭证文本")
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        parsed = None
+    if isinstance(parsed, dict):
+        for key in ("accounts", "data", "items"):
+            value = parsed.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+        return [parsed]
+    if isinstance(parsed, list):
+        return [item for item in parsed if isinstance(item, dict)]
+
+    payloads: list[dict] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            item = json.loads(line)
+        except ValueError:
+            item = None
+        if isinstance(item, dict):
+            payloads.append(item)
+            continue
+        parts = [part.strip() for part in line.replace("|", "----").split("----")]
+        if len(parts) < 2 or not parts[0]:
+            continue
+        credential: dict = {"email": parts[0]}
+        if provider == "kiro":
+            credential["accessToken"] = parts[1]
+            if len(parts) > 2:
+                credential["refreshToken"] = parts[2]
+        elif provider == "chatgpt":
+            credential["accessToken"] = parts[1]
+            if len(parts) > 2:
+                credential["refreshToken"] = parts[2]
+        else:
+            credential["access_token"] = parts[1]
+            credential["sso_token"] = parts[1]
+            if len(parts) > 2:
+                credential["refresh_token"] = parts[2]
+        payloads.append(credential)
+    return payloads
+
+
+def import_accounts(provider: str, data: str) -> dict:
+    normalized = normalize_provider(provider)
+    if normalized not in {"grok", "kiro", "chatgpt"}:
+        raise ValueError(f"不支持的账号类型：{provider}")
+    payloads = _import_payloads(data, normalized)
+    if not payloads:
+        raise ValueError("没有识别到可导入的账号")
+    imported = 0
+    skipped = 0
+    for item in payloads:
+        credential = dict(item)
+        credential.setdefault("provider", normalized)
+        email = str(credential.get("email") or credential.get("emailAddress") or "").strip()
+        if not email:
+            skipped += 1
+            continue
+        credential["email"] = email
+        export_key = _stable_export_key(normalized, credential)
+        account = account_from_credential(
+            credential,
+            Path("database"),
+            export_key=export_key,
+            account_id=export_key.rsplit(":", 1)[-1],
+            provider=normalized,
+        )
+        account_db.upsert_account(account, credential, Path("database"), 0)
+        imported += 1
+    invalidate_accounts_cache()
+    return {"imported": imported, "skipped": skipped, "accounts": list_accounts()}
 
 
 def _persist_updated_ref(ref: dict, updated: dict) -> dict:
@@ -613,6 +724,37 @@ def delete_accounts_for_upstream_accounts(upstream_accounts: list[dict]) -> dict
     return {"removed": deleted, "matched": len(emails | user_ids)}
 
 
+def _refresh_chatgpt_credential(item: dict) -> dict:
+    """刷新一个 ChatGPT 账号的 access_token。
+
+    ChatGPT 走的是自己的 OAuth 端点，和 xAI 的刷新流程完全不同，不能共用
+    Grok 那套 ``refresh_xai_access_token`` / ``fetch_complete_credential``。
+    """
+    from ...providers.gpt.gateway import upstream
+
+    refresh_token = str(item.get("refresh_token") or item.get("refreshToken") or "").strip()
+    if not refresh_token:
+        raise ValueError("该账号没有 refresh_token，无法刷新")
+
+    user_agent = str(item.get("user_agent") or "").strip() or (
+        str((item.get("browser_identity") or {}).get("user_agent") or "").strip()
+    )
+    tokens = upstream.refresh_access_token(refresh_token, timeout=30, user_agent=user_agent)
+    item.update(tokens)
+    item["accessToken"] = str(tokens.get("access_token") or "")
+
+    # 顺带验证出口可达：chatgpt.com 在部分网络下必须走本地代理才能访问，
+    # 直连会超时，那正是「账号显示失效」的根因之一。
+    session = upstream.create_session(item)
+    try:
+        upstream.bootstrap(session, item, timeout=20)
+    except Exception as error:
+        raise ValueError(f"刷新成功但无法访问 ChatGPT：{error}") from error
+    finally:
+        session.close()
+    return item
+
+
 def refresh_account_quota(account_id: str) -> dict:
     """Refresh one stored account quota using its current access token."""
     from ...providers.grok.account_tester import refresh_xai_access_token
@@ -623,30 +765,37 @@ def refresh_account_quota(account_id: str) -> dict:
         raise ValueError(f"未找到 accountId={account_id} 的账号")
 
     item = dict(ref["credential"])
-    access_token = str(item.get("access_token") or "").strip()
-    refresh_token = str(item.get("refresh_token") or "").strip()
-    refreshed_tokens: dict | None = None
-    if refresh_token:
-        try:
-            refreshed_tokens = refresh_xai_access_token(
-                refresh_token,
-                token_endpoint=str(item.get("token_endpoint") or ""),
-                timeout=30,
-            )
-            item.update(refreshed_tokens)
-            access_token = str(item.get("access_token") or "").strip()
-        except Exception as error:
-            if not access_token:
-                raise ValueError(f"刷新 access_token 失败：{error}") from error
-    if not access_token:
-        raise ValueError("该账号没有 access_token 或可用 refresh_token，无法刷新额度")
-    email = str(item.get("email") or "").strip()
-    updated = fetch_complete_credential(
-        email=email,
-        sso_token=access_token,
-        profile=None,
-        oauth_tokens=refreshed_tokens,
-    )
+    provider = _account_provider(ref)
+
+    if provider == "chatgpt":
+        # ChatGPT 的刷新走自己的 OAuth 端点。
+        item = _refresh_chatgpt_credential(item)
+        updated = item
+    else:
+        access_token = str(item.get("access_token") or "").strip()
+        refresh_token = str(item.get("refresh_token") or "").strip()
+        refreshed_tokens: dict | None = None
+        if refresh_token:
+            try:
+                refreshed_tokens = refresh_xai_access_token(
+                    refresh_token,
+                    token_endpoint=str(item.get("token_endpoint") or ""),
+                    timeout=30,
+                )
+                item.update(refreshed_tokens)
+                access_token = str(item.get("access_token") or "").strip()
+            except Exception as error:
+                if not access_token:
+                    raise ValueError(f"刷新 access_token 失败：{error}") from error
+        if not access_token:
+            raise ValueError("该账号没有 access_token 或可用 refresh_token，无法刷新额度")
+        email = str(item.get("email") or "").strip()
+        updated = fetch_complete_credential(
+            email=email,
+            sso_token=access_token,
+            profile=None,
+            oauth_tokens=refreshed_tokens,
+        )
     for keep_key in (
         "id",
         "created_at",
@@ -655,6 +804,12 @@ def refresh_account_quota(account_id: str) -> dict:
         "expires_at",
         "expires_at_raw",
         "auth_raw",
+        "browser_identity",
+        "user_agent",
+        "cookie",
+        "cookies",
+        "oai_device_id",
+        "oai_session_id",
     ):
         if item.get(keep_key) is not None and updated.get(keep_key) is None:
             updated[keep_key] = item[keep_key]
@@ -678,6 +833,12 @@ def persist_registration_result(provider_name: str, result: dict) -> dict:
     oauth_status = str(result.get("oauth_status") or "not_requested")
     if oauth_status in {"pending", "failed"}:
         raise ValueError("refresh_token 尚未成功获取，拒绝写入账号数据库")
+    if normalized == "chatgpt" and oauth_status == "ready" and not str(
+        (result.get("full_credential") or {}).get("refresh_token")
+        or (result.get("full_credential") or {}).get("refreshToken")
+        or ""
+    ).strip():
+        raise ValueError("GPT OAuth 状态为 ready，但完整凭证缺少 refresh_token")
 
     if "full_credential" in result:
         credential = dict(result["full_credential"])

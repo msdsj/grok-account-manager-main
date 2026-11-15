@@ -29,6 +29,7 @@ hardwareConcurrency、deviceMemory、languages），不改写 User-Agent / Chrom
 from __future__ import annotations
 
 import json
+import os
 import secrets
 import sys
 from dataclasses import dataclass, field
@@ -37,23 +38,23 @@ _DeviceProfile = tuple[str, str, tuple[int, ...], tuple[int, ...]]
 
 _DEVICE_PROFILES_BY_PLATFORM: dict[str, list[_DeviceProfile]] = {
     "darwin": [
-        ("Google Inc. (Apple)", "ANGLE (Apple, ANGLE Metal Renderer: Apple M1, Unspecified Version)", (8,), (8,)),
-        ("Google Inc. (Apple)", "ANGLE (Apple, ANGLE Metal Renderer: Apple M2, Unspecified Version)", (8, 10, 12), (8,)),
-        ("Google Inc. (Apple)", "ANGLE (Apple, ANGLE Metal Renderer: Apple M3, Unspecified Version)", (8, 10, 12, 14, 16), (8,)),
-        ("Google Inc. (Apple)", "ANGLE (Apple, ANGLE Metal Renderer: Apple M4, Unspecified Version)", (10, 12, 14, 16), (8,)),
+        ("Google Inc. (Apple)", "ANGLE (Apple, ANGLE Metal Renderer: Apple M1, Unspecified Version)", (8,), (8, 16)),
+        ("Google Inc. (Apple)", "ANGLE (Apple, ANGLE Metal Renderer: Apple M2, Unspecified Version)", (8, 10, 12), (8, 16)),
+        ("Google Inc. (Apple)", "ANGLE (Apple, ANGLE Metal Renderer: Apple M3, Unspecified Version)", (8, 10, 12, 14, 16), (8, 16)),
+        ("Google Inc. (Apple)", "ANGLE (Apple, ANGLE Metal Renderer: Apple M4, Unspecified Version)", (10, 12, 14, 16), (8, 16)),
     ],
     "win32": [
-        ("Google Inc. (Intel)", "ANGLE (Intel, Intel(R) Iris(R) Xe Graphics (0x00009A49) Direct3D11 vs_5_0 ps_5_0, D3D11)", (8, 12, 16), (4, 8)),
-        ("Google Inc. (Intel)", "ANGLE (Intel, Intel(R) UHD Graphics 630 (0x00003E9B) Direct3D11 vs_5_0 ps_5_0, D3D11)", (4, 6, 8, 12), (4, 8)),
-        ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 (0x00002504) Direct3D11 vs_5_0 ps_5_0, D3D11)", (8, 12, 16), (8,)),
-        ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, NVIDIA GeForce GTX 1660 Ti (0x00002191) Direct3D11 vs_5_0 ps_5_0, D3D11)", (8, 12, 16), (8,)),
-        ("Google Inc. (AMD)", "ANGLE (AMD, AMD Radeon RX 6600 (0x000073FF) Direct3D11 vs_5_0 ps_5_0, D3D11)", (8, 12, 16), (8,)),
+        ("Google Inc. (Intel)", "ANGLE (Intel, Intel(R) Iris(R) Xe Graphics (0x00009A49) Direct3D11 vs_5_0 ps_5_0, D3D11)", (8, 12, 16), (4, 8, 16)),
+        ("Google Inc. (Intel)", "ANGLE (Intel, Intel(R) UHD Graphics 630 (0x00003E9B) Direct3D11 vs_5_0 ps_5_0, D3D11)", (4, 6, 8, 12), (4, 8, 16)),
+        ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 (0x00002504) Direct3D11 vs_5_0 ps_5_0, D3D11)", (8, 12, 16), (8, 16)),
+        ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, NVIDIA GeForce GTX 1660 Ti (0x00002191) Direct3D11 vs_5_0 ps_5_0, D3D11)", (8, 12, 16), (8, 16)),
+        ("Google Inc. (AMD)", "ANGLE (AMD, AMD Radeon RX 6600 (0x000073FF) Direct3D11 vs_5_0 ps_5_0, D3D11)", (8, 12, 16), (8, 16)),
     ],
     "linux": [
-        ("Google Inc. (Intel)", "ANGLE (Intel, Mesa Intel(R) UHD Graphics 630 (CFL GT2), OpenGL 4.6)", (4, 6, 8, 12), (4, 8)),
-        ("Google Inc. (Intel)", "ANGLE (Intel, Mesa Intel(R) Iris(R) Xe Graphics (TGL GT2), OpenGL 4.6)", (8, 12, 16), (4, 8)),
-        ("Google Inc. (AMD)", "ANGLE (AMD, AMD Radeon RX 6600 (radeonsi, navi23, LLVM 17.0.6), OpenGL 4.6)", (8, 12, 16), (8,)),
-        ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060/PCIe/SSE2, OpenGL 4.6)", (8, 12, 16), (8,)),
+        ("Google Inc. (Intel)", "ANGLE (Intel, Mesa Intel(R) UHD Graphics 630 (CFL GT2), OpenGL 4.6)", (4, 6, 8, 12), (4, 8, 16)),
+        ("Google Inc. (Intel)", "ANGLE (Intel, Mesa Intel(R) Iris(R) Xe Graphics (TGL GT2), OpenGL 4.6)", (8, 12, 16), (4, 8, 16)),
+        ("Google Inc. (AMD)", "ANGLE (AMD, AMD Radeon RX 6600 (radeonsi, navi23, LLVM 17.0.6), OpenGL 4.6)", (8, 12, 16), (8, 16)),
+        ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060/PCIe/SSE2, OpenGL 4.6)", (8, 12, 16), (8, 16)),
     ],
 }
 
@@ -150,6 +151,15 @@ def _languages_for(lang: str | None) -> tuple[str, ...]:
     return (raw, primary, "en")
 
 
+def chrome_languages(lang: str | None) -> tuple[str, ...]:
+    """返回该 locale 对应的 ``navigator.languages`` 列表。
+
+    与 Chrome 的 ``intl.accept_languages`` pref 保持同一份来源，
+    避免请求头与页面可见语言对不上。
+    """
+    return _languages_for(lang)
+
+
 def _gpu_family(gpu_renderer: str) -> str:
     text = str(gpu_renderer).lower()
     for family in ("apple", "nvidia", "amd", "intel"):
@@ -170,11 +180,63 @@ class BrowserIdentity:
     languages: tuple[str, ...] = ("en-US", "en")
     platform: str = "MacIntel"
     webgl_extensions: tuple[str, ...] = field(default_factory=tuple)
+    # True 表示这台机器就用真实硬件参数（与手动注册完全同源）。
+    real_device: bool = False
 
 
-def random_identity(platform_name: str | None = None, lang: str | None = None) -> BrowserIdentity:
-    """生成一套本轮注册全程复用的随机指纹身份。"""
+def _real_hardware() -> tuple[int, int]:
+    """读取本机真实 CPU 核数与内存（GB），供 real_device 模式使用。
+
+    Chrome 的 ``navigator.hardwareConcurrency`` 就是物理/逻辑核数，
+    ``navigator.deviceMemory`` 上限 8 GB——和这里保持一致。
+    """
+    concurrency = 0
+    try:
+        concurrency = int(os.cpu_count() or 0)
+    except Exception:
+        concurrency = 0
+    if concurrency <= 0:
+        concurrency = 8
+    memory_gb = 8
+    try:
+        import psutil
+
+        memory_gb = int(round(psutil.virtual_memory().total / (1024**3)))
+    except Exception:
+        memory_gb = 8
+    # Chrome 上报的 deviceMemory 取值有限；新版 Chrome 的上限已放宽到 16。
+    memory_gb = max(1, min(16, memory_gb))
+    return concurrency, memory_gb
+
+
+def random_identity(
+    platform_name: str | None = None,
+    lang: str | None = None,
+    *,
+    real_device: bool = False,
+) -> BrowserIdentity:
+    """生成一套本轮注册全程复用的随机指纹身份。
+
+    ``real_device=True`` 时不伪造硬件参数：CPU 核数、内存取本机真实值，GPU
+    字符串留空表示「不伪装，按浏览器真实值上报」。手动注册走的就是这条路径，
+    自动化注册要与之对齐时应当使用它。
+    """
     platform_key = _platform_key(platform_name)
+    if real_device:
+        concurrency, memory_gb = _real_hardware()
+        return BrowserIdentity(
+            gpu_vendor="",
+            gpu_renderer="",
+            hardware_concurrency=concurrency,
+            device_memory=memory_gb,
+            canvas_seed=secrets.randbelow(2**31) or 1,
+            audio_seed=secrets.randbelow(2**31) or 1,
+            languages=_languages_for(lang),
+            platform=_PLATFORM_NAMES[platform_key],
+            webgl_extensions=(),
+            real_device=True,
+        )
+
     gpu_vendor, gpu_renderer, concurrency_values, memory_values = secrets.choice(
         _DEVICE_PROFILES_BY_PLATFORM[platform_key]
     )
@@ -324,16 +386,88 @@ _SCRIPT_TEMPLATE = r"""
     }
 
     // ---- WebGL --------------------------------------------------------------
+    // ⚠️ 一致性要点：getSupportedExtensions() 报出来的扩展列表必须和
+    // getExtension(name) 的返回值对得上。之前的实现只改了前者，于是页面读到
+    // 「支持 EXT_texture_compression_astc」，再调 getExtension 却是 null——
+    // 这种自相矛盾比不改还显眼。
+    //
+    // 同时，GPU 字符串只在「与真实 GPU 同族」时才伪装：扩展列表始终取浏览器真实
+    // 值，如果伪装成 NVIDIA 而真实是 Intel，扩展能力就对不上了。
     var WEBGL_EXTENSIONS = __WEBGL_EXTENSIONS__;
+    var GPU_VENDOR = __GPU_VENDOR__;
+    var GPU_RENDERER = __GPU_RENDERER__;
+    var GPU_FAMILY = __GPU_FAMILY__;
     var MAX_TEXTURE_SIZE = 16384;
+
+    function familyOf(renderer) {
+        var text = String(renderer || '').toLowerCase();
+        if (text.indexOf('apple') >= 0) return 'apple';
+        if (text.indexOf('nvidia') >= 0) return 'nvidia';
+        if (text.indexOf('amd') >= 0) return 'amd';
+        if (text.indexOf('intel') >= 0) return 'intel';
+        return '';
+    }
 
     function patchWebGL(proto) {
         if (!proto) return;
 
         var origGetParameter = proto.getParameter;
+        var origGetSupportedExtensions = proto.getSupportedExtensions;
+        var origGetExtension = proto.getExtension;
+
+        // 扩展列表必须在「真正用到时」再取：document_start 阶段画布往往还没有
+        // 可用的 WebGL 上下文，提前取会得到空数组，然后退回到合成列表——
+        // 那份合成列表和 getExtension 的真实能力对不上，正是要避免的矛盾。
+        var advertised = null;
+
+        function getAdvertised() {
+            if (advertised) return advertised;
+            var real = [];
+            try {
+                var probe = document.createElement('canvas');
+                var gl = probe.getContext('webgl') || probe.getContext('experimental-webgl');
+                if (gl && typeof origGetSupportedExtensions === 'function') {
+                    // 必须调用原生实现，否则会再次进入本 patch 造成递归。
+                    real = origGetSupportedExtensions.call(gl) || [];
+                }
+            } catch (error) {}
+            advertised = real.length
+                ? Array.prototype.slice.call(real)
+                : WEBGL_EXTENSIONS.slice();
+            return advertised;
+        }
+
+        // 真实 GPU 字符串：同样延后到第一次使用时再取。
+        var realRenderer = '';
+        var realVendor = '';
+        var rendererResolved = false;
+
+        function resolveRenderer() {
+            if (rendererResolved) return;
+            rendererResolved = true;
+            try {
+                var probe = document.createElement('canvas');
+                var gl = probe.getContext('webgl') || probe.getContext('experimental-webgl');
+                if (gl) {
+                    realRenderer = String(origGetParameter.call(gl, 37446) || '');
+                    realVendor = String(origGetParameter.call(gl, 37445) || '');
+                }
+            } catch (error) {}
+        }
+
         defineMethod(proto, 'getParameter', function (parameter) {
-            if (parameter === 37445) return __GPU_VENDOR__;    // UNMASKED_VENDOR_WEBGL
-            if (parameter === 37446) return __GPU_RENDERER__;  // UNMASKED_RENDERER_WEBGL
+            resolveRenderer();
+            // 整套 WebGL 参数只在「确实要伪装 GPU、且伪装与真实环境同族」时才覆盖。
+            // 否则一律回落到浏览器真实值——避免出现「真实扩展列表 + 被改写的
+            // MAX_TEXTURE_SIZE」这种半真半假的组合。
+            if (!GPU_VENDOR || !GPU_RENDERER) {
+                return origGetParameter.call(this, parameter);
+            }
+            if (familyOf(realRenderer) !== GPU_FAMILY) {
+                return origGetParameter.call(this, parameter);
+            }
+            if (parameter === 37445) return GPU_VENDOR;     // UNMASKED_VENDOR_WEBGL
+            if (parameter === 37446) return GPU_RENDERER;   // UNMASKED_RENDERER_WEBGL
             if (parameter === 3379) return MAX_TEXTURE_SIZE;   // MAX_TEXTURE_SIZE
             if (parameter === 34076) return MAX_TEXTURE_SIZE;  // MAX_CUBE_MAP_TEXTURE_SIZE
             if (parameter === 34930) return 16;                // MAX_TEXTURE_IMAGE_UNITS
@@ -346,13 +480,101 @@ _SCRIPT_TEMPLATE = r"""
             return origGetParameter.call(this, parameter);
         }, 'getParameter');
 
-        var origGetSupportedExtensions = proto.getSupportedExtensions;
         if (typeof origGetSupportedExtensions === 'function') {
             defineMethod(proto, 'getSupportedExtensions', function () {
-                return WEBGL_EXTENSIONS.slice();
+                return getAdvertised().slice();
             }, 'getSupportedExtensions');
         }
+
+        // 让 getExtension 与广告列表保持一致：列表里有就返回一个可用的对象，
+        // 没有就返回 null。
+        if (typeof origGetExtension === 'function') {
+            defineMethod(proto, 'getExtension', function (name) {
+                var key = String(name || '');
+                if (getAdvertised().indexOf(key) < 0) {
+                    return origGetExtension.call(this, name);
+                }
+                try {
+                    var real = origGetExtension.call(this, name);
+                    if (real) return real;
+                } catch (error) {}
+                return makeExtensionStub(key);
+            }, 'getExtension');
+        }
     }
+
+    // 扩展对象的最小可信实现：带 isContextLost / 常量，toString 像原生。
+    var EXTENSION_CONSTANTS = {
+        'EXT_texture_compression_bptc': {
+            COMPRESSED_RGBA_BPTC_UNORM_EXT: 0x80E1,
+            COMPRESSED_RGB_BPTC_SIGNED_FLOAT_EXT: 0x80E3,
+            COMPRESSED_RGBA_BPTC_SIGNED_FLOAT_EXT: 0x80E4,
+        },
+        'EXT_texture_compression_rgtc': {
+            COMPRESSED_RED_RGTC1_EXT: 0x8DBD,
+            COMPRESSED_SIGNED_RED_RGTC1_EXT: 0x8DBE,
+            COMPRESSED_RED_GREEN_RGTC2_EXT: 0x8DBF,
+            COMPRESSED_SIGNED_RED_GREEN_RGTC2_EXT: 0x8DC0,
+        },
+        'WEBGL_compressed_texture_astc': {
+            COMPRESSED_RGBA_ASTC_4x4_KHR: 0x93B0,
+            COMPRESSED_RGBA_ASTC_5x4_KHR: 0x93B1,
+            COMPRESSED_RGBA_ASTC_5x5_KHR: 0x93B2,
+            COMPRESSED_RGBA_ASTC_6x5_KHR: 0x93B3,
+            COMPRESSED_RGBA_ASTC_6x6_KHR: 0x93B4,
+            COMPRESSED_RGBA_ASTC_8x5_KHR: 0x93B5,
+            COMPRESSED_RGBA_ASTC_8x6_KHR: 0x93B6,
+            COMPRESSED_RGBA_ASTC_8x8_KHR: 0x93B7,
+            COMPRESSED_RGBA_ASTC_10x5_KHR: 0x93B8,
+            COMPRESSED_RGBA_ASTC_10x6_KHR: 0x93B9,
+            COMPRESSED_RGBA_ASTC_10x8_KHR: 0x93BA,
+            COMPRESSED_RGBA_ASTC_10x10_KHR: 0x93BB,
+            COMPRESSED_RGBA_ASTC_12x10_KHR: 0x93BC,
+            COMPRESSED_RGBA_ASTC_12x12_KHR: 0x93BD,
+        },
+        'WEBGL_compressed_texture_etc': {
+            COMPRESSED_RGB8_ETC2: 0x9274,
+            COMPRESSED_RGBA8_ETC2_EAC: 0x9278,
+            COMPRESSED_RGB8_PUNCHTHROUGH_ALPHA1_ETC2_EAC: 0x9279,
+            COMPRESSED_RGBA8_PUNCHTHROUGH_ALPHA1_ETC2_EAC: 0x927A,
+            COMPRESSED_RGB8_ETC1: 0x9270,
+            COMPRESSED_RGBA8_ETC1_EAC: 0x9272,
+        },
+        'WEBGL_compressed_texture_etc1': {
+            COMPRESSED_RGB8_ETC1: 0x9270,
+            COMPRESSED_RGBA8_ETC1_EAC: 0x9272,
+        },
+        'WEBGL_compressed_texture_pvrtc': {
+            COMPRESSED_RGB_PVRTC_4BPPV1_IMG: 0x8C00,
+            COMPRESSED_RGB_PVRTC_2BPPV1_IMG: 0x8C01,
+            COMPRESSED_RGBA_PVRTC_4BPPV1_IMG: 0x8C02,
+            COMPRESSED_RGBA_PVRTC_2BPPV1_IMG: 0x8C03,
+        },
+        'WEBGL_compressed_texture_s3tc': {
+            COMPRESSED_RGB_S3TC_DXT1_EXT: 0x83F0,
+            COMPRESSED_RGBA_S3TC_DXT1_EXT: 0x83F1,
+            COMPRESSED_RGBA_S3TC_DXT3_EXT: 0x83F2,
+            COMPRESSED_RGBA_S3TC_DXT5_EXT: 0x83F3,
+        },
+        'WEBGL_compressed_texture_s3tc_srgb': {
+            COMPRESSED_RGB_S3TC_DXT1_EXT: 0x8C4C,
+            COMPRESSED_RGBA_S3TC_DXT1_EXT: 0x8C4D,
+            COMPRESSED_RGBA_S3TC_DXT3_EXT: 0x8C4E,
+            COMPRESSED_RGBA_S3TC_DXT5_EXT: 0x8C4F,
+        },
+    };
+
+    function makeExtensionStub(name) {
+        var constants = EXTENSION_CONSTANTS[name] || {};
+        var stub = { isContextLost: function () { return false; } };
+        for (var key in constants) {
+            if (Object.prototype.hasOwnProperty.call(constants, key)) {
+                stub[key] = constants[key];
+            }
+        }
+        return register(stub, name);
+    }
+
     try { patchWebGL(window.WebGLRenderingContext && window.WebGLRenderingContext.prototype); } catch (e) {}
     try { patchWebGL(window.WebGL2RenderingContext && window.WebGL2RenderingContext.prototype); } catch (e) {}
 
@@ -419,46 +641,164 @@ _SCRIPT_TEMPLATE = r"""
         }
     } catch (e) {}
 
-    // ---- window.chrome 兜底 --------------------------------------------------
-    // 正常 Chrome 本来就有；这里只在缺失时补上（headless / 特殊启动参数下会丢）。
+    // ---- window.chrome ------------------------------------------------------
+    // ⚠️ 这里原本有一段「补全 window.chrome.runtime / csi / loadTimes」的代码，
+    // 反而制造了破绽：新版 Chrome 已经移除了 chrome.csi() 与 chrome.loadTimes()，
+    // 而没有安装扩展的页面上 chrome.runtime 本来就是 undefined。
+    // 也就是说，这段补丁凭空造出了三个「真实 Chrome 不存在」的属性——比不补更显眼。
+    // 现在完全不动 window.chrome：真实浏览器有什么就是什么。
+
+    // ---- 插件与 MIME 列表 --------------------------------------------------
+    // 桌面版 Chrome 固定带 5 个 PDF 插件条目和 2 个 MIME 类型。正常可见窗口下
+    // 这些本来就存在；只有在无头/受限环境里才会为空，这时补齐成桌面 Chrome 的
+    // 标准形态，避免「插件列表为空」这种一眼可见的特征。
     try {
-        if (!window.chrome) {
-            Object.defineProperty(window, 'chrome', { value: {}, writable: true, configurable: true });
-        }
-        if (window.chrome && !window.chrome.runtime) {
-            window.chrome.runtime = {
-                OnInstalledReason: {
-                    CHROME_UPDATE: 'chrome_update',
-                    INSTALL: 'install',
-                    SHARED_MODULE_UPDATE: 'shared_module_update',
-                    UPDATE: 'update',
-                },
-                PlatformArch: { ARM: 'arm', ARM64: 'arm64', X86_32: 'x86-32', X86_64: 'x86-64' },
-                PlatformOs: {
-                    ANDROID: 'android', CROS: 'cros', LINUX: 'linux',
-                    MAC: 'mac', OPENBSD: 'openbsd', WIN: 'win',
-                },
-            };
-        }
-        if (window.chrome && !window.chrome.csi) {
-            window.chrome.csi = register(function csi() {
-                var now = Date.now();
-                return { onloadT: now, startE: now, pageT: 1000, tran: 15 };
-            }, 'csi');
-        }
-        if (window.chrome && !window.chrome.loadTimes) {
-            window.chrome.loadTimes = register(function loadTimes() {
-                var now = Date.now() / 1000;
-                return {
-                    commitLoadTime: now, connectionInfo: 'h2',
-                    finishDocumentLoadTime: now, finishLoadTime: now,
-                    firstPaintAfterLoadTime: 0, firstPaintTime: now,
-                    navigationType: 'Other', npnNegotiatedProtocol: 'h2',
-                    requestTime: now, startLoadTime: now,
-                    wasAlternateProtocolAvailable: false,
-                    wasFetchedViaSpdy: true, wasNpnNegotiated: true,
+        if (!navigator.plugins || navigator.plugins.length === 0) {
+            var PDF_PLUGINS = [
+                { name: 'PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+                { name: 'Chrome PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+                { name: 'Chromium PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+                { name: 'Microsoft Edge PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+                { name: 'WebKit built-in PDF', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+            ];
+            var pluginArray = PDF_PLUGINS.map(function (item) {
+                var plugin = {
+                    name: item.name,
+                    filename: item.filename,
+                    description: item.description,
+                    length: 2,
+                    0: { type: 'application/pdf', suffixes: 'pdf', description: 'Portable Document Format' },
+                    1: { type: 'text/pdf', suffixes: 'pdf', description: 'Portable Document Format' },
+                    item: function (index) { return this[index] || null; },
+                    namedItem: function (type) {
+                        return this[0].type === type ? this[0] : null;
+                    },
                 };
-            }, 'loadTimes');
+                return register(plugin, 'Plugin');
+            });
+            pluginArray.item = function (index) { return this[index] || null; };
+            pluginArray.namedItem = function (name) {
+                for (var i = 0; i < this.length; i++) {
+                    if (this[i].name === name) return this[i];
+                }
+                return null;
+            };
+            pluginArray.refresh = function () {};
+            Object.defineProperty(Navigator.prototype, 'plugins', {
+                get: function () { return pluginArray; }, configurable: true,
+            });
+        }
+    } catch (e) {}
+
+    try {
+        if (!navigator.mimeTypes || navigator.mimeTypes.length === 0) {
+            var mimeArray = [
+                { type: 'application/pdf', suffixes: 'pdf', description: 'Portable Document Format' },
+                { type: 'text/pdf', suffixes: 'pdf', description: 'Portable Document Format' },
+            ];
+            mimeArray.item = function (index) { return this[index] || null; };
+            mimeArray.namedItem = function (type) {
+                for (var i = 0; i < this.length; i++) {
+                    if (this[i].type === type) return this[i];
+                }
+                return null;
+            };
+            Object.defineProperty(Navigator.prototype, 'mimeTypes', {
+                get: function () { return mimeArray; }, configurable: true,
+            });
+        }
+    } catch (e) {}
+})();
+"""
+
+
+# real_device 模式使用的脚本：除了「插件列表为空时补齐」这一项兜底，
+# 什么都不改写。CPU 核数、内存、Canvas、Audio、GPU 全部保持真实 Chrome 的原值，
+# 这样自动化注册与手动注册在同一台机器上得到的是同一份指纹。
+_REAL_DEVICE_SCRIPT = r"""
+(function () {
+    var nativeToString = Function.prototype.toString;
+    var fakeRegistry = new WeakMap();
+
+    function register(fn, name) {
+        try {
+            fakeRegistry.set(fn, 'function ' + (name || fn.name || '') + '() { [native code] }');
+        } catch (e) {}
+        return fn;
+    }
+
+    function toStringShim() {
+        var faked = fakeRegistry.get(this);
+        if (typeof faked === 'string') return faked;
+        return nativeToString.call(this);
+    }
+    register(toStringShim, 'toString');
+    try {
+        Object.defineProperty(Function.prototype, 'toString', {
+            value: toStringShim,
+            writable: true,
+            configurable: true,
+            enumerable: false,
+        });
+    } catch (e) {}
+
+    // 桌面版 Chrome 固定带 5 个 PDF 插件条目和 2 个 MIME 类型。正常可见窗口下
+    // 这些本来就存在；只有在无头/受限环境里才会为空，这时补齐成桌面 Chrome 的
+    // 标准形态，避免「插件列表为空」这种一眼可见的特征。
+    try {
+        if (!navigator.plugins || navigator.plugins.length === 0) {
+            var PDF_PLUGINS = [
+                { name: 'PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+                { name: 'Chrome PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+                { name: 'Chromium PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+                { name: 'Microsoft Edge PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+                { name: 'WebKit built-in PDF', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+            ];
+            var pluginArray = PDF_PLUGINS.map(function (item) {
+                var plugin = {
+                    name: item.name,
+                    filename: item.filename,
+                    description: item.description,
+                    length: 2,
+                    0: { type: 'application/pdf', suffixes: 'pdf', description: 'Portable Document Format' },
+                    1: { type: 'text/pdf', suffixes: 'pdf', description: 'Portable Document Format' },
+                    item: function (index) { return this[index] || null; },
+                    namedItem: function (type) {
+                        return this[0].type === type ? this[0] : null;
+                    },
+                };
+                return register(plugin, 'Plugin');
+            });
+            pluginArray.item = function (index) { return this[index] || null; };
+            pluginArray.namedItem = function (name) {
+                for (var i = 0; i < this.length; i++) {
+                    if (this[i].name === name) return this[i];
+                }
+                return null;
+            };
+            pluginArray.refresh = function () {};
+            Object.defineProperty(Navigator.prototype, 'plugins', {
+                get: function () { return pluginArray; }, configurable: true,
+            });
+        }
+    } catch (e) {}
+
+    try {
+        if (!navigator.mimeTypes || navigator.mimeTypes.length === 0) {
+            var mimeArray = [
+                { type: 'application/pdf', suffixes: 'pdf', description: 'Portable Document Format' },
+                { type: 'text/pdf', suffixes: 'pdf', description: 'Portable Document Format' },
+            ];
+            mimeArray.item = function (index) { return this[index] || null; };
+            mimeArray.namedItem = function (type) {
+                for (var i = 0; i < this.length; i++) {
+                    if (this[i].type === type) return this[i];
+                }
+                return null;
+            };
+            Object.defineProperty(Navigator.prototype, 'mimeTypes', {
+                get: function () { return mimeArray; }, configurable: true,
+            });
         }
     } catch (e) {}
 })();
@@ -471,7 +811,19 @@ def build_fingerprint_script(identity: BrowserIdentity) -> str:
     覆盖 WebGL、Canvas、AudioContext、navigator 系列字段，并把所有 patch 的
     ``Function.prototype.toString`` 伪装成原生实现。写法上和仓库里已有的
     turnstile_patch 扩展保持一致。
+
+    凡是「伪装了就会和真实环境打架」的信号（GPU 字符串、插件列表），一律遵循
+    「不伪装就不改、伪装就同族」的原则，保证页面上读到的任何两个属性之间不会
+    自相矛盾。
+
+    ``real_device=True`` 时返回的是**几乎不做事**的脚本：只保留插件列表的兜底
+    填充，其余一律按真实 Chrome 的原样上报。这条路径让自动化注册与手动注册
+    落在完全相同的环境特征上——包括 Canvas 读数、CPU 核数、内存大小这些
+    随机化模式下会被改写的值。
     """
+    gpu_renderer = str(identity.gpu_renderer or "")
+    if identity.real_device:
+        return _REAL_DEVICE_SCRIPT.strip()
     replacements = {
         "__LANGUAGES__": json.dumps(list(identity.languages or ("en-US", "en"))),
         "__HARDWARE_CONCURRENCY__": str(int(identity.hardware_concurrency)),
@@ -479,8 +831,9 @@ def build_fingerprint_script(identity: BrowserIdentity) -> str:
         "__PLATFORM__": json.dumps(identity.platform or "MacIntel"),
         "__CANVAS_SEED__": str(int(identity.canvas_seed)),
         "__AUDIO_SEED__": str(int(identity.audio_seed)),
-        "__GPU_VENDOR__": json.dumps(identity.gpu_vendor),
-        "__GPU_RENDERER__": json.dumps(identity.gpu_renderer),
+        "__GPU_VENDOR__": json.dumps(str(identity.gpu_vendor or "")),
+        "__GPU_RENDERER__": json.dumps(gpu_renderer),
+        "__GPU_FAMILY__": json.dumps(_gpu_family(gpu_renderer) if gpu_renderer else ""),
         "__WEBGL_EXTENSIONS__": json.dumps(list(identity.webgl_extensions or ())),
     }
     script = _SCRIPT_TEMPLATE

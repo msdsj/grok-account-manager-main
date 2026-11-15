@@ -13,7 +13,13 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from ...gateway import audit as gateway_audit
 from ...gateway import catalog
-from ...gateway.auth import AuthContext, authenticate, create_client_key, require_scope
+from ...gateway.auth import (
+    AuthContext,
+    authenticate,
+    create_client_key,
+    read_default_client_key,
+    require_scope,
+)
 from ...gateway.errors import GatewayError
 from ...gateway.pool import PoolAccount, cool_down, pick
 from ...gateway.registry import get_adapter
@@ -525,6 +531,11 @@ def _pool_accounts(provider: str) -> list[PoolAccount]:
 @router.get("/api/gateway/keys")
 def list_client_keys() -> dict:
     return {"items": db.list_client_keys()}
+
+
+@router.get("/api/gateway/keys/default")
+def get_default_client_key() -> dict:
+    return {"key": read_default_client_key()}
 
 
 @router.post("/api/gateway/keys")

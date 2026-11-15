@@ -1,7 +1,7 @@
 import { Navigate, createBrowserRouter } from "react-router-dom";
 
 import { AnonymousBoundary, AuthBoundary } from "@/app/auth-boundary";
-import { DeferredApiDocsPage, DeferredAppShell, DeferredClientKeysPage, DeferredCreativeConsolePage, DeferredDashboardPage, DeferredManagedAccountsPage, DeferredModelsPage, DeferredOperationLogsPage, DeferredRegisterTaskPage, DeferredRequestAuditsPage, DeferredSettingsPage } from "@/app/deferred-pages";
+import { DeferredAccountTestBoardPage, DeferredApiDocsPage, DeferredAppShell, DeferredClientKeysPage, DeferredCreativeConsolePage, DeferredDashboardPage, DeferredGptAccountPoolPage, DeferredGrokAccountPoolPage, DeferredKiroAccountPoolPage, DeferredManagedAccountsPage, DeferredModelsPage, DeferredOperationLogsPage, DeferredRegisterTaskPage, DeferredRequestAuditsPage, DeferredSettingsPage } from "@/app/deferred-pages";
 import { LoginPage } from "@/features/auth/login-page";
 
 export const router = createBrowserRouter([
@@ -18,8 +18,12 @@ export const router = createBrowserRouter([
           { index: true, element: <Navigate to="/dashboard" replace /> },
           { path: "/dashboard", element: <DeferredDashboardPage /> },
           { path: "/register", element: <DeferredRegisterTaskPage /> },
-          { path: "/accounts", element: <Navigate to="/managed-accounts" replace /> },
+          { path: "/accounts", element: <Navigate to="/accounts/grok" replace /> },
+          { path: "/accounts/grok", element: <DeferredGrokAccountPoolPage /> },
+          { path: "/accounts/kiro", element: <DeferredKiroAccountPoolPage /> },
+          { path: "/accounts/gpt", element: <DeferredGptAccountPoolPage /> },
           { path: "/managed-accounts", element: <DeferredManagedAccountsPage /> },
+          { path: "/account-tests", element: <DeferredAccountTestBoardPage /> },
           { path: "/operation-logs", element: <DeferredOperationLogsPage /> },
           { path: "/models", element: <DeferredModelsPage /> },
           { path: "/creative-console", element: <DeferredCreativeConsolePage /> },

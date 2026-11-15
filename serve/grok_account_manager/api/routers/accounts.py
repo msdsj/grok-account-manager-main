@@ -6,7 +6,7 @@ import json
 import time
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 
 from ...sinks.cpa_credential import build_cpa_download
 from ..schemas import (
@@ -17,6 +17,7 @@ from ..schemas import (
     AccountVideoTestRequest,
     DeleteAccountsRequest,
     ExportRequest,
+    ImportAccountsRequest,
     RefreshQuotaRequest,
     TestBatchRequest,
 )
@@ -25,6 +26,7 @@ from ...core import audit
 from ..services.accounts import (
     delete_accounts,
     export_credentials,
+    import_accounts,
     refresh_account_quota,
     test_account_chat,
     test_account_image,
@@ -103,6 +105,48 @@ def update_account_tags(body: AccountTagsRequest, request: Request) -> dict:
         detail={"tags": body.tags, "mode": mode, "updated": result.get("updated", 0)},
     )
     return {**result, "items": account_service.list_account_tags()}
+
+
+@router.post("/api/accounts/import")
+def import_selected_accounts(body: ImportAccountsRequest, request: Request) -> dict:
+    try:
+        result = import_accounts(body.provider, body.data)
+        audit.log_operation(
+            audit.actor_from_request(request),
+            "account.import",
+            target_type="account",
+            target_id=str(body.provider or ""),
+            detail={"imported": result.get("imported"), "skipped": result.get("skipped")},
+        )
+        return result
+    except Exception as error:
+        audit.log_operation(
+            audit.actor_from_request(request),
+            "account.import",
+            target_type="account",
+            target_id=str(body.provider or ""),
+            result=f"failed: {error}",
+        )
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+
+@router.get("/api/accounts/{export_key:path}/credential")
+def get_account_credential(export_key: str, request: Request) -> dict:
+    try:
+        result = account_service.get_account_credential(export_key)
+        audit.log_operation(
+            audit.actor_from_request(request),
+            "account.credential.read",
+            target_type="account",
+            target_id=export_key,
+            detail={"provider": result.get("provider")},
+        )
+        return JSONResponse(
+            content=result,
+            headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+        )
+    except Exception as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
 
 
 @router.post("/api/accounts/export")

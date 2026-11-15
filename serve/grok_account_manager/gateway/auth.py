@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import secrets
 import uuid
 from dataclasses import dataclass
@@ -12,6 +13,8 @@ from .errors import GatewayError
 
 KEY_PREFIX = "gak_"
 VALID_SCOPES = ("chat", "image", "video")
+DEFAULT_KEY_NAME = "系统默认密钥"
+DEFAULT_KEY_META = "default_client_key"
 
 
 @dataclass(frozen=True)
@@ -105,4 +108,58 @@ def create_client_key(
         "keyPrefix": token[:12],
         "scopes": selected,
         "models": [str(item).strip() for item in (models or []) if str(item).strip()],
+    }
+
+
+def _create_default_key() -> dict:
+    token = str(os.environ.get("GATEWAY_DEFAULT_KEY") or "").strip()
+    if not token:
+        token = KEY_PREFIX + secrets.token_urlsafe(32)
+    db.insert_client_key(
+        "default",
+        DEFAULT_KEY_NAME,
+        hash_key(token),
+        token[:12],
+        scopes=list(VALID_SCOPES),
+        models=[],
+    )
+    db.set_meta(DEFAULT_KEY_META, token)
+    return {
+        "id": "default",
+        "name": DEFAULT_KEY_NAME,
+        "key": token,
+        "keyPrefix": token[:12],
+        "scopes": list(VALID_SCOPES),
+        "models": [],
+    }
+
+
+def ensure_default_client_key() -> dict | None:
+    """首次启动时预创建系统密钥，明文保存在本地数据库供控制台展示。"""
+    keys = db.list_client_keys()
+    if keys:
+        if db.get_meta(DEFAULT_KEY_META):
+            return None
+        # 旧版本只存了哈希：仅当现有默认密钥需要补全明文时轮换一次。
+        if any(str(key.get("id") or "") == "default" for key in keys):
+            db.delete_client_key("default")
+            return _create_default_key()
+        return None
+    return _create_default_key()
+
+
+def read_default_client_key() -> dict | None:
+    token = db.get_meta(DEFAULT_KEY_META)
+    if not token:
+        return None
+    record = db.find_client_key_by_hash(hash_key(token))
+    if not record:
+        return None
+    return {
+        "id": str(record.get("id") or ""),
+        "name": str(record.get("name") or DEFAULT_KEY_NAME),
+        "key": token,
+        "keyPrefix": token[:12],
+        "scopes": list(record.get("scopes") or VALID_SCOPES),
+        "models": list(record.get("models") or []),
     }

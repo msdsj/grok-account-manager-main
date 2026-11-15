@@ -26,6 +26,7 @@ from ...providers.grok.oauth_exchange import CloudflareBlockedError
 from ...mail.sources import build_mailbox_source
 from ...providers.grok.registration import GrokProvider
 from ...providers.gpt.registration import ChatGPTProvider
+from ...providers.kiro.registration import KiroProvider
 from ...sinks.sub2api import (
     build_sub2api_oauth_accounts,
     create_sub2api_accounts,
@@ -299,7 +300,13 @@ class RegistrationJobManager:
         proxy_data: str = "",
         proxy_file: str = "",
     ) -> dict:
-        auto_import_sub2api = bool(auto_import_sub2api)
+        provider = str(provider or "grok").strip().lower()
+        if provider not in {"grok", "chatgpt", "kiro"}:
+            raise ValueError(f"不支持的注册类型：{provider}")
+        if provider == "kiro" and str(email_source or "").strip().lower() != "google":
+            raise ValueError("Kiro 注册请选择「Google 账号」邮箱源")
+        oauth_exchange = bool(oauth_exchange) and provider in {"grok", "kiro"}
+        auto_import_sub2api = bool(auto_import_sub2api) and provider == "grok"
         if auto_import_sub2api and not oauth_exchange:
             raise ValueError("自动导入 Sub2API 需要开启 refresh_token")
         sub2api_config = load_sub2api_env_config() if auto_import_sub2api else None
@@ -1288,6 +1295,8 @@ class RegistrationJobManager:
         """创建 provider 实例（支持 grok、chatgpt）。"""
         if provider_name == "chatgpt":
             provider = ChatGPTProvider()
+        elif provider_name == "kiro":
+            provider = KiroProvider()
         else:
             provider = GrokProvider()
             provider.enable_oauth_exchange = oauth_exchange

@@ -1,5 +1,5 @@
 import { apiRequest, LEGACY_ADMIN_API_PREFIX } from "@/shared/api/client";
-import { createObjectDecoder, hasShape, isArrayOf, isNumber, isOneOf, isOptional, isString } from "@/shared/api/decoder";
+import { createObjectDecoder, hasShape, isArrayOf, isBoolean, isNumber, isOneOf, isOptional, isString } from "@/shared/api/decoder";
 import type { PeriodValue } from "@/shared/lib/period";
 
 export type DashboardPeriod = PeriodValue;
@@ -19,6 +19,21 @@ export type DashboardUsageDTO = {
   outputTokensPerSecond?: number;
   firstTokenSamples?: number;
   throughputSamples?: number;
+};
+
+export type DashboardAccountPoolDTO = {
+  provider: string;
+  total: number;
+  active: number;
+  chatAvailable: number;
+  imageAvailable: number;
+  videoAvailable: number;
+  quotaAccounts: number;
+  weeklyUsed: number;
+  weeklyTotal: number;
+  lastJobStatus: string;
+  lastJobAt: number;
+  running: boolean;
 };
 
 export type DashboardDTO = {
@@ -41,6 +56,7 @@ export type DashboardDTO = {
   activity: Array<{ start: string; requests: number }>;
   topModels: Array<{ model: string; requests: number; inputTokens: number; cachedInputTokens: number; outputTokens: number; reasoningTokens: number; tokens: number; billedCostUsdTicks: number }>;
   providers: Array<{ provider: string; requests: number; successfulRequests: number; tokens: number }>;
+  accountPools: DashboardAccountPoolDTO[];
 };
 
 const dashboardSeriesItem = hasShape({
@@ -70,6 +86,11 @@ const decodeDashboard = createObjectDecoder<DashboardDTO>("dashboard", {
   activity: isArrayOf(hasShape({ start: isString, requests: isNumber })),
   topModels: isArrayOf(dashboardModelItem),
   providers: isArrayOf(hasShape({ provider: isString, requests: isNumber, successfulRequests: isNumber, tokens: isNumber })),
+  accountPools: isArrayOf(hasShape({
+    provider: isString, total: isNumber, active: isNumber, chatAvailable: isNumber, imageAvailable: isNumber,
+    videoAvailable: isNumber, quotaAccounts: isNumber, weeklyUsed: isNumber, weeklyTotal: isNumber,
+    lastJobStatus: isString, lastJobAt: isNumber, running: isBoolean,
+  })),
 });
 
 export function getDashboard(period: DashboardPeriod, timezone: string, refresh = false): Promise<DashboardDTO> {

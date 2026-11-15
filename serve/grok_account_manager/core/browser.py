@@ -17,6 +17,7 @@ import psutil
 from DrissionPage import Chromium, ChromiumOptions
 from DrissionPage.errors import PageDisconnectedError
 
+from . import browser_identity
 from . import fingerprint as fingerprint_mod
 from .proxy_pool import mask_proxy_server, normalize_proxy_server, redact_proxy_secrets
 
@@ -339,33 +340,45 @@ def calculate_window_bounds(
     window_count: int = 1,
     screen_bounds: tuple[int, int, int, int] | None = None,
 ) -> tuple[int, int, int, int]:
-    """Return a visible slot on the main display for up to six concurrent windows.
+    """Return a visible slot on the main display for concurrent windows.
 
-    超过六个并发窗口时，多出来的窗口会落到同一格上。此时按「圈数」做少量级联
-    偏移，避免多个窗口像素级完全重叠——完全重叠的窗口在 macOS 上会让同一块屏幕
-    区域反复重绘，看起来就是"窗口在抖/发卡"。
+    **窗口尺寸优先保证「页面能正常渲染」，而不是「全部塞进屏幕」。**
+
+    并发注册时如果把窗口高度对半分（3 个窗口时 1 排、4 个以上变 2 排），
+    视口会被压到 500px 上下，chatgpt.com 就会切换成移动端版式——
+    注册按钮的 DOM 结构、文案、位置全都不一样，自动化于是「找不到注册按钮」。
+    这正是并发 3 个正常、5~10 个点不到的原因。
+
+    所以这里的策略是：每个窗口保持足够高的视口，放不下时让它们在屏幕上
+    错位重叠，而不是把每个窗口压扁。注册时窗口默认是最小化的，重叠不影���
+    自动化操作；需要盯着看时也不会出现像素级完全重叠导致的反复重绘。
     """
     screen_x, screen_y, screen_width, screen_height = screen_bounds or _screen_bounds()
-    visible_count = max(1, min(6, int(window_count or 1)))
-    columns = min(3, visible_count)
-    rows = 1 if visible_count <= 3 else 2
-    per_cycle = columns * rows
+
+    # 单个窗口的最小可用尺寸：够放下桌面版注册弹窗和完整表单。
+    min_width = 600
+    min_height = 680
+
+    count = max(1, int(window_count or 1))
+    # 横向最多 3 列；再多的窗口就靠错位重叠区分。
+    columns = max(1, min(3, count))
+    slot_width = max(min_width, screen_width // columns)
+
     index = max(0, int(window_index))
-    slot = index % per_cycle
-    cycle = index // per_cycle
-    column = slot % columns
-    row = slot // columns
-    slot_width = max(480, screen_width // columns)
-    slot_height = max(360, screen_height // rows)
-    cascade = (cycle % 8) * 24
-    left = screen_x + column * slot_width + cascade
-    top = screen_y + row * slot_height + cascade
-    # 夹回屏幕内，保证窗口始终落在主显示器上。
-    left = min(left, screen_x + screen_width - 1)
-    top = min(top, screen_y + screen_height - 1)
-    width = min(slot_width, screen_x + screen_width - left)
-    height = min(slot_height, screen_y + screen_height - top)
-    return left, top, width, height
+    slot = index % columns
+    row = index // columns
+
+    # 每一排错开 24px：完全重叠的窗口在 macOS 上会反复重绘，看起来像「窗口在抖」。
+    cascade = (row % 8) * 24
+
+    left = screen_x + slot * slot_width
+    # 水平方向必须留在屏幕内（宽度不够时左边几个窗口会重叠，这是可接受的）。
+    left = min(left, screen_x + max(0, screen_width - slot_width))
+    top = screen_y + cascade
+    # 高度保持满屏：视口够高，页面才不会切到移动端版式。
+    # 代价是窗口可能超出屏幕底部，注册时窗口默认最小化，不影响操作。
+    height = max(min_height, screen_height)
+    return left, top, slot_width, height
 
 
 def build_chromium_options(
@@ -376,6 +389,7 @@ def build_chromium_options(
     start_minimized: bool = False,
     proxy_server: str | None = None,
     proxy_url: str | None = None,
+    real_device: bool | None = None,
 ) -> ChromiumOptions:
     """构造启动参数：自动端口、Turnstile 扩展、强制语言。
 
@@ -389,12 +403,21 @@ def build_chromium_options(
     HTTP/HTTPS/SOCKS4/SOCKS5 代理地址。每个
     Chromium 进程只能在启动时绑定一个代理；需要切换时应重启会话并传入
     新地址。
+
+    `real_device` 控制指纹策略：True 表示不伪造硬件参数（CPU/内存/GPU 都按
+    本机真实值上报），用于让自动化注册与手动注册完全同源；None 表示读环境变量
+    `GROK_ACCOUNT_MANAGER_FINGERPRINT_MODE`（`real` / `random`）。
     """
     if proxy_server is not None and proxy_url is not None:
         raise ValueError("proxy_server 与 proxy_url 只能指定一个")
     selected_proxy = proxy_server if proxy_server is not None else proxy_url
     co = ChromiumOptions()
     normalized_proxy = normalize_proxy_server(selected_proxy) if selected_proxy else None
+
+    if real_device is None:
+        mode = str(os.environ.get("GROK_ACCOUNT_MANAGER_FINGERPRINT_MODE", "") or "").strip().lower()
+        real_device = mode == "real"
+    co._grok_real_device = bool(real_device)
 
     # 跨平台 Chrome 路径检测
     chrome_path = _find_chrome_path()
@@ -464,8 +487,12 @@ def build_chromium_options(
         # 只允许走代理的 UDP，禁止直连 UDP。
         co.set_argument("--force-webrtc-ip-handling-policy=disable_non_proxied_udp")
     co._grok_proxy_server = normalized_proxy
-    # Accept-Language 给一份带后备的列表，避免某些页面对 navigator.language 单值过敏
-    accept_languages = f"{lang},{lang.split('-')[0]};q=0.9,en;q=0.8"
+    # Accept-Language 用 Chrome 自己的降权规则拼（首项无 q、后续每项 -0.1），
+    # 与 navigator.languages 一一对应；之前的写法会出现 "en-US,en;q=0.9,en;q=0.8"
+    # 这种重复项，和真实 Chrome 发出的头对不上。
+    accept_languages = browser_identity.chrome_accept_language(
+        fingerprint_mod.chrome_languages(lang)
+    ) or f"{lang},en;q=0.9"
     co.set_pref("intl.accept_languages", accept_languages)
     co.set_pref("profile.default_content_setting_values.cookies", 1)
     co.set_pref("profile.default_content_settings.cookies", 1)
@@ -500,6 +527,8 @@ class DrissionBrowserSession:
         self._proxy_server = (
             normalize_proxy_server(configured_proxy) if configured_proxy else None
         )
+        # True = 不伪造硬件参数，让自动化注册与手动注册使用同一套真实环境特征。
+        self._real_device = bool(getattr(options, "_grok_real_device", False))
         self._browser: Chromium | None = None
         self._page = None
         self._profile_dir: Path | None = None
@@ -569,11 +598,25 @@ class DrissionBrowserSession:
         处于失效状态）。改为在浏览器起来后用 CDP 的
         ``Page.addScriptToEvaluateOnNewDocument`` 注入：它在任何页面脚本之前、
         在主世界里执行，并且对 iframe 同样生效。
+
+        ``real_device`` 模式下不伪造硬件参数——CPU 核数、内存取本机真实值，
+        GPU 字符串留空表示按浏览器真实值上报。这条路径让自动化注册与手动注册
+        落在完全相同的环境特征上。
         """
         if self._fingerprint_ext_dir is not None:
             shutil.rmtree(self._fingerprint_ext_dir, ignore_errors=True)
             self._fingerprint_ext_dir = None
-        self.identity = fingerprint_mod.random_identity(lang=_options_language(self._options))
+        if bool(getattr(self._options, "_grok_skip_fingerprint", False)):
+            # 基线模式：不注入任何指纹脚本，用来取得「这台机器上的真实 Chrome」
+            # 的原始取值，作为对比基准（见 scripts/fingerprint_audit.py）。
+            self.identity = None
+            self._fingerprint_script = ""
+            print("[*] 已跳过指纹注入（基线模式）")
+            return
+        self.identity = fingerprint_mod.random_identity(
+            lang=_options_language(self._options),
+            real_device=self._real_device,
+        )
         self._fingerprint_script = fingerprint_mod.build_fingerprint_script(self.identity)
         # turnstile_patch 仍按老方式挂着（当前 Chrome 版本下不会生效，保留兼容）。
         try:
@@ -581,12 +624,19 @@ class DrissionBrowserSession:
             self._options.add_extension(TURNSTILE_EXTENSION_PATH)
         except Exception:
             pass
-        print(
-            f"[*] 已生成本轮浏览器指纹: id={self.identity.canvas_seed:08x}, "
-            f"gpu={self.identity.gpu_renderer}, "
-            f"cpu={self.identity.hardware_concurrency}核, mem={self.identity.device_memory}GB, "
-            f"lang={self.identity.languages[0]}"
-        )
+        if self._real_device:
+            print(
+                f"[*] 本轮采用真实设备指纹: cpu={self.identity.hardware_concurrency}核, "
+                f"mem={self.identity.device_memory}GB, lang={self.identity.languages[0]} "
+                "（与手动注册同源）"
+            )
+        else:
+            print(
+                f"[*] 已生成本轮浏览器指纹: id={self.identity.canvas_seed:08x}, "
+                f"gpu={self.identity.gpu_renderer}, "
+                f"cpu={self.identity.hardware_concurrency}核, mem={self.identity.device_memory}GB, "
+                f"lang={self.identity.languages[0]}"
+            )
 
     def _inject_fingerprint(self) -> None:
         """把本轮指纹脚本注册到页面，保证在每个新文档创建前执行。"""
@@ -1005,6 +1055,14 @@ class DrissionBrowserSession:
         except Exception:
             return ""
         return str(value or "").strip()
+
+    def capture_identity(self) -> dict:
+        """采集当前浏览器的身份快照（UA / Client Hints / 语言 / 设备 id …）。
+
+        注册流程在拿到 session 后调用它，把结果写进凭证；网关层据此回放请求头，
+        保证「注册用的浏览器」与「使用账号的客户端」是同一台设备。
+        """
+        return browser_identity.capture_browser_identity(self)
 
     def refresh_page(self):
         """验证码确认后页面会跳转，旧 page 句柄可能断开，统一重新获取当前活动 tab。

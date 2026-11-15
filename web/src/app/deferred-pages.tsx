@@ -10,6 +10,10 @@ const DashboardPage = lazyNamed(() => import("@/features/dashboard/dashboard-pag
 const ApiDocsPage = lazyNamed(() => import("@/features/docs/api-docs-page"), "ApiDocsPage");
 const ModelsPage = lazyNamed(() => import("@/features/models/models-page"), "ModelsPage");
 const ManagedAccountsPage = lazyNamed(() => import("@/features/managed-accounts/managed-accounts-page"), "ManagedAccountsPage");
+const GrokAccountPoolPage = lazyNamed(() => import("@/features/managed-accounts/account-pool-page"), "GrokAccountPoolPage");
+const KiroAccountPoolPage = lazyNamed(() => import("@/features/managed-accounts/account-pool-page"), "KiroAccountPoolPage");
+const GptAccountPoolPage = lazyNamed(() => import("@/features/managed-accounts/account-pool-page"), "GptAccountPoolPage");
+const AccountTestBoardPage = lazyNamed(() => import("@/features/account-tests/account-test-board-page"), "AccountTestBoardPage");
 const OperationLogsPage = lazyNamed(() => import("@/features/logs/operation-logs-page"), "OperationLogsPage");
 const RegisterTaskPage = lazyNamed(() => import("@/features/register-task/register-task-page"), "RegisterTaskPage");
 const SettingsPage = lazyNamed(() => import("@/features/settings/settings-page"), "SettingsPage");
@@ -36,6 +40,22 @@ export function DeferredModelsPage() {
 
 export function DeferredManagedAccountsPage() {
   return <DeferredPage page={ManagedAccountsPage} />;
+}
+
+export function DeferredGrokAccountPoolPage() {
+  return <DeferredPage page={GrokAccountPoolPage} />;
+}
+
+export function DeferredKiroAccountPoolPage() {
+  return <DeferredPage page={KiroAccountPoolPage} />;
+}
+
+export function DeferredGptAccountPoolPage() {
+  return <DeferredPage page={GptAccountPoolPage} />;
+}
+
+export function DeferredAccountTestBoardPage() {
+  return <DeferredPage page={AccountTestBoardPage} />;
 }
 
 export function DeferredOperationLogsPage() {

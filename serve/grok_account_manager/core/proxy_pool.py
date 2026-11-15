@@ -31,6 +31,17 @@ _PROXY_CREDENTIAL_URL_PATTERN = re.compile(
 # proxy pool" below whose whole point is to never reuse an endpoint.
 EGRESS_PROXY_ENV_VAR = "GROK_ACCOUNT_MANAGER_EGRESS_PROXY"
 
+# 默认出口代理：本机常见的本地代理（Clash / Mihomo / Surge 等）的 mixed 端口。
+#
+# 为什么必须默认走它：Chrome 会自动继承 macOS 的系统代理设置，而 Python 的
+# ``requests`` 只认 HTTP_PROXY / HTTPS_PROXY 环境变量、不认系统代理。
+# 两边不一致就会出现「浏览器注册走代理、网关调用却是本机直连」——
+# 服务端看到的是同一账号在两个出口 IP 之间跳变，和设备指纹不一致是同一类问题。
+DEFAULT_EGRESS_PROXY = "http://127.0.0.1:7890"
+
+# 显式关闭默认出口代理时用的取值。
+_EGRESS_PROXY_DISABLED_VALUES = {"", "none", "off", "direct", "false", "0"}
+
 
 class ProxyPoolError(ValueError):
     """Base error for malformed proxy pool input."""
@@ -236,10 +247,22 @@ def get_fixed_egress_proxy() -> str | None:
     Unlike :class:`ProxyPool`, this endpoint is reused for every round; it
     exists for hosts that cannot reach the registration/mail targets at all
     without a local outbound proxy, not for exit-IP rotation.
+
+    读取顺序：
+
+    1. ``GROK_ACCOUNT_MANAGER_EGRESS_PROXY``——显式指定；
+    2. 没有配置时用 :data:`DEFAULT_EGRESS_PROXY`（本机本地代理 7890）；
+    3. 显式写成 ``none`` / ``off`` / ``direct`` 时表示「不要走代理」。
+
+    这个出口会被浏览器（``--proxy-server``）和 Python HTTP 侧（``requests``）
+    同时使用，保证「注册用的出口」和「使用账号的出口」是同一个 IP。
     """
 
-    raw = os.environ.get(EGRESS_PROXY_ENV_VAR, "").strip()
-    if not raw:
+    raw = os.environ.get(EGRESS_PROXY_ENV_VAR)
+    if raw is None:
+        raw = DEFAULT_EGRESS_PROXY
+    raw = str(raw).strip()
+    if raw.lower() in _EGRESS_PROXY_DISABLED_VALUES:
         return None
     return normalize_proxy_server(raw)
 

@@ -17,7 +17,7 @@ from typing import Any
 
 import requests
 
-from .proxy_pool import normalize_proxy_server
+from .proxy_pool import get_fixed_egress_proxy, normalize_proxy_server
 
 
 def build_requests_session(
@@ -28,11 +28,17 @@ def build_requests_session(
     """Build a requests session pinned to one round's network identity.
 
     ``trust_env`` follows the caller's intent: it is disabled **only** when an
-    explicit per-round proxy is supplied, so ambient ``HTTP(S)_PROXY`` /
-    ``NO_PROXY`` cannot silently move the Python half of the round to a
-    different egress than the browser. Without an explicit proxy the session
-    keeps ``trust_env=True`` so the system proxy still works (manual xAI OAuth
+    explicit proxy is supplied, so ambient ``HTTP(S)_PROXY`` / ``NO_PROXY``
+    cannot silently move the Python half of the round to a different egress
+    than the browser. Without an explicit proxy the session keeps
+    ``trust_env=True`` so the system proxy still works (manual xAI OAuth
     relies on that same route).
+
+    没有显式传代理时，会套用默认出口（本地 VPN，通常是 127.0.0.1:7890）。
+    这一步很关键：Chrome 会自动继承 macOS 的系统代理设置，而 ``requests``
+    只认 ``HTTP_PROXY`` / ``HTTPS_PROXY`` 环境变量、不认系统代理。两边不一致
+    就会出现「浏览器注册走代理、网关调用却是本机直连」——服务端看到同一个
+    账号在两个出口 IP 之间跳变，和设备指纹不一致是同一类问题。
     """
 
     session = requests.Session()
@@ -43,6 +49,10 @@ def build_requests_session(
     if proxy_url:
         normalized = normalize_proxy_server(proxy_url)
         session.proxies.update({"http": normalized, "https": normalized})
+    else:
+        default_proxy = get_fixed_egress_proxy()
+        if default_proxy:
+            session.proxies.update({"http": default_proxy, "https": default_proxy})
     if user_agent:
         browser_user_agent = str(user_agent).strip()
         session.headers.update({"User-Agent": browser_user_agent})

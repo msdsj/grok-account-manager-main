@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Plus, RefreshCw, Search, Trash2 } from "lucide-react";
+import { Eye, EyeOff, Plus, RefreshCw, Search, Trash2 } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
@@ -28,6 +28,7 @@ import {
   createGatewayKey,
   deleteGatewayKey,
   formatGatewayTimestamp,
+  getDefaultGatewayKey,
   listGatewayKeys,
   listGatewayModels,
   type CreatedGatewayKeyDTO,
@@ -55,8 +56,10 @@ export function ClientKeysPage() {
   const [models, setModels] = useState<string[]>([]);
   const [createdKey, setCreatedKey] = useState<CreatedGatewayKeyDTO | null>(null);
   const [deleting, setDeleting] = useState<GatewayKeyDTO | null>(null);
+  const [showDefaultKey, setShowDefaultKey] = useState(false);
 
   const keysQuery = useQuery({ queryKey: ["gateway-keys"], queryFn: listGatewayKeys });
+  const defaultKeyQuery = useQuery({ queryKey: ["gateway-default-key"], queryFn: getDefaultGatewayKey });
   const modelsQuery = useQuery({
     queryKey: ["gateway-models"],
     queryFn: () => listGatewayModels(),
@@ -116,6 +119,30 @@ export function ClientKeysPage() {
           </>
         )}
       />
+
+      {defaultKeyQuery.data ? (
+        <DashboardPanel id="gateway-default-key" title={t("keys.defaultTitle")}>
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="min-w-0">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-[13px] font-medium">{defaultKeyQuery.data.name}</span>
+                <Badge variant="default">{t("keys.defaultBadge")}</Badge>
+              </div>
+              <code className="mt-2 block break-all rounded-md border border-border/60 bg-secondary/40 px-2.5 py-1.5 font-mono text-xs text-muted-foreground">
+                {showDefaultKey ? defaultKeyQuery.data.key : `${defaultKeyQuery.data.keyPrefix}${"•".repeat(24)}`}
+              </code>
+              <p className="mt-1.5 text-xs text-muted-foreground">{t("keys.defaultHelp")}</p>
+            </div>
+            <div className="flex shrink-0 items-center gap-1">
+              <Button variant="secondary" size="sm" onClick={() => setShowDefaultKey((value) => !value)}>
+                {showDefaultKey ? <EyeOff /> : <Eye />}
+                {showDefaultKey ? t("keys.hide") : t("keys.reveal")}
+              </Button>
+              <CopyButton value={defaultKeyQuery.data.key} copyLabel={t("common.copy")} />
+            </div>
+          </div>
+        </DashboardPanel>
+      ) : null}
 
       <DashboardPanel id="gateway-keys-filters" title={t("common.filter")}>
         <div className="flex flex-wrap items-center gap-2">

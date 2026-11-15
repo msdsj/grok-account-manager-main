@@ -10,6 +10,7 @@ bootstrap -> sentinel chat requirements -> /f/conversation/prepare
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import re
@@ -22,6 +23,8 @@ from typing import Any
 
 import requests
 
+from ....core import browser_identity
+from ....core.proxy_pool import get_fixed_egress_proxy
 from ....gateway.errors import GatewayError
 from ....gateway.pool import PoolAccount, normalize_provider
 from .pow import build_legacy_requirements_token, build_proof_token, parse_pow_resources
@@ -34,9 +37,12 @@ OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
 OAUTH_CLIENT_ID = "app_2SKx67EdpoN0G6j64rFvigXD"
 DEFAULT_CLIENT_VERSION = "prod-a194cd50d4416d3c0b47c740f206b12ce60f5887"
 DEFAULT_CLIENT_BUILD_NUMBER = "6708908"
+DEFAULT_OAI_LANGUAGE = "en-US"
+# 兜底 UA 必须是「真实存在的 Chrome」，而不是 Edge：账号是在 Chrome 里注册的，
+# 兜底值也必须属于同一浏览器家族，否则 Sec-CH-UA 会与 UA 自相矛盾。
 DEFAULT_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0"
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"
 )
 
 _MAX_IMAGES = 4
@@ -98,29 +104,103 @@ def _cookie_header(credential: dict[str, Any]) -> str:
     return _text(raw)
 
 
+def _identity_of(credential: dict[str, Any]) -> dict[str, Any]:
+    """取回注册时采集的浏览器身份快照。"""
+    raw = credential.get("browser_identity")
+    return raw if isinstance(raw, dict) else {}
+
+
+def stable_device_id(credential: dict[str, Any]) -> str:
+    """返回账号级稳定的设备标识。
+
+    ⚠️ 这里绝对不能每次请求都换一个随机值。``OAI-Device-Id`` 是 OpenAI 侧的
+    设备指纹：同一个账号在每一次调用里上报不同的设备 id，等于告诉服务端
+    「这个凭证正在被无数台设备同时使用」——账号会在几分钟内被判定异常并回收。
+    注册时浏览器已经把 ``oai-did`` 写进 cookie，这里优先沿用它；
+    老账号没有该字段时，用账号自身信息派生一个固定值，保证跨请求、跨进程稳定。
+    """
+    for key in ("oai_device_id", "device_id"):
+        value = _text(credential.get(key))
+        if value:
+            return value
+    identity = _identity_of(credential)
+    value = _text(identity.get("device_id"))
+    if value:
+        return value
+    seed = (
+        access_token(credential)
+        or _cookie_header(credential)
+        or _text(credential.get("email"))
+        or json.dumps(credential, sort_keys=True, ensure_ascii=False, default=str)
+    )
+    digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()
+    return str(uuid.UUID(hex=digest[:32]))
+
+
+def stable_session_id(credential: dict[str, Any]) -> str:
+    """返回账号级稳定的会话标识（同一个浏览器会话内保持不变）。"""
+    for key in ("oai_session_id", "session_id"):
+        value = _text(credential.get(key))
+        if value:
+            return value
+    identity = _identity_of(credential)
+    value = _text(identity.get("session_id"))
+    if value:
+        return value
+    seed = stable_device_id(credential)
+    digest = hashlib.sha256(f"session:{seed}".encode("utf-8")).hexdigest()
+    return str(uuid.UUID(hex=digest[:32]))
+
+
 def _base_headers(credential: dict[str, Any], *, user_agent: str = "") -> dict[str, str]:
-    headers = {
-        "User-Agent": user_agent or _text(credential.get("user_agent")) or DEFAULT_USER_AGENT,
+    """构造与注册时浏览器完全一致的上游请求头。
+
+    核心原则：**请求头必须复述注册时的浏览器**。之前这里写死了一套
+    「Windows 上的 Edge 143」的头（UA + Sec-CH-UA-Platform/Arch + zh-CN 语言），
+    而账号其实是在 macOS 的真实 Chrome 里注册出来的——服务端一比对就发现
+    注册设备与使用设备不是同一台，账号随即被回收。
+    """
+    identity = _identity_of(credential)
+    resolved_user_agent = (
+        user_agent
+        or _text(credential.get("user_agent"))
+        or _text(identity.get("user_agent"))
+        or DEFAULT_USER_AGENT
+    )
+
+    headers: dict[str, str] = {
+        "User-Agent": resolved_user_agent,
+        # 真实 Chrome 的 fetch/XHR 一定会带 Accept；缺失本身就是特征。
+        "Accept": "*/*",
         "Origin": CHATGPT_BASE_URL,
         "Referer": f"{CHATGPT_BASE_URL}/",
-        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,en-US;q=0.7",
         "Cache-Control": "no-cache",
         "Pragma": "no-cache",
         "Priority": "u=1, i",
-        "Sec-Ch-Ua": '"Microsoft Edge";v="143", "Chromium";v="143", "Not A(Brand";v="24"',
-        "Sec-Ch-Ua-Arch": '"x86"',
-        "Sec-Ch-Ua-Bitness": '"64"',
-        "Sec-Ch-Ua-Mobile": "?0",
-        "Sec-Ch-Ua-Platform": '"Windows"',
         "Sec-Fetch-Dest": "empty",
         "Sec-Fetch-Mode": "cors",
         "Sec-Fetch-Site": "same-origin",
-        "OAI-Device-Id": _text(credential.get("oai_device_id") or credential.get("device_id")) or uuid.uuid4().hex,
-        "OAI-Session-Id": _text(credential.get("oai_session_id") or credential.get("session_id")) or uuid.uuid4().hex,
-        "OAI-Language": "zh-CN",
-        "OAI-Client-Version": _text(credential.get("client_version")) or DEFAULT_CLIENT_VERSION,
-        "OAI-Client-Build-Number": _text(credential.get("client_build_number")) or DEFAULT_CLIENT_BUILD_NUMBER,
+        "OAI-Device-Id": stable_device_id(credential),
+        "OAI-Session-Id": stable_session_id(credential),
+        "OAI-Language": _text(identity.get("navigator_language")) or DEFAULT_OAI_LANGUAGE,
+        "OAI-Client-Version": _text(credential.get("client_version"))
+        or _text(identity.get("client_version"))
+        or DEFAULT_CLIENT_VERSION,
+        "OAI-Client-Build-Number": _text(credential.get("client_build_number"))
+        or _text(identity.get("client_build_number"))
+        or DEFAULT_CLIENT_BUILD_NUMBER,
     }
+
+    # Client Hints 与 Accept-Language 全部来自注册时的浏览器快照；
+    # 快照缺失时才回落到「与 UA 自洽」的推导值，绝不会出现 UA 说 Edge、
+    # Client Hints 说 Chromium 这种互相打脸的组合。
+    hint_headers = browser_identity.identity_headers(
+        identity, fallback_user_agent=resolved_user_agent
+    )
+    hint_headers.pop("User-Agent", None)
+    headers.update(hint_headers)
+    headers["User-Agent"] = resolved_user_agent
+
     token = access_token(credential)
     if token:
         headers["Authorization"] = f"Bearer {token}"
@@ -146,12 +226,28 @@ def target_headers(
     return headers
 
 
+def _egress_proxies() -> dict[str, str] | None:
+    """返回出口代理配置；没有配置默认出口时返回 None（走环境变量）。"""
+    proxy = get_fixed_egress_proxy()
+    if not proxy:
+        return None
+    return {"http": proxy, "https": proxy}
+
+
 def create_session(credential: dict[str, Any]) -> requests.Session:
     # 同一次请求内保持设备与会话指纹一致，sentinel 校验会比对。
-    credential.setdefault("oai_device_id", _text(credential.get("device_id")) or uuid.uuid4().hex)
-    credential.setdefault("oai_session_id", _text(credential.get("session_id")) or uuid.uuid4().hex)
+    # 设备 id 必须是账号级稳定的，不能每次调用重新生成。
+    credential.setdefault("oai_device_id", stable_device_id(credential))
+    credential.setdefault("oai_session_id", stable_session_id(credential))
     session = requests.Session()
     session.headers.update(_base_headers(credential))
+    # 出口必须和注册时一致：Chrome 走的是本地代理（默认 127.0.0.1:7890），
+    # Python 侧不显式指定就会直连本机 IP——服务端看到的是同一账号在两个
+    # 出口 IP 之间跳变，和设备指纹不一致是同一类问题。
+    proxies = _egress_proxies()
+    if proxies:
+        session.trust_env = False
+        session.proxies.update(proxies)
     return session
 
 
@@ -210,7 +306,12 @@ def _expires_soon(credential: dict[str, Any]) -> bool:
     return expires_at - 120 <= int(time.time())
 
 
-def refresh_access_token(refresh_token: str, *, timeout: int = 30) -> dict[str, Any]:
+def refresh_access_token(
+    refresh_token: str,
+    *,
+    timeout: int = 30,
+    user_agent: str = "",
+) -> dict[str, Any]:
     """按参考项目实现刷新 ChatGPT OAuth access token。"""
     try:
         response = requests.post(
@@ -218,13 +319,14 @@ def refresh_access_token(refresh_token: str, *, timeout: int = 30) -> dict[str, 
             headers={
                 "Accept": "application/json",
                 "Content-Type": "application/x-www-form-urlencoded",
-                "User-Agent": DEFAULT_USER_AGENT,
+                "User-Agent": user_agent or DEFAULT_USER_AGENT,
             },
             data={
                 "grant_type": "refresh_token",
                 "refresh_token": refresh_token,
                 "client_id": OAUTH_CLIENT_ID,
             },
+            proxies=_egress_proxies(),
             timeout=max(5, int(timeout or 30)),
         )
     except requests.RequestException as error:
@@ -302,7 +404,12 @@ def prepare_credential(
         return credential
     if not force_refresh and access and not _expires_soon(credential):
         return credential
-    tokens = refresh_access_token(refresh, timeout=timeout)
+    tokens = refresh_access_token(
+        refresh,
+        timeout=timeout,
+        user_agent=_text(credential.get("user_agent"))
+        or _text(_identity_of(credential).get("user_agent")),
+    )
     credential.update(tokens)
     _persist(account, credential)
     return credential
@@ -393,16 +500,40 @@ def build_image_plan(upstream_model: str, payload: dict[str, Any]) -> ImagePlan:
     )
 
 
-def build_prepare_body(plan: ImagePlan) -> dict[str, Any]:
+def _device_facts(credential: dict[str, Any]) -> dict[str, Any]:
+    """把注册时采集的浏览器身份整理成「设备事实」，供 PoW / prepare 请求体使用。"""
+    identity = _identity_of(credential)
+    screen = identity.get("screen") if isinstance(identity.get("screen"), dict) else {}
+    try:
+        offset = int(identity.get("timezone_offset_minutes"))
+    except (TypeError, ValueError):
+        offset = -480
+    return {
+        "screen": screen,
+        "hardware_concurrency": identity.get("hardware_concurrency"),
+        "navigator_language": identity.get("navigator_language") or DEFAULT_OAI_LANGUAGE,
+        "accept_language": identity.get("accept_language"),
+        "timezone": identity.get("timezone") or "Asia/Shanghai",
+        "timezone_offset_minutes": offset,
+    }
+
+
+def build_prepare_body(plan: ImagePlan, device: dict | None = None) -> dict[str, Any]:
     """构造 /backend-api/f/conversation/prepare 请求体。"""
+    facts = device if isinstance(device, dict) else {}
+    try:
+        offset_minutes = int(facts.get("timezone_offset_minutes"))
+    except (TypeError, ValueError):
+        offset_minutes = -480
     body: dict[str, Any] = {
         "action": "next",
         "fork_from_shared_post": False,
         "parent_message_id": uuid.uuid4().hex,
         "model": plan.model,
         "client_prepare_state": "success",
-        "timezone_offset_min": -480,
-        "timezone": "Asia/Shanghai",
+        # 时区必须和注册时浏览器一致：写死 Asia/Shanghai 会和真实注册环境矛盾。
+        "timezone_offset_min": offset_minutes,
+        "timezone": str(facts.get("timezone") or "Asia/Shanghai"),
         "conversation_mode": {"kind": "primary_assistant"},
         "system_hints": ["picture_v2"],
         "partial_query": {
@@ -419,7 +550,11 @@ def build_prepare_body(plan: ImagePlan) -> dict[str, Any]:
     return body
 
 
-def build_conversation_body(plan: ImagePlan, references: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+def build_conversation_body(
+    plan: ImagePlan,
+    references: list[dict[str, Any]] | None = None,
+    device: dict | None = None,
+) -> dict[str, Any]:
     """构造图片生成/编辑的 /backend-api/f/conversation 请求体。"""
     references = references or []
     parts: list[Any] = [
@@ -456,6 +591,24 @@ def build_conversation_body(plan: ImagePlan, references: list[dict[str, Any]] | 
             }
             for item in references
         ]
+    facts = device if isinstance(device, dict) else {}
+    screen = facts.get("screen") if isinstance(facts.get("screen"), dict) else {}
+
+    def _screen_int(key: str, fallback: int) -> int:
+        try:
+            return int(screen.get(key) or fallback)
+        except (TypeError, ValueError):
+            return fallback
+
+    try:
+        offset_minutes = int(facts.get("timezone_offset_minutes"))
+    except (TypeError, ValueError):
+        offset_minutes = -480
+    try:
+        pixel_ratio = float(screen.get("devicePixelRatio") or 1.2)
+    except (TypeError, ValueError):
+        pixel_ratio = 1.2
+
     body: dict[str, Any] = {
         "action": "next",
         "messages": [
@@ -470,8 +623,9 @@ def build_conversation_body(plan: ImagePlan, references: list[dict[str, Any]] | 
         "parent_message_id": uuid.uuid4().hex,
         "model": plan.model,
         "client_prepare_state": "sent",
-        "timezone_offset_min": -480,
-        "timezone": "Asia/Shanghai",
+        # 时区跟随注册时浏览器，避免写死值与真实环境矛盾。
+        "timezone_offset_min": offset_minutes,
+        "timezone": str(facts.get("timezone") or "Asia/Shanghai"),
         "conversation_mode": {"kind": "primary_assistant"},
         "enable_message_followups": True,
         "system_hints": ["picture_v2"],
@@ -480,11 +634,11 @@ def build_conversation_body(plan: ImagePlan, references: list[dict[str, Any]] | 
         "client_contextual_info": {
             "is_dark_mode": False,
             "time_since_loaded": 1200,
-            "page_height": 1072,
-            "page_width": 1724,
-            "pixel_ratio": 1.2,
-            "screen_height": 1440,
-            "screen_width": 2560,
+            "page_height": _screen_int("innerHeight", 1072),
+            "page_width": _screen_int("innerWidth", 1724),
+            "pixel_ratio": pixel_ratio,
+            "screen_height": _screen_int("height", 1440),
+            "screen_width": _screen_int("width", 2560),
             "app_name": "chatgpt.com",
         },
         "paragen_cot_summary_display_override": "allow",
@@ -497,16 +651,30 @@ def build_conversation_body(plan: ImagePlan, references: list[dict[str, Any]] | 
 
 def bootstrap(session: requests.Session, credential: dict[str, Any], *, timeout: int = 30) -> tuple[list[str], str]:
     """预热首页并提取 PoW 脚本地址。"""
+    base = _base_headers(credential)
     headers = {
-        "User-Agent": _base_headers(credential)["User-Agent"],
+        "User-Agent": base["User-Agent"],
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        # 语言与 Client Hints 必须和注册时一致，否则预热请求本身就是异常信号。
+        "Accept-Language": base.get("Accept-Language", "en-US,en;q=0.9"),
         "Sec-Fetch-Dest": "document",
         "Sec-Fetch-Mode": "navigate",
         "Sec-Fetch-Site": "none",
         "Sec-Fetch-User": "?1",
         "Upgrade-Insecure-Requests": "1",
     }
+    for key in (
+        "Sec-CH-UA",
+        "Sec-CH-UA-Full-Version-List",
+        "Sec-CH-UA-Platform",
+        "Sec-CH-UA-Platform-Version",
+        "Sec-CH-UA-Arch",
+        "Sec-CH-UA-Bitness",
+        "Sec-CH-UA-Mobile",
+        "Accept-CH",
+    ):
+        if key in base:
+            headers[key] = base[key]
     response = session.get(f"{CHATGPT_BASE_URL}/", headers=headers, timeout=max(5, min(30, int(timeout or 30))))
     raise_for_upstream(response)
     return parse_pow_resources(response.text)
@@ -522,7 +690,12 @@ def get_chat_requirements(
 ) -> ChatRequirements:
     """执行 sentinel prepare + finalize，返回对话所需 token。"""
     user_agent = _base_headers(credential)["User-Agent"]
-    p_token = build_legacy_requirements_token(user_agent, script_sources, data_build)
+    # PoW / requirements token 里上报的屏幕、CPU 核数、时区、语言必须和注册时
+    # 的浏览器一致，否则 sentinel 会把它当成另一台设备发来的请求。
+    device = _device_facts(credential)
+    p_token = build_legacy_requirements_token(
+        user_agent, script_sources, data_build, device=device
+    )
     prepare_path = f"{CHAT_REQUIREMENTS_PATH}/prepare"
     response = session.post(
         f"{CHATGPT_BASE_URL}{prepare_path}",
@@ -550,6 +723,7 @@ def get_chat_requirements(
                 user_agent,
                 script_sources=script_sources,
                 data_build=data_build,
+                device=device,
             )
         except Exception as error:
             raise GatewayError(f"计算 ChatGPT PoW 失败: {error}", status_code=502, code="upstream_error") from error
@@ -619,7 +793,7 @@ def prepare_image_conversation(
     response = session.post(
         f"{CHATGPT_BASE_URL}{CONVERSATION_PREPARE_PATH}",
         headers=image_headers(credential, CONVERSATION_PREPARE_PATH, requirements),
-        json=build_prepare_body(plan),
+        json=build_prepare_body(plan, device=_device_facts(credential)),
         timeout=max(5, int(timeout or 60)),
     )
     raise_for_upstream(response)
@@ -646,7 +820,7 @@ def start_image_generation(
     response = session.post(
         f"{CHATGPT_BASE_URL}{CONVERSATION_PATH}",
         headers=image_headers(credential, CONVERSATION_PATH, requirements, conduit_token=conduit_token, accept="text/event-stream"),
-        json=build_conversation_body(plan, references),
+        json=build_conversation_body(plan, references, device=_device_facts(credential)),
         timeout=(10, max(5, int(timeout or 180))),
         stream=True,
     )

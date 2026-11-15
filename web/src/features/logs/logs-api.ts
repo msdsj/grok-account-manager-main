@@ -19,6 +19,18 @@ export type JobLog = {
   createdAt: number;
 };
 
+export type JobRun = {
+  id: string;
+  provider: string;
+  status: string;
+  total: number;
+  concurrency: number;
+  config: Record<string, unknown>;
+  startedAt: number;
+  finishedAt: number;
+  updatedAt: number;
+};
+
 export type SystemLog = {
   id: number;
   level: string;
@@ -62,6 +74,14 @@ export function listJobLogs(
     offset: String(input.offset ?? 0),
   });
   return api<{ items: JobLog[]; total: number }>(`/api/logs/jobs/${encodeURIComponent(jobId)}?${query.toString()}`);
+}
+
+export function listJobRuns(input: { limit?: number; offset?: number } = {}): Promise<{ items: JobRun[]; total: number }> {
+  const query = new URLSearchParams({
+    limit: String(input.limit ?? 50),
+    offset: String(input.offset ?? 0),
+  });
+  return api<{ items: JobRun[]; total: number }>(`/api/logs/job-runs?${query.toString()}`);
 }
 
 export function listSystemLogs(input: {

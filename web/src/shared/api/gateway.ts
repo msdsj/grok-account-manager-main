@@ -20,6 +20,15 @@ export type CreatedGatewayKeyDTO = {
   models: string[];
 };
 
+export type DefaultGatewayKeyDTO = {
+  id: string;
+  name: string;
+  key: string;
+  keyPrefix: string;
+  scopes: string[];
+  models: string[];
+};
+
 export type GatewayRequestDTO = {
   id: string;
   clientKeyId: string;
@@ -99,6 +108,11 @@ async function gatewayRequest<T>(path: string, options: GatewayRequestOptions = 
 export async function listGatewayKeys(): Promise<GatewayKeyDTO[]> {
   const result = await gatewayRequest<{ items?: GatewayKeyDTO[] }>("/api/gateway/keys");
   return result.items ?? [];
+}
+
+export async function getDefaultGatewayKey(): Promise<DefaultGatewayKeyDTO | null> {
+  const result = await gatewayRequest<{ key?: DefaultGatewayKeyDTO | null }>("/api/gateway/keys/default");
+  return result.key ?? null;
 }
 
 export async function createGatewayKey(input: { name: string; scopes: string[]; models: string[] }): Promise<CreatedGatewayKeyDTO> {
