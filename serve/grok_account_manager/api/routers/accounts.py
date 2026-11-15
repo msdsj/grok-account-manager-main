@@ -13,6 +13,8 @@ from ..schemas import (
     AccountChatTestRequest,
     AccountImageTestRequest,
     AccountTagsRequest,
+    AccountVideoStatusRequest,
+    AccountVideoTestRequest,
     DeleteAccountsRequest,
     ExportRequest,
     RefreshQuotaRequest,
@@ -26,6 +28,8 @@ from ..services.accounts import (
     refresh_account_quota,
     test_account_chat,
     test_account_image,
+    test_account_video,
+    test_account_video_status,
     test_selected_accounts,
 )
 from ...core.utils import safe_int
@@ -244,5 +248,44 @@ def test_image(body: AccountImageTestRequest, request: Request) -> dict:
             detail={"model": body.model, "count": count, "timeout": timeout},
         )
         return result
+    except Exception as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+
+@router.post("/api/accounts/video-test")
+def test_video(body: AccountVideoTestRequest, request: Request) -> dict:
+    timeout = safe_int(body.timeout, default=180, minimum=5, maximum=180)
+    duration = safe_int(body.duration, default=6, minimum=1, maximum=30)
+    try:
+        result = test_account_video(
+            export_key=body.exportKey,
+            model=body.model,
+            prompt=body.prompt,
+            duration=duration,
+            resolution=body.resolution,
+            aspect_ratio=body.aspectRatio,
+            timeout=timeout,
+        )
+        audit.log_operation(
+            audit.actor_from_request(request),
+            "account.test.video",
+            target_type="account",
+            target_id=str(body.exportKey or ""),
+            detail={"model": body.model, "duration": duration, "timeout": timeout},
+        )
+        return result
+    except Exception as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+
+@router.post("/api/accounts/video-status")
+def video_status(body: AccountVideoStatusRequest, request: Request) -> dict:
+    timeout = safe_int(body.timeout, default=180, minimum=5, maximum=180)
+    try:
+        return test_account_video_status(
+            export_key=body.exportKey,
+            video_id=body.videoId,
+            timeout=timeout,
+        )
     except Exception as error:
         raise HTTPException(status_code=400, detail=str(error)) from error

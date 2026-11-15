@@ -7,10 +7,12 @@ import json
 import time
 from pathlib import Path
 
-from ...gateway.catalog import resolve_model
+from ...gateway.catalog import ModelRoute, resolve_model
 from ...gateway.errors import GatewayError
+from ...providers.gpt.gateway.adapter import ADAPTER as CHATGPT_ADAPTER
 from ...providers.grok.gateway.adapter import ADAPTER as GROK_ADAPTER
-from ...gateway.pool import PoolAccount
+from ...providers.kiro.gateway.adapter import ADAPTER as KIRO_ADAPTER
+from ...gateway.pool import PoolAccount, normalize_provider
 from ...providers.grok.account_tester import send_grok_chat, test_grok_account
 from ...providers.grok.client import build_cockpit_grok_credential
 from ...core.paths import ACCOUNT_TEST_RESULTS_PATH, CREDENTIALS_DIR
@@ -128,12 +130,14 @@ def _merge_account_test_result(account: dict, test_results: dict[str, dict]) -> 
         "cli45Available": bool(result.get("cli45Available") or result.get("grok45Available")),
         "grok45Available": bool(result.get("grok45Available")),
         "imageAvailable": bool(result.get("imageAvailable")),
+        "videoAvailable": bool(result.get("videoAvailable")),
         "baseModel": result.get("baseModel"),
         "chatModel": result.get("chatModel") or result.get("baseModel"),
         "cli45Model": result.get("cli45Model") or result.get("grok45Model"),
         "grok45Model": result.get("grok45Model"),
         "imageModel": result.get("imageModel"),
         "imageSource": result.get("imageSource"),
+        "videoModel": result.get("videoModel"),
         "latencyMs": result.get("latencyMs"),
         "error": result.get("error"),
         "testedAt": result.get("testedAt"),
@@ -199,6 +203,7 @@ def _mark_account_capability(ref: dict, updates: dict) -> None:
         "cli45Available": bool(previous.get("cli45Available") or previous.get("grok45Available")),
         "grok45Available": bool(previous.get("grok45Available")),
         "imageAvailable": bool(previous.get("imageAvailable")),
+        "videoAvailable": bool(previous.get("videoAvailable")),
         "category": previous.get("category") or "unavailable",
         "baseModel": previous.get("baseModel"),
         "chatModel": previous.get("chatModel") or previous.get("baseModel"),
@@ -206,6 +211,7 @@ def _mark_account_capability(ref: dict, updates: dict) -> None:
         "grok45Model": previous.get("grok45Model"),
         "imageModel": previous.get("imageModel"),
         "imageSource": previous.get("imageSource"),
+        "videoModel": previous.get("videoModel"),
         "latencyMs": previous.get("latencyMs"),
         "error": None,
         "testedAt": now_ms,
@@ -222,6 +228,8 @@ def _mark_account_capability(ref: dict, updates: dict) -> None:
         result["category"] = "base-only"
     elif result.get("imageAvailable"):
         result["category"] = "image-only"
+    elif result.get("videoAvailable"):
+        result["category"] = "video-only"
     else:
         result["category"] = "unavailable"
     result["testedAt"] = now_ms
@@ -239,7 +247,14 @@ def _image_error_message(error: Exception) -> str:
     return f"图片生成失败：{text}"
 
 
-def _pool_account(ref: dict) -> PoolAccount:
+def _account_provider(ref: dict) -> str:
+    account = ref.get("account") or {}
+    credential = ref.get("credential") or {}
+    provider = account.get("provider") or credential.get("provider") or "grok"
+    return normalize_provider(str(provider))
+
+
+def _pool_account(ref: dict, provider: str) -> PoolAccount:
     account = dict(ref.get("account") or {})
     credential = dict(ref.get("credential") or {})
     export_key = str(ref.get("export_key") or "")
@@ -248,25 +263,34 @@ def _pool_account(ref: dict) -> PoolAccount:
         export_key=export_key,
         account_id=account_id,
         email=str(account.get("email") or credential.get("email") or ""),
-        provider="grok",
+        provider=provider,
         credential=credential,
         account=account,
     )
 
 
-def _grok_route(model: str, capability: str):
-    name = str(model or "").strip()
+_DEFAULT_TEST_MODELS = {
+    ("grok", "chat"): "grok-4.5",
+    ("grok", "image"): "grok-imagine-image",
+    ("grok", "video"): "grok-imagine-video-1.5",
+    ("kiro", "chat"): "kiro-auto",
+    ("chatgpt", "image"): "gpt-image-1",
+}
+
+
+def _test_route(provider: str, model: str, capability: str) -> ModelRoute:
+    name = str(model or "").strip() or _DEFAULT_TEST_MODELS.get((provider, capability), "")
+    if not name:
+        raise ValueError(f"{provider} 暂不支持 {capability} 测试")
     try:
         route = resolve_model(name)
     except GatewayError:
         route = None
-    if route is None or route.provider != "grok" or route.capability != capability:
-        from ...gateway.catalog import ModelRoute
-
+    if route is None or route.provider != provider or route.capability != capability:
         return ModelRoute(
-            public_model=name or ("grok-imagine-image" if capability == "image" else "grok-4.20-auto"),
-            provider="grok",
-            upstream_model=name or ("grok-imagine-image" if capability == "image" else "grok-4.20-auto"),
+            public_model=name,
+            provider=provider,
+            upstream_model=name,
             capability=capability,
             config={},
         )
@@ -282,6 +306,19 @@ def test_selected_accounts(export_keys: list[str], timeout: int = 180) -> dict:
     for ref in refs:
         export_key = ref["export_key"]
         credential = ref["credential"]
+        if _account_provider(ref) != "grok":
+            result = {
+                "exportKey": export_key,
+                "id": str(ref.get("account", {}).get("id") or ""),
+                "email": str(ref.get("account", {}).get("email") or ""),
+                "fileName": "database",
+                "category": "unsupported",
+                "error": "批量能力测试仅支持 Grok 账号，请在账号列表中使用单项测试",
+                "testedAt": int(time.time() * 1000),
+            }
+            results.append(result)
+            account_db.upsert_account_test_result(result)
+            continue
         result, updated = test_grok_account(dict(credential), timeout=timeout)
         result["exportKey"] = export_key
         result["id"] = str(credential.get("id") or "").strip() or str(ref.get("account", {}).get("id") or "")
@@ -296,15 +333,29 @@ def test_selected_accounts(export_keys: list[str], timeout: int = 180) -> dict:
     return {"results": results, "accounts": list_accounts()}
 
 
+def _extract_chat_content(result: dict) -> str:
+    choices = result.get("choices")
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        message_payload = choices[0].get("message")
+        if isinstance(message_payload, dict):
+            return str(message_payload.get("content") or "")
+    return ""
+
+
 def test_account_chat(export_key: str, model: str, messages: list[dict], timeout: int = 180) -> dict:
     refs = account_db.get_credential_refs([export_key])
     if not refs:
         raise ValueError("请选择要测试的账号")
     ref = refs[0]
-    model = str(model or "").strip() or "grok-4.5"
+    provider = _account_provider(ref)
+    if provider == "chatgpt":
+        raise ValueError("GPT 账号暂不支持对话测试，请切换到生图测试")
+    if provider not in {"grok", "kiro"}:
+        raise ValueError(f"{provider} 账号暂不支持对话测试")
+    model = str(model or "").strip()
     started = time.monotonic()
 
-    if _is_cli_chat_model(model):
+    if provider == "grok" and _is_cli_chat_model(model):
         result, updated = send_grok_chat(ref["credential"], model="grok-4.5", messages=messages, timeout=timeout)
         account_view = ref.get("account")
         if updated != ref["credential"]:
@@ -326,16 +377,18 @@ def test_account_chat(export_key: str, model: str, messages: list[dict], timeout
             },
         )
         return {
+            "provider": provider,
             "model": result["model"],
             "message": {"role": "assistant", "content": result["content"]},
             "account": account_view,
             "accounts": list_accounts(),
         }
 
-    route = _grok_route(model, "chat")
+    route = _test_route(provider, model, "chat")
+    adapter = KIRO_ADAPTER if provider == "kiro" else GROK_ADAPTER
     try:
-        result, updated = GROK_ADAPTER.chat(
-            _pool_account(ref),
+        result, updated = adapter.chat(
+            _pool_account(ref, provider),
             route,
             {"messages": messages},
             timeout=timeout,
@@ -357,12 +410,7 @@ def test_account_chat(export_key: str, model: str, messages: list[dict], timeout
         account_view = _persist_updated_ref(ref, updated)
         ref["credential"] = updated
         ref["account"] = account_view
-    content = ""
-    choices = result.get("choices")
-    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
-        message_payload = choices[0].get("message")
-        if isinstance(message_payload, dict):
-            content = str(message_payload.get("content") or "")
+    content = _extract_chat_content(result)
     _mark_account_capability(
         ref,
         {
@@ -370,10 +418,12 @@ def test_account_chat(export_key: str, model: str, messages: list[dict], timeout
             "chatAvailable": True,
             "baseModel": result.get("model") or route.public_model,
             "chatModel": result.get("model") or route.public_model,
+            "error": None,
             "latencyMs": int((time.monotonic() - started) * 1000),
         },
     )
     return {
+        "provider": provider,
         "model": result.get("model") or route.public_model,
         "message": {"role": "assistant", "content": content},
         "account": account_view,
@@ -386,11 +436,17 @@ def test_account_image(export_key: str, model: str, prompt: str, n: int, size: s
     if not refs:
         raise ValueError("请选择要测试的账号")
     ref = refs[0]
+    provider = _account_provider(ref)
+    if provider == "kiro":
+        raise ValueError("Kiro 账号暂不支持生图测试，请切换到对话测试")
+    if provider not in {"grok", "chatgpt"}:
+        raise ValueError(f"{provider} 账号暂不支持生图测试")
     started = time.monotonic()
-    route = _grok_route(str(model or "").strip() or "grok-imagine-image", "image")
+    route = _test_route(provider, str(model or "").strip(), "image")
+    adapter = CHATGPT_ADAPTER if provider == "chatgpt" else GROK_ADAPTER
     try:
-        result, updated = GROK_ADAPTER.image(
-            _pool_account(ref),
+        result, updated = adapter.image(
+            _pool_account(ref, provider),
             route,
             {"prompt": prompt, "n": n, "size": size},
             timeout=timeout,
@@ -418,13 +474,111 @@ def test_account_image(export_key: str, model: str, prompt: str, n: int, size: s
         {
             "imageAvailable": True,
             "imageModel": route.public_model,
-            "imageSource": "python-gateway",
+            "imageSource": f"{provider}-gateway",
+            "error": None,
             "latencyMs": int((time.monotonic() - started) * 1000),
         },
     )
     return {
+        "provider": provider,
         "model": route.public_model,
         "data": result.get("data") or [],
+        "account": account_view,
+        "accounts": list_accounts(),
+    }
+
+
+def test_account_video(
+    export_key: str,
+    model: str,
+    prompt: str,
+    duration: int,
+    resolution: str,
+    aspect_ratio: str,
+    timeout: int = 180,
+) -> dict:
+    refs = account_db.get_credential_refs([export_key])
+    if not refs:
+        raise ValueError("请选择要测试的账号")
+    ref = refs[0]
+    provider = _account_provider(ref)
+    if provider != "grok":
+        raise ValueError("仅 Grok 账号支持视频生成测试")
+    started = time.monotonic()
+    route = _test_route(provider, str(model or "").strip(), "video")
+    payload = {
+        "prompt": str(prompt or "").strip(),
+        "duration": duration,
+        "resolution": resolution,
+        "aspect_ratio": aspect_ratio,
+    }
+    try:
+        result, updated = GROK_ADAPTER.video(
+            _pool_account(ref, provider),
+            route,
+            payload,
+            timeout=timeout,
+        )
+    except GatewayError as error:
+        message = f"视频生成失败：{error.message}"
+        _mark_account_capability(
+            ref,
+            {
+                "videoAvailable": False,
+                "videoModel": None,
+                "error": message,
+                "latencyMs": int((time.monotonic() - started) * 1000),
+            },
+        )
+        raise ValueError(message) from error
+    account_view = ref.get("account")
+    if updated != ref["credential"]:
+        account_view = _persist_updated_ref(ref, updated)
+        ref["credential"] = updated
+        ref["account"] = account_view
+    _mark_account_capability(
+        ref,
+        {
+            "videoAvailable": True,
+            "videoModel": route.public_model,
+            "error": None,
+            "latencyMs": int((time.monotonic() - started) * 1000),
+        },
+    )
+    return {
+        "provider": provider,
+        "model": route.public_model,
+        "video": result,
+        "account": account_view,
+        "accounts": list_accounts(),
+    }
+
+
+def test_account_video_status(export_key: str, video_id: str, timeout: int = 180) -> dict:
+    refs = account_db.get_credential_refs([export_key])
+    if not refs:
+        raise ValueError("请选择要测试的账号")
+    ref = refs[0]
+    provider = _account_provider(ref)
+    if provider != "grok":
+        raise ValueError("仅 Grok 账号支持视频任务查询")
+    video_id = str(video_id or "").strip()
+    if not video_id:
+        raise ValueError("缺少 videoId")
+    try:
+        result, updated = GROK_ADAPTER.video_status(
+            _pool_account(ref, provider),
+            video_id,
+            timeout=timeout,
+        )
+    except GatewayError as error:
+        raise ValueError(f"视频状态查询失败：{error.message}") from error
+    account_view = ref.get("account")
+    if updated != ref["credential"]:
+        account_view = _persist_updated_ref(ref, updated)
+    return {
+        "provider": provider,
+        "video": result,
         "account": account_view,
         "accounts": list_accounts(),
     }

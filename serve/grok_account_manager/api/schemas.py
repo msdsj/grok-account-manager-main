@@ -82,17 +82,33 @@ class TestBatchRequest(BaseModel):
 
 class AccountChatTestRequest(BaseModel):
     exportKey: str = ""
-    model: str = "grok-4.5"
+    model: str = ""
     messages: list[dict[str, Any]] = Field(default_factory=list)
     timeout: int = 180
 
 
 class AccountImageTestRequest(BaseModel):
     exportKey: str = ""
-    model: str = "grok-imagine-image"
+    model: str = ""
     prompt: str = ""
     n: int = 1
     size: str = "1024x1024"
+    timeout: int = 180
+
+
+class AccountVideoTestRequest(BaseModel):
+    exportKey: str = ""
+    model: str = ""
+    prompt: str = ""
+    duration: int = 6
+    resolution: str = "720p"
+    aspectRatio: str = "16:9"
+    timeout: int = 180
+
+
+class AccountVideoStatusRequest(BaseModel):
+    exportKey: str = ""
+    videoId: str = ""
     timeout: int = 180
 
 

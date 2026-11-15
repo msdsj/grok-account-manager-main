@@ -1,5 +1,7 @@
 export type ManagedProvider = "grok" | "chatgpt" | "kiro";
 
+export type AccountTestMode = "chat" | "image" | "video";
+
 export type ManagedAccount = {
   id: string;
   exportKey: string;
@@ -29,20 +31,52 @@ export type ManagedAccount = {
     category?: string;
     chatAvailable?: boolean;
     imageAvailable?: boolean;
+    videoAvailable?: boolean;
+    chatModel?: string | null;
+    imageModel?: string | null;
+    videoModel?: string | null;
     error?: string | null;
+    latencyMs?: number | null;
+    testedAt?: number | null;
   };
 };
 
 export type AccountTag = { tag: string; count: number };
+
+export type AccountTestImage = {
+  url?: string;
+  b64_json?: string;
+  revised_prompt?: string;
+};
+
+export type AccountTestResult = {
+  provider?: string;
+  model?: string;
+  message?: { role: string; content: string };
+  data?: AccountTestImage[];
+  video?: Record<string, unknown>;
+  account?: ManagedAccount;
+  accounts?: ManagedAccount[];
+};
+
+type ApiErrorPayload = { error?: unknown; detail?: unknown };
+
+function errorMessage(payload: ApiErrorPayload, status: number): string {
+  const detail = typeof payload.detail === "string" ? payload.detail : "";
+  const error = typeof payload.error === "string" ? payload.error : "";
+  if (error) return error;
+  if (detail) return detail;
+  return `HTTP ${status}`;
+}
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
     ...init,
     headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) },
   });
-  const payload = (await response.json().catch(() => ({}))) as T & { error?: string };
+  const payload = (await response.json().catch(() => ({}))) as T & ApiErrorPayload;
   if (!response.ok) {
-    throw new Error(payload.error || `HTTP ${response.status}`);
+    throw new Error(errorMessage(payload, response.status));
   }
   return payload;
 }
@@ -90,6 +124,60 @@ export function refreshManagedAccountQuota(accountId: string): Promise<{ account
   });
 }
 
+export function testManagedAccountChat(input: {
+  exportKey: string;
+  model: string;
+  messages: Array<{ role: string; content: string }>;
+}): Promise<AccountTestResult> {
+  return api<AccountTestResult>("/api/accounts/chat-test", {
+    method: "POST",
+    body: JSON.stringify({ ...input, timeout: 180 }),
+  });
+}
+
+export function testManagedAccountImage(input: {
+  exportKey: string;
+  model: string;
+  prompt: string;
+  n?: number;
+  size?: string;
+}): Promise<AccountTestResult> {
+  return api<AccountTestResult>("/api/accounts/image-test", {
+    method: "POST",
+    body: JSON.stringify({ ...input, n: input.n ?? 1, size: input.size ?? "1024x1024", timeout: 180 }),
+  });
+}
+
+export function testManagedAccountVideo(input: {
+  exportKey: string;
+  model: string;
+  prompt: string;
+  duration?: number;
+  resolution?: string;
+  aspectRatio?: string;
+}): Promise<AccountTestResult> {
+  return api<AccountTestResult>("/api/accounts/video-test", {
+    method: "POST",
+    body: JSON.stringify({
+      ...input,
+      duration: input.duration ?? 6,
+      resolution: input.resolution ?? "720p",
+      aspectRatio: input.aspectRatio ?? "16:9",
+      timeout: 180,
+    }),
+  });
+}
+
+export function getManagedAccountVideoStatus(input: {
+  exportKey: string;
+  videoId: string;
+}): Promise<AccountTestResult> {
+  return api<AccountTestResult>("/api/accounts/video-status", {
+    method: "POST",
+    body: JSON.stringify({ ...input, timeout: 180 }),
+  });
+}
+
 export async function exportManagedAccounts(exportKeys: string[]): Promise<Blob> {
   const response = await fetch("/api/accounts/export", {
     method: "POST",
@@ -97,8 +185,8 @@ export async function exportManagedAccounts(exportKeys: string[]): Promise<Blob>
     body: JSON.stringify({ exportKeys }),
   });
   if (!response.ok) {
-    const payload = (await response.json().catch(() => ({}))) as { error?: string };
-    throw new Error(payload.error || `HTTP ${response.status}`);
+    const payload = (await response.json().catch(() => ({}))) as ApiErrorPayload;
+    throw new Error(errorMessage(payload, response.status));
   }
   return response.blob();
 }
