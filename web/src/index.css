@@ -3,35 +3,55 @@
 
 @custom-variant dark (&:is(.dark *));
 
+/*
+ * macOS Sonoma / Sequoia inspired design tokens.
+ * Light follows System Settings: #f5f5f7 canvas, white cards, hairline dividers.
+ * Dark follows #1e1e1e / #2c2c2e surfaces with translucent white borders.
+ */
 :root {
-  --radius: 0.5rem;
-  --background: oklch(0.995 0 0);
-  --foreground: oklch(0.145 0 0);
-  --card: oklch(0.975 0.002 90);
-  --card-foreground: oklch(0.145 0 0);
-  --popover: oklch(1 0 0);
-  --popover-foreground: oklch(0.145 0 0);
-  --primary: oklch(0.12 0 0);
-  --primary-foreground: oklch(0.985 0 0);
-  --secondary: oklch(0.965 0.002 90);
-  --secondary-foreground: oklch(0.2 0 0);
-  --muted: oklch(0.965 0.002 90);
-  --muted-foreground: oklch(0.55 0 0);
-  --accent: oklch(0.95 0.003 90);
-  --accent-foreground: oklch(0.16 0 0);
-  --destructive: oklch(0.58 0.22 27);
-  --border: oklch(0.91 0 0);
-  --input: oklch(0.9 0 0);
-  --ring: var(--border);
-  --sidebar: oklch(0.995 0 0);
-  --sidebar-foreground: oklch(0.18 0 0);
-  --sidebar-primary: oklch(0.12 0 0);
-  --sidebar-primary-foreground: oklch(0.985 0 0);
-  --sidebar-accent: oklch(0.96 0 0);
-  --sidebar-accent-foreground: oklch(0.14 0 0);
-  --sidebar-border: oklch(0.93 0 0);
+  --radius: 10px;
+
+  --background: #f5f5f7;
+  --foreground: #1d1d1f;
+
+  --card: #ffffff;
+  --card-foreground: #1d1d1f;
+  --popover: #ffffff;
+  --popover-foreground: #1d1d1f;
+
+  --primary: #007aff;
+  --primary-foreground: #ffffff;
+  --secondary: #ececf0;
+  --secondary-foreground: #1d1d1f;
+  --muted: #f0f0f3;
+  --muted-foreground: #6e6e73;
+  --accent: rgba(0, 122, 255, 0.09);
+  --accent-foreground: #0062cc;
+
+  --destructive: #ff3b30;
+  --success: #34c759;
+  --warning: #ff9f0a;
+
+  --border: rgba(0, 0, 0, 0.08);
+  --input: rgba(0, 0, 0, 0.13);
+  --ring: #007aff;
+
+  --sidebar: rgba(255, 255, 255, 0.72);
+  --sidebar-foreground: #1d1d1f;
+  --sidebar-primary: #007aff;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: rgba(0, 0, 0, 0.045);
+  --sidebar-accent-foreground: #1d1d1f;
+  --sidebar-border: rgba(0, 0, 0, 0.08);
+
+  --row-hover: color-mix(in oklab, #1d1d1f 4%, #ffffff);
+  --segment-active: #ffffff;
+  --toolbar: rgba(246, 246, 248, 0.78);
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.04), 0 0 0 0.5px rgba(0, 0, 0, 0.02);
+  --shadow-window: 0 24px 80px -24px rgba(0, 0, 0, 0.28);
+
   --quota-product-0: oklch(0.55 0 0);
-  --quota-product-1: oklch(0.68 0.14 235);
+  --quota-product-1: oklch(0.62 0.19 255);
   --quota-product-2: oklch(0.64 0.15 155);
   --quota-product-3: oklch(0.75 0.15 80);
   --quota-product-4: oklch(0.68 0.14 285);
@@ -40,33 +60,47 @@
 }
 
 .dark {
-  --background: oklch(0.13 0 0);
-  --foreground: oklch(0.95 0 0);
-  --card: oklch(0.18 0 0);
-  --card-foreground: oklch(0.95 0 0);
-  --popover: oklch(0.17 0 0);
-  --popover-foreground: oklch(0.95 0 0);
-  --primary: oklch(0.96 0 0);
-  --primary-foreground: oklch(0.12 0 0);
-  --secondary: oklch(0.21 0 0);
-  --secondary-foreground: oklch(0.94 0 0);
-  --muted: oklch(0.21 0 0);
-  --muted-foreground: oklch(0.64 0 0);
-  --accent: oklch(0.24 0 0);
-  --accent-foreground: oklch(0.96 0 0);
-  --destructive: oklch(0.65 0.2 28);
-  --border: oklch(0.27 0 0);
-  --input: oklch(0.3 0 0);
-  --ring: var(--border);
-  --sidebar: oklch(0.145 0 0);
-  --sidebar-foreground: oklch(0.92 0 0);
-  --sidebar-primary: oklch(0.96 0 0);
-  --sidebar-primary-foreground: oklch(0.12 0 0);
-  --sidebar-accent: oklch(0.22 0 0);
-  --sidebar-accent-foreground: oklch(0.96 0 0);
-  --sidebar-border: oklch(0.25 0 0);
+  --background: #1e1e1e;
+  --foreground: #f5f5f7;
+
+  --card: #2c2c2e;
+  --card-foreground: #f5f5f7;
+  --popover: #2c2c2e;
+  --popover-foreground: #f5f5f7;
+
+  --primary: #0a84ff;
+  --primary-foreground: #ffffff;
+  --secondary: #3a3a3c;
+  --secondary-foreground: #f5f5f7;
+  --muted: #363638;
+  --muted-foreground: #98989d;
+  --accent: rgba(10, 132, 255, 0.16);
+  --accent-foreground: #6cb6ff;
+
+  --destructive: #ff453a;
+  --success: #30d158;
+  --warning: #ffd60a;
+
+  --border: rgba(255, 255, 255, 0.1);
+  --input: rgba(255, 255, 255, 0.16);
+  --ring: #0a84ff;
+
+  --sidebar: rgba(28, 28, 30, 0.72);
+  --sidebar-foreground: #f5f5f7;
+  --sidebar-primary: #0a84ff;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: rgba(255, 255, 255, 0.07);
+  --sidebar-accent-foreground: #ffffff;
+  --sidebar-border: rgba(255, 255, 255, 0.1);
+
+  --row-hover: color-mix(in oklab, #ffffff 5%, #2c2c2e);
+  --segment-active: #48484a;
+  --toolbar: rgba(30, 30, 30, 0.76);
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.22), 0 0 0 0.5px rgba(255, 255, 255, 0.03);
+  --shadow-window: 0 24px 80px -24px rgba(0, 0, 0, 0.7);
+
   --quota-product-0: oklch(0.66 0 0);
-  --quota-product-1: oklch(0.74 0.12 235);
+  --quota-product-1: oklch(0.72 0.15 255);
   --quota-product-2: oklch(0.72 0.13 155);
   --quota-product-3: oklch(0.8 0.13 80);
   --quota-product-4: oklch(0.74 0.12 285);
@@ -75,6 +109,9 @@
 }
 
 @theme inline {
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "Helvetica Neue", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  --font-mono: "SF Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+
   --color-background: var(--background);
   --color-foreground: var(--foreground);
   --color-card: var(--card);
@@ -90,6 +127,8 @@
   --color-accent: var(--accent);
   --color-accent-foreground: var(--accent-foreground);
   --color-destructive: var(--destructive);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
   --color-border: var(--border);
   --color-input: var(--input);
   --color-ring: var(--ring);
@@ -107,9 +146,12 @@
   --color-quota-product-4: var(--quota-product-4);
   --color-quota-product-5: var(--quota-product-5);
   --color-quota-product-6: var(--quota-product-6);
-  --radius-sm: calc(var(--radius) - 2px);
-  --radius-md: var(--radius);
-  --radius-lg: calc(var(--radius) + 2px);
+
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 10px;
+  --radius-xl: 14px;
+  --radius-2xl: 18px;
 }
 
 * {
@@ -119,12 +161,12 @@
 @layer base {
   * {
     scrollbar-width: thin;
-    scrollbar-color: var(--border) transparent;
+    scrollbar-color: color-mix(in oklab, var(--foreground) 18%, transparent) transparent;
   }
 
   *::-webkit-scrollbar {
-    width: 5px;
-    height: 5px;
+    width: 6px;
+    height: 6px;
   }
 
   *::-webkit-scrollbar-track {
@@ -132,8 +174,12 @@
   }
 
   *::-webkit-scrollbar-thumb {
-    border-radius: 5px;
-    background: var(--border);
+    border-radius: 6px;
+    background: color-mix(in oklab, var(--foreground) 16%, transparent);
+  }
+
+  *::-webkit-scrollbar-thumb:hover {
+    background: color-mix(in oklab, var(--foreground) 28%, transparent);
   }
 }
 
@@ -145,6 +191,9 @@ body,
 
 html {
   color-scheme: light;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
 }
 
 html.dark {
@@ -155,16 +204,84 @@ body {
   margin: 0;
   background: var(--background);
   color: var(--foreground);
-  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  font-size: 14px;
-  letter-spacing: 0;
-  text-rendering: optimizeLegibility;
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 1.5;
+  letter-spacing: -0.01em;
+  font-feature-settings: "cv03", "cv04", "cv11";
+}
+
+h1,
+h2,
+h3,
+h4 {
+  letter-spacing: -0.022em;
+}
+
+button,
+input,
+select,
+textarea {
+  font-family: inherit;
+  letter-spacing: inherit;
 }
 
 ::selection {
-  background: color-mix(in oklab, var(--primary) 24%, transparent);
+  background: color-mix(in oklab, var(--primary) 26%, transparent);
 }
 
 :focus-visible {
-  outline-color: var(--ring);
+  outline: none;
+}
+
+/* Translucent window chrome used by the sidebar and sticky toolbars. */
+.mac-glass {
+  background: var(--sidebar);
+  -webkit-backdrop-filter: saturate(180%) blur(24px);
+  backdrop-filter: saturate(180%) blur(24px);
+}
+
+/* A restrained desktop backdrop so the translucent sidebar has something to blur. */
+.app-canvas {
+  background-color: var(--background);
+  background-image:
+    radial-gradient(900px 520px at 8% -8%, rgba(255, 255, 255, 0.95), transparent 62%),
+    radial-gradient(760px 480px at 92% 108%, color-mix(in oklab, var(--primary) 9%, transparent), transparent 58%);
+  background-attachment: fixed;
+}
+
+.dark .app-canvas {
+  background-image:
+    radial-gradient(900px 520px at 8% -8%, rgba(72, 72, 76, 0.38), transparent 62%),
+    radial-gradient(760px 480px at 92% 108%, color-mix(in oklab, var(--primary) 13%, transparent), transparent 58%);
+}
+
+.mac-toolbar {
+  background: var(--toolbar);
+  -webkit-backdrop-filter: saturate(180%) blur(20px);
+  backdrop-filter: saturate(180%) blur(20px);
+}
+
+.mac-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: var(--shadow-card);
+}
+
+.mac-segmented {
+  border-radius: 9px;
+  background: color-mix(in oklab, var(--foreground) 6%, transparent);
+  padding: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }

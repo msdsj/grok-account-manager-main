@@ -11,7 +11,8 @@ from dotenv import load_dotenv
 
 from .mail.sources import build_mailbox_source
 from .providers.base import Provider
-from .providers.grok import GrokProvider
+from .providers.grok.registration import GrokProvider
+from .providers.gpt.registration import ChatGPTProvider
 from .core.browser import (
     DrissionBrowserSession,
     build_chromium_options,
@@ -28,12 +29,14 @@ from .core.proxy_pool import (
 )
 from .api.services.registration_proxy_pool import load_saved_registration_proxies
 from .sinks.base import Sink
+from .sinks.database_credential import DatabaseSink
 from .sinks.sub2api import Sub2ApiSink, parse_sub2api_group_ids
 from .sinks.txt_file import TxtFileSink
 from .sinks.json_credential import JsonCredentialSink
 
 PROVIDERS: dict[str, type[Provider]] = {
     "grok": GrokProvider,
+    "chatgpt": ChatGPTProvider,
 }
 
 
@@ -65,7 +68,10 @@ def _make_sink(args: argparse.Namespace) -> Sink:
     for sink_type in sink_types:
         sink_type = sink_type.strip()
 
-        if sink_type == "txt":
+        if sink_type == "db":
+            sinks.append(DatabaseSink())
+
+        elif sink_type == "txt":
             sinks.append(TxtFileSink(args.output))
 
         elif sink_type == "json":
@@ -139,13 +145,13 @@ def main() -> None:
     warn_runtime_compatibility()
     load_dotenv()
 
-    parser = argparse.ArgumentParser(description="MSDSJ Grok 账号注册与凭证管理器")
-    parser.add_argument("provider", choices=list(PROVIDERS), help="目标 AI 服务（如 grok）")
+    parser = argparse.ArgumentParser(description="MSDSJ AI 账号注册与凭证管理器")
+    parser.add_argument("provider", choices=list(PROVIDERS), help="目标 AI 服务（如 grok、chatgpt）")
     parser.add_argument("--count", type=int, default=0, help="执行轮数，0 表示无限循环")
     parser.add_argument(
         "--sink",
-        default="txt",
-        help='产物下游，支持: txt, json, sub2api，可组合使用如 "json+txt"',
+        default="db",
+        help='产物下游，支持: db, txt, json, sub2api，可组合使用如 "db+json"；默认写入数据库',
     )
     parser.add_argument("--output", default="output/sso.txt", help="txt sink 输出文件")
     parser.add_argument(
@@ -251,18 +257,19 @@ def main() -> None:
     provider = provider_cls()
     if hasattr(provider, "enable_oauth_exchange"):
         provider.enable_oauth_exchange = args.oauth_exchange
-    provider.mail_source = build_mailbox_source(
-        email_source=args.email_source,
-        outlook_data=args.outlook_accounts,
-        outlook_file=args.outlook_accounts_file,
-        google_data=args.google_accounts,
-        google_file=args.google_accounts_file,
-        cloud_mail_api_base=args.cloud_mail_api_base,
-        cloud_mail_public_token=args.cloud_mail_public_token,
-        cloud_mail_login_email=args.cloud_mail_login_email,
-        cloud_mail_login_password=args.cloud_mail_login_password,
-        cloud_mail_domains=args.cloud_mail_domains,
-    )
+    mail_source_kwargs = {
+        "email_source": args.email_source,
+        "outlook_data": args.outlook_accounts,
+        "outlook_file": args.outlook_accounts_file,
+        "google_data": args.google_accounts,
+        "google_file": args.google_accounts_file,
+        "cloud_mail_api_base": args.cloud_mail_api_base,
+        "cloud_mail_public_token": args.cloud_mail_public_token,
+        "cloud_mail_login_email": args.cloud_mail_login_email,
+        "cloud_mail_login_password": args.cloud_mail_login_password,
+        "cloud_mail_domains": args.cloud_mail_domains,
+    }
+    provider.mail_source = build_mailbox_source(**mail_source_kwargs)
     sink = _make_sink(args)
 
     initial_proxy = proxy_pool.acquire() if proxy_pool is not None else get_fixed_egress_proxy()

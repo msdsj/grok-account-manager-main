@@ -4,13 +4,20 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from starlette.requests import Request
+
 from grok_account_manager import cli
 from grok_account_manager.api.routers.register import start_registration
 from grok_account_manager.api.schemas import RegisterRequest
+from grok_account_manager.core import database as account_db
 from grok_account_manager.api.services.jobs import RegistrationJobManager
 from grok_account_manager.api.services.pending import PendingResultStore
 from grok_account_manager.mail.cloud_mail import CloudMailSource
 from grok_account_manager.mail.sources import build_mailbox_source
+
+
+def _request() -> Request:
+    return Request({"type": "http", "headers": []})
 
 
 class CloudMailFactoryWiringTests(unittest.TestCase):
@@ -38,11 +45,15 @@ class CloudMailApiWiringTests(unittest.TestCase):
             cloudMailDomains="one.example.test\ntwo.example.test",
         )
 
-        with patch(
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            account_db,
+            "DB_PATH",
+            Path(directory) / "cloud-mail.db",
+        ), patch.object(account_db, "OUTPUT_DIR", Path(directory)), patch(
             "grok_account_manager.api.routers.register.JOB_MANAGER.start",
             return_value={"id": "cloud-mail-job"},
         ) as start:
-            result = start_registration(body)
+            result = start_registration(body, _request())
 
         self.assertEqual(result, {"job": {"id": "cloud-mail-job"}})
         self.assertEqual(start.call_args.kwargs["email_source"], "cloud_mail")
@@ -63,6 +74,8 @@ class CloudMailJobWiringTests(unittest.TestCase):
             mail_source.name = "cloud_mail"
             mail_source.count = 0
             with (
+                patch.object(account_db, "DB_PATH", Path(directory) / "cloud-mail-job.db"),
+                patch.object(account_db, "OUTPUT_DIR", Path(directory)),
                 patch(
                     "grok_account_manager.api.services.jobs.build_mailbox_source",
                     return_value=mail_source,

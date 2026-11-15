@@ -10,9 +10,9 @@ uv run grok-account-manager grok --count 1 --sink json --oauth-exchange
 ## 相关模块
 
 - `serve/grok_account_manager/cli.py`：读取 `--oauth-exchange`。
-- `serve/grok_account_manager/providers/grok.py`：完成注册并决定是否进入 OAuth。
-- `serve/grok_account_manager/grok/oauth_exchange.py`：申请 device code；优先用注册得到的同一 `sso` 会话直接完成 `verify/approve`，失败时回退到同一个浏览器登录态，并轮询 token endpoint。
-- `serve/grok_account_manager/grok/client.py`：整理 GrokAccount JSON。
+- `serve/grok_account_manager/providers/grok/registration.py`：完成注册并决定是否进入 OAuth。
+- `serve/grok_account_manager/providers/grok/oauth_exchange.py`：申请 device code；优先用注册得到的同一 `sso` 会话直接完成 `verify/approve`，失败时回退到同一个浏览器登录态，并轮询 token endpoint。
+- `serve/grok_account_manager/providers/grok/client.py`：整理 GrokAccount JSON。
 - `serve/grok_account_manager/sinks/json_credential.py`：写入最终 JSON。
 
 ## 注意

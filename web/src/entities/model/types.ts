@@ -1,10 +1,20 @@
+export type ModelCapability =
+  | "chat"
+  | "responses"
+  | "image"
+  | "image_edit"
+  | "video"
+  | "stt"
+  | "tts"
+  | "realtime";
+
 export type ModelRouteDTO = {
   id: string;
   publicId: string;
-  provider: "grok_build" | "grok_web" | "grok_console";
+  provider: string;
   upstreamModel: string;
-  capability: "responses" | "chat" | "image" | "image_edit" | "video" | "stt" | "tts" | "realtime";
-  origin: "catalog" | "discovered" | "manual";
+  capability: ModelCapability;
+  origin: "catalog";
   enabled: boolean;
   accountIds: string[];
   bindingMode: boolean;
@@ -14,4 +24,6 @@ export type ModelRouteDTO = {
   capabilityKnown: boolean;
   available: boolean;
   lastSyncedAt?: string;
+  weight: number;
+  config: Record<string, unknown>;
 };

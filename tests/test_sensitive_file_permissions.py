@@ -4,11 +4,9 @@ import stat
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
-from grok_account_manager.api.services import database as account_db
-from grok_account_manager.api.services import relay as relay_service
-from grok_account_manager.grok.oauth_authorize import _write_private_credential
+from grok_account_manager.core import database as account_db
+from grok_account_manager.providers.grok.oauth_authorize import _write_private_credential
 from grok_account_manager.sinks.txt_file import TxtFileSink
 
 
@@ -70,28 +68,6 @@ class SensitiveFilePermissionTests(unittest.TestCase):
                     self.assert_private(sidecar)
         finally:
             account_db.DB_PATH = old_db_path
-
-    def test_relay_config_is_private(self) -> None:
-        config_path = self.root / "relay-config.json"
-        config_path.write_text("{}", encoding="utf-8")
-        config_path.chmod(0o644)
-
-        with (
-            patch.object(relay_service, "OUTPUT_DIR", self.root),
-            patch.object(relay_service, "CONFIG_PATH", config_path),
-        ):
-            manager = relay_service.RelayManager()
-            manager._save_config(
-                relay_service.RelayConfig(
-                    api_key="private-api-key",
-                    admin_key="private-admin-key",
-                )
-            )
-
-        self.assert_private(config_path)
-        payload = json.loads(config_path.read_text(encoding="utf-8"))
-        self.assertEqual(payload["api_key"], "private-api-key")
-        self.assertEqual(payload["admin_key"], "private-admin-key")
 
 
 if __name__ == "__main__":

@@ -8,7 +8,6 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { listModels } from "@/entities/model/model-api";
 import type { ModelRouteDTO } from "@/entities/model/types";
-import { getSystemInfo } from "@/entities/system/system-api";
 import { runtimeConfig } from "@/shared/config/runtime-config";
 import { CopyButton } from "@/shared/components/copy-button";
 import { cn } from "@/shared/lib/cn";
@@ -152,12 +151,11 @@ export function ApiDocsPage() {
   const [exampleView, setExampleView] = useState<ExampleView>("request");
   const [selectedModel, setSelectedModel] = useState("");
 
-  const systemQuery = useQuery({ queryKey: ["system-info"], queryFn: getSystemInfo, staleTime: Number.POSITIVE_INFINITY, retry: 1 });
   const modelsQuery = useQuery({ queryKey: ["docs", "available-models"], queryFn: () => listModels({ page: 1, pageSize: 100 }), staleTime: 30_000 });
 
   if (!definition) return <Navigate to="/docs/chat/completions" replace />;
 
-  const publicApiBaseUrl = systemQuery.data?.publicApiBaseURL || runtimeConfig.publicApiBaseUrl;
+  const publicApiBaseUrl = runtimeConfig.publicApiBaseUrl;
   const baseUrl = `${publicApiBaseUrl.replace(/\/$/, "")}/v1`;
   const availableModels = (modelsQuery.data?.items ?? []).filter((model) => model.enabled && model.available && definition.capabilities.includes(model.capability));
   const selectedModelAvailable = availableModels.some((model) => model.publicId === selectedModel);
@@ -169,8 +167,8 @@ export function ApiDocsPage() {
     <div className="w-full space-y-10">
       <header className="space-y-4">
         <div className="min-w-0">
-          <h1 className="text-2xl font-medium text-foreground">{definition.title}</h1>
-          <p className="mt-2 max-w-2xl text-sm leading-6 text-muted-foreground">{t(definition.descriptionKey)}</p>
+          <h1 className="text-[24px] font-semibold tracking-[-0.025em] text-foreground">{definition.title}</h1>
+          <p className="mt-2 max-w-2xl text-[13px] leading-6 text-muted-foreground">{t(definition.descriptionKey)}</p>
         </div>
         <EndpointSignature method={definition.method} path={`/v1${definition.path}`} />
       </header>
@@ -179,7 +177,7 @@ export function ApiDocsPage() {
         <DocsSection icon={<Link2 />} title={t("docs.reference.connection")}>
           <div className="grid gap-4 sm:grid-cols-2">
             <ConnectionItem label={t("docs.baseUrl")} value={baseUrl} />
-            <ConnectionItem label={t("docs.authentication")} value={definition.key === "chat/messages" ? "x-api-key: g2a_..." : "Authorization: Bearer g2a_..."} />
+            <ConnectionItem label={t("docs.authentication")} value={definition.key === "chat/messages" ? "x-api-key: gak_..." : "Authorization: Bearer gak_..."} />
             {definition.key === "chat/messages" ? <ConnectionItem label="anthropic-version" value="2023-06-01" /> : null}
           </div>
         </DocsSection>
@@ -245,14 +243,14 @@ function createExamples(definition: EndpointDefinition, baseUrl: string, model: 
       ].join(" \\\n");
   const curlBody = request ? ` \\\n  -d '${JSON.stringify(request, null, 2)}'` : "";
   const headers = messageHeaders
-    ? { "x-api-key": "g2a_your_api_key", "anthropic-version": "2023-06-01", "Content-Type": "application/json" }
-    : { Authorization: "Bearer g2a_your_api_key", "Content-Type": "application/json" };
+    ? { "x-api-key": "gak_your_api_key", "anthropic-version": "2023-06-01", "Content-Type": "application/json" }
+    : { Authorization: "Bearer gak_your_api_key", "Content-Type": "application/json" };
   const pythonImports = request ? "import json\nimport requests" : "import requests";
   const pythonPayload = request ? `\n\npayload = json.loads(r'''${JSON.stringify(request, null, 2)}''')` : "";
   const pythonBody = request ? ",\n    json=payload" : "";
   const javascriptBody = request ? `,\n  body: JSON.stringify(${JSON.stringify(request, null, 2)})` : "";
   return {
-    curl: `export GROK2API_API_KEY="g2a_your_api_key"\n\ncurl -X ${definition.method} "${url}" \\\n${curlHeaders}${curlBody}`,
+    curl: `export GROK2API_API_KEY="gak_your_api_key"\n\ncurl -X ${definition.method} "${url}" \\\n${curlHeaders}${curlBody}`,
     python: `${pythonImports}${pythonPayload}\n\nresponse = requests.${definition.method.toLowerCase()}(\n    "${url}",\n    headers=${JSON.stringify(headers, null, 2)}${pythonBody}\n)\nresponse.raise_for_status()\nprint(response.json())`,
     javascript: `const response = await fetch("${url}", {\n  method: "${definition.method}",\n  headers: ${JSON.stringify(headers, null, 2)}${javascriptBody}\n});\n\nif (!response.ok) throw new Error(await response.text());\nconsole.log(await response.json());`,
   };

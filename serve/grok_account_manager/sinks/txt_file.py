@@ -17,7 +17,8 @@ class TxtFileSink:
         self.output_path = Path(output_path)
 
     def push(self, provider_name: str, result: RegistrationResult) -> None:
-        if str(result.get("oauth_status") or "not_requested") in {"pending", "failed"}:
+        oauth_status = str(result.get("oauth_status") or "not_requested")
+        if oauth_status in {"pending", "failed"}:
             raise ValueError("refresh_token 尚未成功获取，拒绝写入 SSO 文本")
         credential = (result.get("credential") or "").strip()
         if not credential:

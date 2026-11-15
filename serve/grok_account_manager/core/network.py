@@ -27,9 +27,12 @@ def build_requests_session(
 ) -> requests.Session:
     """Build a requests session pinned to one round's network identity.
 
-    ``trust_env=False`` is intentional: ambient ``HTTP(S)_PROXY`` and
-    ``NO_PROXY`` settings must not silently move only the Python half of a
-    browser round to a different egress.
+    ``trust_env`` follows the caller's intent: it is disabled **only** when an
+    explicit per-round proxy is supplied, so ambient ``HTTP(S)_PROXY`` /
+    ``NO_PROXY`` cannot silently move the Python half of the round to a
+    different egress than the browser. Without an explicit proxy the session
+    keeps ``trust_env=True`` so the system proxy still works (manual xAI OAuth
+    relies on that same route).
     """
 
     session = requests.Session()

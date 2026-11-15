@@ -1,4 +1,4 @@
-import { apiRequest } from "@/shared/api/client";
+import { apiRequest, LEGACY_ADMIN_API_PREFIX } from "@/shared/api/client";
 import { createObjectDecoder, hasShape, isArrayOf, isNumber, isOneOf, isOptional, isString } from "@/shared/api/decoder";
 import type { PeriodValue } from "@/shared/lib/period";
 
@@ -75,5 +75,5 @@ const decodeDashboard = createObjectDecoder<DashboardDTO>("dashboard", {
 export function getDashboard(period: DashboardPeriod, timezone: string, refresh = false): Promise<DashboardDTO> {
   const query = new URLSearchParams({ period, timezone });
   if (refresh) query.set("refresh", "1");
-  return apiRequest(`/api/admin/v1/dashboard?${query.toString()}`, {}, decodeDashboard);
+  return apiRequest(`${LEGACY_ADMIN_API_PREFIX}/dashboard?${query.toString()}`, {}, decodeDashboard);
 }

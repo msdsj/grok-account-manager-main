@@ -1,10 +1,10 @@
 # 部署、运行与使用指南
 
-本文面向第一次部署 `grok-account-manager` 的用户，说明本地开发、构建后的本地运行、命令行注册、邮箱与代理配置、账号管理和本地中转的完整流程。
+本文面向第一次部署 `grok-account-manager` 的用户，说明本地开发、构建后的本地运行、命令行注册、邮箱与代理配置、账号管理和内置网关的完整流程。
 
 > 本项目默认按本机工具设计，只监听 `127.0.0.1`。请遵守 Grok、邮箱服务和代理服务的条款，不要把账号凭证、Cookie、OAuth token、代理账号或 `.env` 上传到 GitHub，也不要把管理端口直接暴露到公网。
 >
-> **安全边界：** 控制台登录由本项目管理的本地网关处理，并不等于 FastAPI 的全局访问控制。注册、配置和中转管理 API 不应直接暴露到互联网或不受信任的局域网。远程使用请走 SSH 隧道或受控 VPN，不要使用 `--host 0.0.0.0` 直接开放服务。
+> **安全边界：** 控制台登录由内置 Python 管理员认证处理。注册、配置和网关 API 不应直接暴露到互联网或不受信任的局域网。远程使用请走 SSH 隧道或受控 VPN，不要使用 `--host 0.0.0.0` 直接开放服务。
 
 ## 目录
 
@@ -16,7 +16,7 @@
 - [本地控制台](#本地控制台)
 - [注册代理池](#注册代理池)
 - [账号与凭证](#账号与凭证)
-- [本地中转](#本地中转)
+- [内置网关](#内置网关)
 - [更新与验证](#更新与验证)
 - [常见问题](#常见问题)
 - [安全清单](#安全清单)
@@ -28,9 +28,9 @@
 | CLI | 单机执行注册并写入凭证 | Python、uv、Chrome/Chromium | `uv run grok-account-manager grok ...` |
 | 控制台开发模式 | 修改前端或后端时调试 | CLI 组件，加 Node.js 和 pnpm/npm | 后端 `43187`，前端 `43188` |
 | 控制台构建模式 | 本机日常使用 | CLI 组件，加一次前端构建 | `http://127.0.0.1:43187` |
-| 本地中转 | 使用账号池提供 OpenAI 兼容接口 | 控制台组件，加 Docker Desktop；官方候选镜像与内置回退源码 | 控制台的“本地中转”页面 |
+| 内置网关 | 使用账号池提供 OpenAI 兼容接口 | 控制台组件 | 控制台“密钥 / 模型路由 / 请求审计”页面 |
 
-CLI 注册不依赖本地网关。完整 Web 控制台的登录、账号管理和中转页面会通过本项目选择并管理的网关容器工作。
+CLI 注册与控制台共用同一条 Python 后端进程；网关直接读取账号数据库，不再需要 Docker、Go 网关或 Node sidecar。
 
 ## 环境要求
 
@@ -46,16 +46,12 @@ CLI 注册不依赖本地网关。完整 Web 控制台的登录、账号管理�
 - Node.js `20+`
 - pnpm `11+`。仓库带有 `pnpm-lock.yaml`，推荐使用 pnpm；已有 npm 环境也可使用 `npm install` 和 `npm run ...`。
 
-运行本地中转还需要 Docker Desktop，且 Docker daemon 已启动。项目默认拉取官方候选镜像；用于自动回退的 v3.1.4 网关源码、前端和 Dockerfile 已随本仓库分发。
-
 ### 端口
 
 | 服务 | 默认地址 | 用途 |
 | --- | --- | --- |
-| FastAPI 后端 | `127.0.0.1:43187` | 注册 API、静态前端、OpenAI 代理入口 |
+| FastAPI 后端 | `127.0.0.1:43187` | 注册 API、账号管理、内置网关 `/v1`、静态前端 |
 | Vite 开发服务器 | `127.0.0.1:43188` | 前端热更新开发服务 |
-| 本地中转 | `127.0.0.1:43871` | 由本项目选择并管理的 grok2api 网关 |
-| 可选 Postgres 容器 | 主机端口 `54329` | 预留开发数据库，不是当前默认运行依赖；现有 Compose 默认会发布端口 |
 
 若端口冲突，请优先改启动参数，而不是结束不明进程。例如后端改为 `43190`：
 
@@ -300,7 +296,7 @@ uv run grok-account-manager-api
 
 打开 `http://127.0.0.1:43187`。此时 FastAPI 会直接提供 `web/dist` 中的前端文件，不需要 Vite 开发服务器。
 
-控制台包含注册任务、账号列表、账号测试、图片/对话测试、代理与中转配置等页面。注册任务启动后可以停止任务，也可以最小化或还原程序启动的浏览器窗口。
+控制台包含注册任务、账号与标签、额度、模型路由、密钥、请求审计、操作日志和配置中心等页面。注册任务启动后可以停止任务，也可以最小化或还原程序启动的浏览器窗口。
 
 ### 后台启动
 
@@ -351,56 +347,31 @@ uv run grok-account-manager grok \
 
 | 文件或目录 | 说明 |
 | --- | --- |
-| `output/credentials/grok_credentials.json` | GrokAccount JSON 凭证集合 |
-| `output/sso.txt` | TXT sink 生成的 SSO 输出 |
-| `output/grok-account-manager.db` | 本地 SQLite 账号索引、凭证引用和测试结果 |
-| `output/pending-registration-results.json` | 注册成功但 OAuth 或持久化尚未完成的恢复队列 |
+| `output/grok-account-manager.db` | 统一 SQLite 主库：账号、凭证、标签、额度、操作日志、任务日志和待恢复队列 |
+| `output/credentials/` | 历史 JSON 导出目录；运行时不再读写，控制台导出时按需生成 |
+| `output/sso.txt` | 仅在 CLI 显式使用 TXT sink 时生成 |
 | `output/mailboxes/outlook-accounts.txt` | 控制台保存的 Outlook 账号池 |
 | `output/registration-proxies.json` | 控制台保存的注册代理池 |
-| `output/relay-config.json` | 本地中转配置，包含敏感管理信息 |
-| `output/grok2api-v2-data/` | 本地中转 SQLite 与媒体数据，官方和回退镜像共用 |
-| `output/grok2api-v2-backups/` | 新官方 digest 首次正式启动前的私有 SQLite 回滚备份 |
+| `output/backups/` | 旧版本存储迁移时的自动备份 |
 
-凭证 JSON 损坏时，程序会先创建带时间戳的 `.broken-*` 备份，再拒绝覆盖源文件。`persistence_failed` 队列会在后端下次启动时尝试恢复；`oauth_pending` 只记录已注册但未得到完整 OAuth 凭证的状态，不会伪装成可用 OAuth 账号。
+账号信息和运行日志统一写入 SQLite 数据库，不再依赖本地 JSON 缓存。`persistence_failed` 队列会在后端下次启动时尝试恢复；`oauth_pending` 只记录已注册但未得到完整 OAuth 凭证的状态，不会伪装成可用 OAuth 账号。
 
 备份时请使用加密磁盘或受限目录，并同时备份 `output/credentials/`、SQLite 数据库和你单独保存的邮箱账号池。不要把备份直接放回仓库根目录后提交。
 
-## 本地中转
+## 内置网关
 
-本地中转默认以 `ghcr.io/chenyme/grok2api:latest` 作为官方候选镜像。每次准备启动中转时，后端按以下顺序选择实际运行镜像：
+三网关都在 FastAPI 进程内运行，不需要 Docker 或额外端口：
 
-1. `docker pull` 所选候选；若拉取失败但本机保留了可验证缓存，仍可继续验证该缓存。
-2. 从本地镜像解析与候选仓库匹配的不可变 `RepoDigest`，不直接以可变 tag 启动正式容器。
-3. 使用临时配置、临时数据目录和随机本机端口执行隔离探针，不挂载正式中转配置或数据。
-4. 探针通过后按该 digest 启动；候选没有可用 `RepoDigest`、探针失败，或拉取失败且无可验证缓存时，回退到仓库内置的 grok2api v3.1.4 镜像 `grok-account-manager-gateway:local`。
+- `GET /v1/models`
+- `POST /v1/chat/completions`（Grok / Kiro，支持流式）
+- `POST /v1/images/generations`、`POST /v1/images/edits`（Grok / GPT）
+- `POST /v1/videos/generations`、`GET /v1/videos/{id}`（Grok）
 
-FastAPI 每次启动都会把这次启动视为更新边界，停止遗留的同名容器并重新检查候选；正常 API 请求只复用已经健康的容器。
+在控制台“密钥”页面创建客户端密钥后，请求头使用 `Authorization: Bearer <key>`；没有创建任何密钥时，本机直连模式放行。模型到 provider 的映射在“模型路由”页面查看，调用记录在“请求审计”页面查看。
 
-如需指定版本 tag 或 digest，在 `.env` 中设置：
+上游超时由 `GATEWAY_UPSTREAM_TIMEOUT` 控制（秒，默认 180）。网关直接读取 `output/grok-account-manager.db` 中的账号，注册完成后无需同步；账号测试也由 Python 网关执行。
 
-```dotenv
-GROK_ACCOUNT_MANAGER_GATEWAY_IMAGE=ghcr.io/chenyme/grok2api:vX.Y.Z
-# GROK_ACCOUNT_MANAGER_GATEWAY_IMAGE=ghcr.io/chenyme/grok2api@sha256:<64 位摘要>
-```
-
-不设置时使用官方 `latest` 候选。版本 tag 便于选择发行版；需要严格固定内容时应使用 digest。
-
-首次成功准备中转时，项目会在 `output/` 下生成中转配置；正式网关数据始终保存在 `output/grok2api-v2-data/`，官方镜像和 v3.1.4 回退镜像共用该目录，隔离探针不会读取它。新官方 digest 第一次正式启动前，程序会把 SQLite 主文件及 WAL/SHM（如存在）备份到权限为 `0700/0600` 的 `output/grok2api-v2-backups/`；正式启动、健康检查或管理员握手失败时会停止候选、恢复该备份，再启动内置回退。中转管理员用户名为 `grok-account-manager`；首次生成的管理员密码保存在仅本机可读的 `output/relay-config.json` 的 `admin_key` 字段中。该值是机密，不能截图、提交或发送给他人；应在可信本机上妥善保存并按需更换。
-
-在控制台“本地中转”页面可以检查状态、启动或停止中转、同步本地账号和查看可用模型。中转默认地址为 `http://127.0.0.1:43871`。不要把它、后端端口或中转配置直接映射到公网。
-
-如果电脑上的代理客户端使用默认混合端口，项目默认会把网关出口配置为
-`http://127.0.0.1:7890`。由于网关运行在 Docker 容器内，启动时会自动改写为
-`http://host.docker.internal:7890`，并创建/更新名为“本机VPN-Web”的内置 Web 出口节点；
-无需另外克隆或维护 grok2api 项目；候选镜像的拉取和回退镜像的构建由本项目处理。代理端口不同或使用 SOCKS5 时，在 `.env` 中填写：
-
-```dotenv
-GROK_ACCOUNT_MANAGER_GATEWAY_PROXY=socks5://127.0.0.1:1080
-```
-
-也可以填写远程代理地址。确实需要直连时将该变量留空，重启本项目后会停用自动创建的本机 VPN 节点。代理地址只写入本机权限为 `0600` 的配置文件，控制台状态仅显示脱敏值。
-
-`docker-compose.yml` 中的 Postgres 服务是后续数据库迁移预留项。当前默认账号数据库是 SQLite，不会因为运行 `docker compose up -d` 自动切换到 Postgres。现有 Compose 使用示例账号并默认发布主机端口 `54329`，只应在可信开发网络中运行；如要启用它，应先修改密码和端口映射策略。
+`output/` 下的 SQLite 数据库是唯一账号存储，不再提供 Postgres 预留容器。
 
 ## 更新与验证
 
@@ -416,13 +387,7 @@ git status --short
 ./scripts/update.sh
 ```
 
-当前脚本会依次更新代码、同步 Python 依赖、构建前端、预拉取当前 shell 环境中
-`GROK_ACCOUNT_MANAGER_GATEWAY_IMAGE` 指定的候选（默认
-`ghcr.io/chenyme/grok2api:latest`），并构建仓库内置的 v3.1.4 回退镜像。要让脚本
-预拉取固定版本，可使用 `GROK_ACCOUNT_MANAGER_GATEWAY_IMAGE=... ./scripts/update.sh`；
-`.env` 中的同名设置供 FastAPI 运行时读取。候选预拉取失败时脚本仍会继续准备回退
-镜像；预拉取成功也不代表直接采用该镜像，启动中转时仍会重新按 `RepoDigest` 和
-隔离探针结果选择。
+当前脚本会依次更新代码、同步 Python 依赖并构建前端，不再拉取或构建 Docker 网关镜像。
 
 需要分步更新应用依赖时可执行：
 
@@ -475,8 +440,8 @@ lsof -nP -iTCP:43188 -sTCP:LISTEN
 
 1. 后端是否运行在 `127.0.0.1:43187`。
 2. 开发模式下，`VITE_DEV_API_TARGET` 是否与后端实际地址一致。
-3. Docker Desktop 是否已启动，以及仓库内 `gateway/` 是否完整。
-4. 查看 `output/backend.log` 与 `output/grok2api-relay.log` 的最后几行，不要把含 token 的整份日志公开。
+3. 控制台登录由内置 Python 认证提供，默认账号 `admin`；首次启动可用 `ADMIN_USERNAME` / `ADMIN_PASSWORD` 覆盖。
+4. 查看 `output/backend.log` 的最后几行（如使用后台启动脚本），不要把含 token 的整份日志公开。
 
 ### 浏览器没有打开或注册页无法加载
 
@@ -498,8 +463,8 @@ OAuth 模式要求拿到有效的 `refresh_token`。如果授权被拒绝、超�
 ## 安全清单
 
 - `.env`、Cloud Mail Token/登录密码、`output/`、账号池文件、代理列表和浏览器 Cookie 都是机密。
-- 后端、Vite 和中转默认应保持在 `127.0.0.1`；远程访问请使用 SSH 隧道或受控 VPN，不要直接绑定 `0.0.0.0`。
-- 当前 `docker-compose.yml` 的 Postgres 示例端口会发布到主机接口，运行前应修改示例凭据并确认防火墙和网络边界。
-- 不要提交 `output/relay-config.json`、SQLite 数据库、`grok_credentials.json`、SSO 文本或截图中的管理密码。
+- 后端和 Vite 默认应保持在 `127.0.0.1`；远程访问请使用 SSH 隧道或受控 VPN，不要直接绑定 `0.0.0.0`。
+- SQLite 数据库、`.env`、客户端密钥和账号凭证都应保存在可信本机，不要提交到 Git。
+- 不要提交 `output/` 下的 SQLite 数据库、`grok_credentials.json`、SSO 文本或截图中的管理密码。
 - 不要把控制台日志直接粘贴到公开 Issue；日志可能包含邮箱、代理摘要或错误上下文。
 - 升级前备份重要产物，尤其是未被 Git 跟踪的本地工具和账号池。

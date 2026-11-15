@@ -22,6 +22,7 @@ import type { ModelRouteDTO } from "@/entities/model/types";
 import {
   createChatResponse,
   createVideo,
+  editImage,
   editVideo,
   extendVideo,
   generateImage,
@@ -39,8 +40,7 @@ import {
   type VideoStatus,
   type VoiceInfo,
 } from "@/features/creative-console/creative-console-api";
-import { getClientKeySecret, listClientKeys, type ClientKeyDTO } from "@/features/client-keys/client-keys-api";
-import { importVideoInputFromURL, uploadMediaInput } from "@/features/media/media-api";
+import { listGatewayKeys, type GatewayKeyDTO } from "@/shared/api/gateway";
 import { PageHeader } from "@/shared/components/page-header";
 import { cn } from "@/shared/lib/cn";
 
@@ -49,11 +49,6 @@ type ConversationMessage = ChatMessage & {
   id: string;
   reasoning?: string;
   tools?: ChatToolActivity[];
-};
-
-type SecretState = {
-  keyId: string;
-  secret: string;
 };
 
 type ChatRequest = {
@@ -102,37 +97,35 @@ export function CreativeConsolePage() {
   const { t } = useTranslation();
   const [mode, setMode] = useState<CreativeMode>("chat");
   const [selectedKeyId, setSelectedKeyId] = useState("");
-  const [secretState, setSecretState] = useState<SecretState | null>(null);
-  const [keyError, setKeyError] = useState("");
+  const [apiKey, setApiKey] = useState("");
   const [selectedModels, setSelectedModels] = useState<Record<CreativeMode, string>>({ chat: "", image: "", video: "", voice: "" });
   const [chatToolbarElement, setChatToolbarElement] = useState<HTMLDivElement | null>(null);
-  const requestedSecretKeyRef = useRef("");
 
   const keysQuery = useQuery({
     queryKey: ["creative-console", "client-keys"],
-    queryFn: () => listAllPaginatedItems((page, pageSize) => listClientKeys({ page, pageSize, status: "active" })),
+    queryFn: listGatewayKeys,
     staleTime: 30_000,
   });
   const activeKeys = useMemo(() => (keysQuery.data ?? []).filter(isUsableKey), [keysQuery.data]);
   const effectiveKeyId = activeKeys.some((key) => key.id === selectedKeyId) ? selectedKeyId : activeKeys[0]?.id ?? "";
   const selectedKey = activeKeys.find((key) => key.id === effectiveKeyId);
-  const modelProviderScope = (selectedKey?.providerScope ?? ["all"]).filter((value) => value !== "all");
-  const modelTierScope = (selectedKey?.tierScope ?? ["all"]).filter((value) => value !== "all");
   const modelsQuery = useQuery({
-    queryKey: ["creative-console", "models", modelProviderScope.join(","), modelTierScope.join(",")],
-    queryFn: () => listAllPaginatedItems((page, pageSize) => listModels({ page, pageSize, status: "enabled", providerScope: modelProviderScope, tierScope: modelTierScope, activeScope: true })),
+    queryKey: ["creative-console", "models"],
+    queryFn: () => listAllPaginatedItems((page, pageSize) => listModels({ page, pageSize, status: "enabled" })),
     enabled: Boolean(selectedKey),
     staleTime: 30_000,
   });
   const availableModels = useMemo(() => (modelsQuery.data ?? []).filter((model) => model.enabled && model.available), [modelsQuery.data]);
   const permittedModels = useMemo(() => {
-    if (!selectedKey || selectedKey.allowedModelIds.length === 0) return availableModels;
-    const allowedModelIds = new Set(selectedKey.allowedModelIds);
-    return availableModels.filter((model) => allowedModelIds.has(model.id));
+    if (!selectedKey || selectedKey.models.length === 0) return availableModels;
+    const allowedModelIds = new Set(selectedKey.models);
+    return availableModels.filter((model) => allowedModelIds.has(model.publicId));
   }, [availableModels, selectedKey]);
   const modelGroups = useMemo(() => ({
     chat: uniqueModelsByPublicID(permittedModels.filter((model) => model.capability === "chat" || model.capability === "responses")),
-    image: uniqueModelsByPublicID(permittedModels.filter(isUsableImageRoute)),
+    // Keep duplicate public IDs here. ImagePanel must see both the Web and
+    // Console routes so it can choose an image_edit-capable target per action.
+    image: permittedModels.filter(isUsableImageRoute),
     // Keep all video routes here; VideoPanel applies the Web preference for
     // generation and restricts edit/extend to the Console route.
     video: permittedModels.filter((model) => model.capability === "video"),
@@ -146,32 +139,6 @@ export function CreativeConsolePage() {
     voice: voiceModelChoices.some((model) => model.publicId === selectedModels.voice) ? selectedModels.voice : voiceModelChoices[0]?.publicId ?? "",
   }), [modelGroups, selectedModels, voiceModelChoices]);
 
-  const secretMutation = useMutation({
-    mutationFn: (id: string) => getClientKeySecret(id),
-    onSuccess: ({ secret }, id) => {
-      if (id !== effectiveKeyId) return;
-      setSecretState({ keyId: id, secret });
-      setKeyError("");
-    },
-    onError: (error, id) => {
-      if (id !== effectiveKeyId) return;
-      setKeyError(error instanceof Error ? error.message : t("creativeConsole.errors.keyUnavailable"));
-    },
-  });
-
-  const loadSecret = secretMutation.mutate;
-  useEffect(() => {
-    if (!effectiveKeyId) {
-      requestedSecretKeyRef.current = "";
-      return;
-    }
-    if (requestedSecretKeyRef.current === effectiveKeyId) return;
-    requestedSecretKeyRef.current = effectiveKeyId;
-    loadSecret(effectiveKeyId);
-  }, [effectiveKeyId, loadSecret]);
-
-  const apiKey = secretState?.keyId === effectiveKeyId ? secretState.secret : "";
-
   function panelProps(panelMode: CreativeMode): CreativePanelProps {
     return {
       apiKey,
@@ -183,15 +150,14 @@ export function CreativeConsolePage() {
 
   function changeKey(id: string): void {
     setSelectedKeyId(id);
-    setSecretState(null);
-    setKeyError("");
+    setApiKey("");
   }
 
   return (
-    <div className="flex h-[calc(100dvh-5rem)] min-h-[36rem] flex-col gap-5 overflow-hidden">
+    <div className="flex h-[calc(100dvh-5rem)] min-h-[36rem] flex-col gap-5 overflow-hidden lg:h-full lg:min-h-0">
       <PageHeader title={t("creativeConsole.title")} description={t("creativeConsole.description")} />
 
-      <aside className="flex shrink-0 flex-col gap-2 rounded-lg bg-secondary/45 px-4 py-2.5 text-xs leading-5 text-muted-foreground sm:flex-row sm:items-center sm:justify-between sm:gap-4">
+      <aside className="flex shrink-0 flex-col gap-2 rounded-xl border border-border/70 bg-secondary/35 px-4 py-2.5 text-xs leading-5 text-muted-foreground sm:flex-row sm:items-center sm:justify-between sm:gap-4">
         <div className="flex min-w-0 items-center gap-3">
           <Sparkle className="size-4 shrink-0 text-foreground/70" />
           <p>{t("creativeConsole.promotion", { product: "DEEIX Chat" })}</p>
@@ -218,9 +184,18 @@ export function CreativeConsolePage() {
                 <SelectValue placeholder={keysQuery.isPending ? t("common.loading") : t("creativeConsole.selectKey")} />
               </SelectTrigger>
               <SelectContent>
-                {activeKeys.map((key) => <SelectItem key={key.id} value={key.id}>{key.name} · {key.prefix}</SelectItem>)}
+                {activeKeys.map((key) => <SelectItem key={key.id} value={key.id}>{key.name} · {key.keyPrefix}</SelectItem>)}
               </SelectContent>
             </Select>
+            <Input
+              type="password"
+              autoComplete="off"
+              value={apiKey}
+              onChange={(event) => setApiKey(event.target.value)}
+              placeholder="粘贴密钥明文（仅创建时显示一次）"
+              aria-label="API 密钥"
+              className="h-9 min-w-0 flex-1 bg-secondary/55 lg:w-64 lg:flex-none"
+            />
             <div ref={setChatToolbarElement} className={cn("items-center gap-1", mode === "chat" ? "flex" : "hidden")} />
           </div>
         </div>
@@ -228,7 +203,7 @@ export function CreativeConsolePage() {
         <div className="shrink-0 space-y-2 px-3">
           {keysQuery.isError ? <RetryableError message={keysQuery.error.message} onRetry={() => void keysQuery.refetch()} /> : null}
           {!keysQuery.isPending && !keysQuery.isError && activeKeys.length === 0 ? <InlineError message={t("creativeConsole.errors.noKeys")} /> : null}
-          {keyError ? <InlineError message={keyError} /> : null}
+          {selectedKey && !apiKey ? <InlineError message="请在密钥页面创建密钥，并将明文粘贴到上方输入框。" /> : null}
           {modelsQuery.isError ? <RetryableError message={modelsQuery.error.message} onRetry={() => void modelsQuery.refetch()} /> : null}
         </div>
 
@@ -861,44 +836,111 @@ function ChatPanel({ apiKey, model, modelOptions, onModelChange, storageScope, t
 
 function ImagePanel({ apiKey, model, modelOptions, onModelChange }: CreativePanelProps) {
   const { t } = useTranslation();
+  const [action, setAction] = useState<"generate" | "edit">("generate");
   const [prompt, setPrompt] = useState("");
+  const [imageURL, setImageURL] = useState("");
+  const [imageFileName, setImageFileName] = useState("");
+  const [imageInputError, setImageInputError] = useState("");
   const [count, setCount] = useState("1");
   const [aspectRatio, setAspectRatio] = useState("1:1");
   const [resolution, setResolution] = useState("1k");
   const [quality, setQuality] = useState<"low" | "medium">("medium");
   const [images, setImages] = useState<ImageResult[]>([]);
-  const selectedRoute = useMemo(() => modelOptions.find((item) => item.publicId === model), [model, modelOptions]);
-  const supportsQuality = model.toLowerCase().endsWith("grok-imagine-image-2.0");
-  const imageResolutionOptions = selectedRoute?.provider === "grok_web" && selectedRoute.publicId === "grok-imagine-image-lite"
+  const imageFileInputRef = useRef<HTMLInputElement | null>(null);
+  const generateModels = useMemo(() => {
+    const routes = modelOptions.filter((item) => item.capability === "image");
+    return uniqueModelsByPublicID(preferWebMediaRoutes(routes));
+  }, [modelOptions]);
+  const editModels = useMemo(
+    () => preferImageEditRoutes(modelOptions.filter(isUsableImageEditRoute)),
+    [modelOptions],
+  );
+  const activeModels = action === "generate" ? generateModels : editModels;
+  const activeModel = activeModels.some((item) => item.publicId === model)
+    ? model
+    : activeModels[0]?.publicId ?? "";
+  const selectedRoute = useMemo(() => activeModels.find((item) => item.publicId === activeModel), [activeModel, activeModels]);
+  const isWebEdit = action === "edit" && selectedRoute?.provider === "grok_web";
+  const supportsQuality = selectedRoute?.provider === "grok_console" && activeModel.toLowerCase().endsWith("grok-imagine-image-2.0");
+  const imageCountOptions = isWebEdit ? ["1"] : ["1", "2", "3", "4"];
+  const selectedCount = imageCountOptions.includes(count) ? count : imageCountOptions[0];
+  const imageResolutionOptions = isWebEdit || (selectedRoute?.provider === "grok_web" && selectedRoute.publicId === "grok-imagine-image-lite")
     ? (["1k"] as const)
     : imageResolutions;
   const selectedResolution = imageResolutionOptions.some((item) => item === resolution) ? resolution : imageResolutionOptions[0];
 
+  useEffect(() => {
+    if (activeModel && activeModel !== model) onModelChange(activeModel);
+  }, [activeModel, model, onModelChange]);
+
   const mutation = useMutation({
-    mutationFn: (request: Parameters<typeof generateImage>[0]) => generateImage(request),
+    mutationFn: (request: Parameters<typeof generateImage>[0] | Parameters<typeof editImage>[0]) => (
+      action === "generate" ? generateImage(request as Parameters<typeof generateImage>[0]) : editImage(request as Parameters<typeof editImage>[0])
+    ),
     onSuccess: setImages,
   });
 
   function submit(event: FormEvent): void {
     event.preventDefault();
-    if (!apiKey || !model || !prompt.trim() || mutation.isPending) return;
+    if (!apiKey || !activeModel || !prompt.trim() || mutation.isPending) return;
+    const sourceImage = imageURL.trim();
+    if (action === "edit") {
+      if (!sourceImage) return;
+      if (!sourceImage.startsWith("data:image/") && !/^https:\/\/[^\s]+$/i.test(sourceImage)) {
+        setImageInputError(t("creativeConsole.errors.invalidImageURL"));
+        return;
+      }
+    }
     mutation.reset();
+    if (action === "generate") {
+      mutation.mutate({
+        apiKey,
+        model: activeModel,
+        prompt: prompt.trim(),
+        count: Number(selectedCount),
+        aspectRatio,
+        resolution: selectedResolution,
+        quality: supportsQuality ? quality : undefined,
+      });
+      return;
+    }
     mutation.mutate({
       apiKey,
-      model,
+      model: activeModel,
       prompt: prompt.trim(),
-      count: Number(count),
+      imageURL: sourceImage,
+      count: Number(selectedCount),
       aspectRatio,
       resolution: selectedResolution,
       quality: supportsQuality ? quality : undefined,
     });
   }
 
+  async function selectImage(file: File): Promise<void> {
+    if (file.type && !file.type.startsWith("image/")) {
+      setImageInputError(t("creativeConsole.errors.invalidImage"));
+      return;
+    }
+    if (file.size > 20 * 1024 * 1024) {
+      setImageInputError(t("creativeConsole.errors.imageTooLarge"));
+      return;
+    }
+    try {
+      const dataURL = await readFileAsDataURL(file);
+      setImageURL(dataURL);
+      setImageFileName(file.name);
+      setImageInputError("");
+      mutation.reset();
+    } catch {
+      setImageInputError(t("creativeConsole.errors.invalidImage"));
+    }
+  }
+
   return (
     <div className="flex h-full min-h-0 flex-col overflow-hidden">
       <div className="min-h-0 flex-1 overflow-y-auto py-6">
         <div className="flex min-h-full w-full flex-col justify-center px-3 sm:px-6">
-          {images.length === 0 && !mutation.isPending ? <WelcomeState title={t("creativeConsole.welcomeImage")} /> : null}
+          {images.length === 0 && !mutation.isPending ? <WelcomeState title={action === "generate" ? t("creativeConsole.welcomeImage") : t("creativeConsole.welcomeImageEdit")} /> : null}
           {mutation.isPending ? <LoadingResult text={t("creativeConsole.generatingImage")} /> : null}
           {images.length > 0 ? (
             <div className="grid grid-cols-1 gap-4 md:grid-cols-2" aria-live="polite">
@@ -918,16 +960,53 @@ function ImagePanel({ apiKey, model, modelOptions, onModelChange }: CreativePane
 
       <form className="w-full shrink-0 px-3 pb-2 sm:px-6 sm:pb-3" onSubmit={submit}>
         <div className={composerClassName}>
-          <Textarea id="image-prompt" value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder={t("creativeConsole.imagePlaceholder")} className="min-h-24 resize-none border-0 bg-transparent px-4 py-3 text-sm focus-visible:ring-0" />
+          {action === "edit" ? (
+            <div className="flex items-center gap-2 px-3 pt-3">
+              <Input
+                id="image-source-url"
+                type="url"
+                value={imageFileName ? "" : imageURL.startsWith("data:") ? "" : imageURL}
+                onChange={(event) => { setImageURL(event.target.value); setImageFileName(""); setImageInputError(""); mutation.reset(); }}
+                placeholder={imageFileName || t("creativeConsole.imageSourcePlaceholder")}
+                aria-label={t("creativeConsole.imageSource")}
+                className="h-8 min-w-0 flex-1 border-0 bg-transparent px-2 text-xs shadow-none focus-visible:ring-0"
+              />
+              <input
+                ref={imageFileInputRef}
+                type="file"
+                accept="image/png,image/jpeg,image/webp,image/gif"
+                className="hidden"
+                onChange={(event) => {
+                  const file = event.target.files?.[0];
+                  if (file) void selectImage(file);
+                  event.target.value = "";
+                }}
+              />
+              <Button type="button" variant="secondary" size="sm" className="h-8 shrink-0 gap-1.5 px-2" onClick={() => imageFileInputRef.current?.click()}>
+                <Upload />{imageFileName || t("creativeConsole.uploadImage")}
+              </Button>
+              {imageURL ? <Button type="button" variant="ghost" size="icon" className="size-8 shrink-0" aria-label={t("creativeConsole.clearImageSource")} onClick={() => { setImageURL(""); setImageFileName(""); setImageInputError(""); mutation.reset(); }}><X /></Button> : null}
+            </div>
+          ) : null}
+          {action === "edit" && imageInputError ? <p className="px-4 pt-1 text-[11px] text-destructive">{imageInputError}</p> : null}
+          <Textarea id="image-prompt" value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder={action === "generate" ? t("creativeConsole.imagePlaceholder") : t("creativeConsole.imageEditPlaceholder")} className="min-h-24 resize-none border-0 bg-transparent px-4 py-3 text-sm focus-visible:ring-0" />
           <div className="flex flex-wrap items-center justify-between gap-2 px-3 pb-3">
             <div className="flex min-w-0 flex-wrap items-center gap-1">
-              <CompactModelSelect value={model} models={modelOptions} onChange={onModelChange} />
-              <CompactSelect value={count} options={["1", "2", "3", "4"]} onChange={setCount} ariaLabel={t("creativeConsole.count")} suffix="×" icon={<Images />} />
+              <CompactIconSelect
+                value={action}
+                options={[{ value: "generate", label: t("creativeConsole.imageActions.generate") }, { value: "edit", label: t("creativeConsole.imageActions.edit") }]}
+                onChange={(value) => { setAction(value as "generate" | "edit"); mutation.reset(); }}
+                ariaLabel={t("creativeConsole.imageAction")}
+                icon={<ImagePlus />}
+                active={action === "edit"}
+              />
+              <CompactModelSelect value={activeModel} models={activeModels} onChange={onModelChange} />
+              <CompactSelect value={selectedCount} options={imageCountOptions} onChange={setCount} ariaLabel={t("creativeConsole.count")} suffix="×" icon={<Images />} />
               <CompactSelect value={aspectRatio} options={imageAspectRatios} onChange={setAspectRatio} ariaLabel={t("creativeConsole.aspectRatio")} icon={<TvMinimal />} />
               <CompactSelect value={selectedResolution} options={imageResolutionOptions} onChange={setResolution} ariaLabel={t("creativeConsole.resolution")} icon={<ImageUpscale />} />
               {supportsQuality ? <CompactSelect value={quality} options={["low", "medium"]} onChange={(value) => setQuality(value as "low" | "medium")} ariaLabel={t("creativeConsole.quality")} /> : null}
             </div>
-            <Button type="submit" size="icon" aria-label={t("creativeConsole.generateImage")} disabled={!apiKey || !model || !prompt.trim() || mutation.isPending}>{mutation.isPending ? <Loader2 className="animate-spin" /> : <ArrowUp />}</Button>
+            <Button type="submit" size="icon" aria-label={action === "generate" ? t("creativeConsole.generateImage") : t("creativeConsole.editImage")} disabled={!apiKey || !activeModel || !prompt.trim() || (action === "edit" && !imageURL.trim()) || mutation.isPending}>{mutation.isPending ? <Loader2 className="animate-spin" /> : <ArrowUp />}</Button>
           </div>
         </div>
         {mutation.isError ? <div className="mt-1 px-2 text-[11px] text-destructive">{mutation.error.message}</div> : null}
@@ -964,9 +1043,7 @@ function VideoPanel({ apiKey, model, modelOptions, onModelChange }: CreativePane
     [modelOptions],
   );
   const editModels = useMemo(
-    () => uniqueModelsByPublicID(modelOptions.filter(
-      (item) => item.capability === "video" && item.provider === "grok_console" && item.upstreamModel.endsWith("grok-imagine-video"),
-    )),
+    () => uniqueModelsByPublicID(modelOptions.filter((item) => item.capability === "video")),
     [modelOptions],
   );
   const activeModels = action === "generate" ? generateModels : editModels;
@@ -1014,16 +1091,6 @@ function VideoPanel({ apiKey, model, modelOptions, onModelChange }: CreativePane
           nextReferenceURL = undefined;
           nextReferenceFileID = undefined;
         }
-        if (!nextImageFileID && nextImageURL && /^https?:\/\//i.test(nextImageURL)) {
-          const staged = await importVideoInputFromURL(nextImageURL);
-          nextImageURL = undefined;
-          nextImageFileID = staged.fileId;
-        }
-        if (!nextReferenceFileID && nextReferenceURL && /^https?:\/\//i.test(nextReferenceURL)) {
-          const staged = await importVideoInputFromURL(nextReferenceURL);
-          nextReferenceURL = undefined;
-          nextReferenceFileID = staged.fileId;
-        }
         return createVideo({
           apiKey,
           model: activeModel,
@@ -1063,23 +1130,22 @@ function VideoPanel({ apiKey, model, modelOptions, onModelChange }: CreativePane
   const uploadMutation = useMutation({
     mutationFn: async ({ file, kind, selectionVersion }: { file: File; kind: "image" | "reference"; selectionVersion: number }) => {
       if (file.type && !file.type.startsWith("image/")) throw new Error(t("creativeConsole.errors.invalidImage"));
-      const input = await uploadMediaInput(file);
-      if (input.kind !== "image") throw new Error(t("creativeConsole.errors.invalidImage"));
-      return { ...input, kind, selectionVersion };
+      const url = await readFileAsDataURL(file);
+      return { kind, url, selectionVersion };
     },
     onSuccess: (input) => {
       if (input.kind === "image") {
         if (input.selectionVersion !== imageSelectionVersionRef.current) return;
-        setImageFileID(input.fileId);
-        setImageURL("");
+        setImageURL(input.url);
+        setImageFileID("");
         setReferenceURL("");
         setReferenceFileID("");
         setReferenceVoiceId("");
         return;
       }
       if (input.selectionVersion !== referenceSelectionVersionRef.current) return;
-      setReferenceFileID(input.fileId);
-      setReferenceURL("");
+      setReferenceURL(input.url);
+      setReferenceFileID("");
       setImageURL("");
       setImageFileID("");
     },
@@ -1088,14 +1154,13 @@ function VideoPanel({ apiKey, model, modelOptions, onModelChange }: CreativePane
   const videoUploadMutation = useMutation({
     mutationFn: async ({ file }: { file: File; selectionVersion: number }) => {
       if (file.type && !file.type.startsWith("video/")) throw new Error(t("creativeConsole.errors.invalidVideo"));
-      const input = await uploadMediaInput(file);
-      if (input.kind !== "video") throw new Error(t("creativeConsole.errors.invalidVideo"));
-      return input;
+      const url = await readFileAsDataURL(file);
+      return { url };
     },
     onSuccess: (input, request) => {
       if (request.selectionVersion !== videoSelectionVersionRef.current) return;
-      setSourceVideoFileID(input.fileId);
-      setSourceVideoURL("");
+      setSourceVideoURL(input.url);
+      setSourceVideoFileID("");
     },
   });
 
@@ -1768,9 +1833,8 @@ function MetaItem({ label, value, mono = false }: { label: string; value: string
   return <div className="min-w-0 py-2"><div className="mb-1 text-[11px] text-muted-foreground">{label}</div><div className={cn("truncate text-xs", mono && "font-mono")} title={value}>{value}</div></div>;
 }
 
-function isUsableKey(key: ClientKeyDTO): boolean {
-  if (!key.enabled) return false;
-  return !key.expiresAt || new Date(key.expiresAt).getTime() > Date.now();
+function isUsableKey(key: GatewayKeyDTO): boolean {
+  return key.enabled;
 }
 
 function validDuration(value: string): boolean {
@@ -1809,12 +1873,48 @@ function preferWebMediaRoutes(models: ModelRouteDTO[]): ModelRouteDTO[] {
 }
 
 function isUsableImageRoute(model: ModelRouteDTO): boolean {
-  if (model.capability !== "image" || !model.available || !model.capabilityKnown || model.supportedAccounts <= 0) return false;
+  if (!(model.capability === "image" || model.capability === "image_edit") || !model.available || !model.capabilityKnown || model.supportedAccounts <= 0) return false;
   if (model.provider === "grok_web") {
-    return ["grok-imagine-image-lite", "grok-imagine-image-quality-lite"].includes(model.publicId);
+    return ["grok-imagine-image-lite", "grok-imagine-image-quality-lite", "grok-imagine-image-edit"].includes(model.publicId);
   }
-  if (model.provider === "grok_build") return false;
-  return ["grok-imagine-image", "grok-imagine-image-quality", "grok-imagine-image-2.0"].includes(model.publicId);
+  return true;
+}
+
+function isUsableImageEditRoute(model: ModelRouteDTO): boolean {
+  if (model.capability === "image_edit") return true;
+  return model.capability === "image";
+}
+
+function preferImageEditRoutes(models: ModelRouteDTO[]): ModelRouteDTO[] {
+  const grouped = new Map<string, ModelRouteDTO[]>();
+  for (const model of models) {
+    const routes = grouped.get(model.publicId) ?? [];
+    routes.push(model);
+    grouped.set(model.publicId, routes);
+  }
+  return [...grouped.values()].flatMap((routes) => {
+    const preferred = [...routes].sort((left, right) => imageEditRoutePriority(left) - imageEditRoutePriority(right))[0];
+    return preferred ? [preferred] : [];
+  });
+}
+
+function imageEditRoutePriority(model: ModelRouteDTO): number {
+  if (model.provider === "grok_console" && model.capability === "image_edit") return 0;
+  if (model.provider === "grok_console" && model.capability === "image") return 1;
+  if (model.provider === "grok_web" && model.capability === "image_edit") return 2;
+  return 3;
+}
+
+function readFileAsDataURL(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.addEventListener("load", () => {
+      if (typeof reader.result === "string" && reader.result.startsWith("data:")) resolve(reader.result);
+      else reject(new Error("invalid file data"));
+    }, { once: true });
+    reader.addEventListener("error", () => reject(reader.error ?? new Error("file read failed")), { once: true });
+    reader.readAsDataURL(file);
+  });
 }
 
 let fallbackMessageID = 0;

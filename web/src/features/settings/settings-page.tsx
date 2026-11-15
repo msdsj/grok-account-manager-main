@@ -1,573 +1,291 @@
-import { RotateCcw, Sparkles } from "lucide-react";
-import { type ReactNode, useRef, useState } from "react";
-import { Controller } from "react-hook-form";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { Monitor, Moon, RefreshCw, Sun } from "lucide-react";
+import { useTheme } from "next-themes";
+import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { Link } from "react-router-dom";
+import { toast } from "sonner";
 
-import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from "@/components/ui/alert-dialog";
-import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Spinner } from "@/components/ui/spinner";
-import { Switch } from "@/components/ui/switch";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Textarea } from "@/components/ui/textarea";
-import { EgressNodes } from "@/features/settings/egress-nodes";
-import { VersionUpdateSection } from "@/features/system/version-update";
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { isByteSizeUnit, isDurationUnit, MAX_ROUTING_ATTEMPTS, type ByteSizeValue, type DurationValue, UNLIMITED_ROUTING_ATTEMPTS } from "@/features/settings/settings-model";
-import { useSettings } from "@/features/settings/use-settings";
-import { ErrorState } from "@/shared/components/data-state";
-import { cn } from "@/shared/lib/cn";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { DashboardPanel } from "@/features/dashboard/dashboard-panel";
+import {
+  getMailConfig,
+  getRegistrationProxyPool,
+  saveMailConfig,
+  type EmailSource,
+} from "@/features/register-task/register-task-api";
+import { getGatewayStatus } from "@/shared/api/gateway";
+import { PageHeader } from "@/shared/components/page-header";
+
+const emailSources: Array<{ value: EmailSource; label: string }> = [
+  { value: "duckmail", label: "DuckMail" },
+  { value: "cloud_mail", label: "Cloud Mail" },
+  { value: "outlook", label: "Outlook" },
+  { value: "google", label: "Google 账号" },
+];
 
 export function SettingsPage() {
-  const { t } = useTranslation();
-  const { form, settingsQuery, updateMutation, reset } = useSettings();
-  const [autoCleanConfirm, setAutoCleanConfirm] = useState<"enabled" | "includeDisabled" | null>(null);
-  const [unlimitedAttemptsConfirm, setUnlimitedAttemptsConfirm] = useState(false);
-  const limitedRoutingAttemptsRef = useRef(3);
-  const limitedVideoRoutingAttemptsRef = useRef(999);
-  const autoCleanEnabled = form.watch("accounts.autoCleanReauthEnabled") === true;
-  const buildForbiddenReauthEnabled = form.watch("accounts.markBuildForbiddenReauth") === true;
-  const segmentedSelectorEnabled = form.watch("routing.segmentedSelector.enabled") === true;
+  const { t, i18n } = useTranslation();
+  const queryClient = useQueryClient();
+  const { theme, setTheme } = useTheme();
+  const [emailSource, setEmailSource] = useState<EmailSource>("duckmail");
+  const [duckMailApiBase, setDuckMailApiBase] = useState("");
+  const [duckMailDomain, setDuckMailDomain] = useState("");
+  const [duckMailApiKey, setDuckMailApiKey] = useState("");
+  const [cloudMailApiBase, setCloudMailApiBase] = useState("");
+  const [cloudMailDomains, setCloudMailDomains] = useState("");
+  const [cloudMailAuthMode, setCloudMailAuthMode] = useState<"public" | "login">("login");
+  const [cloudMailPublicToken, setCloudMailPublicToken] = useState("");
+  const [cloudMailLoginEmail, setCloudMailLoginEmail] = useState("");
+  const [cloudMailLoginPassword, setCloudMailLoginPassword] = useState("");
+  const [duckMailApiKeyConfigured, setDuckMailApiKeyConfigured] = useState(false);
+  const [cloudMailPublicTokenConfigured, setCloudMailPublicTokenConfigured] = useState(false);
+  const [cloudMailLoginPasswordConfigured, setCloudMailLoginPasswordConfigured] = useState(false);
+  const loadedMailConfig = useRef(false);
 
-  if (settingsQuery.isError) {
-    return <ErrorState message={settingsQuery.error.message} onRetry={() => void settingsQuery.refetch()} />;
-  }
+  const mailQuery = useQuery({ queryKey: ["settings", "mail-config"], queryFn: getMailConfig });
+  const statusQuery = useQuery({ queryKey: ["gateway-status"], queryFn: () => getGatewayStatus(), staleTime: 30_000 });
+  const proxiesQuery = useQuery({ queryKey: ["registration-proxy-pool"], queryFn: getRegistrationProxyPool, staleTime: 30_000 });
 
-  const snapshot = settingsQuery.data;
-  const loading = settingsQuery.isPending;
-  const statsigMode = form.watch("providerWeb.statsigMode");
-  const draftClearanceMode = form.watch("providerWeb.clearanceMode");
-  const activeClearanceMode = snapshot?.config.providerWeb.clearanceMode ?? draftClearanceMode;
-  const statsigManualConfigured = form.watch("providerWeb.statsigManualConfigured");
-  const buildClientVersion = form.watch("providerBuild.clientVersion");
-  const buildUserAgent = form.watch("providerBuild.userAgent");
-  const recommendedBuild = snapshot?.recommendedProviderBuild;
-  const recommendedBuildApplied = recommendedBuild != null
-    && buildClientVersion === recommendedBuild.clientVersion
-    && buildUserAgent === recommendedBuild.userAgent;
-  const syncRecommendedBuild = () => {
-    if (!recommendedBuild) return;
-    form.setValue("providerBuild.clientVersion", recommendedBuild.clientVersion, { shouldDirty: true, shouldTouch: true, shouldValidate: true });
-    form.setValue("providerBuild.userAgent", recommendedBuild.userAgent, { shouldDirty: true, shouldTouch: true, shouldValidate: true });
-  };
+  useEffect(() => {
+    const config = mailQuery.data;
+    if (!config || loadedMailConfig.current) return;
+    if (emailSources.some((item) => item.value === config.emailSource)) setEmailSource(config.emailSource);
+    setDuckMailApiBase(config.duckMailApiBase);
+    setDuckMailDomain(config.duckMailDomain);
+    setDuckMailApiKeyConfigured(config.duckMailApiKeyConfigured);
+    setCloudMailApiBase(config.cloudMailApiBase);
+    setCloudMailDomains(config.cloudMailDomains);
+    setCloudMailAuthMode(config.cloudMailAuthMode);
+    setCloudMailPublicTokenConfigured(config.cloudMailPublicTokenConfigured);
+    setCloudMailLoginEmail(config.cloudMailLoginEmail);
+    setCloudMailLoginPasswordConfigured(config.cloudMailLoginPasswordConfigured);
+    loadedMailConfig.current = true;
+  }, [mailQuery.data]);
+
+  const saveMutation = useMutation({
+    mutationFn: () => saveMailConfig({
+      emailSource,
+      duckMailApiBase,
+      duckMailApiKey: duckMailApiKey.trim() || undefined,
+      duckMailDomain,
+      cloudMailApiBase,
+      cloudMailDomains,
+      cloudMailAuthMode,
+      cloudMailPublicToken: cloudMailPublicToken.trim() || undefined,
+      cloudMailLoginEmail,
+      cloudMailLoginPassword: cloudMailLoginPassword.trim() || undefined,
+    }),
+    onSuccess: (config) => {
+      queryClient.setQueryData(["settings", "mail-config"], config);
+      setDuckMailApiKeyConfigured(config.duckMailApiKeyConfigured);
+      setCloudMailPublicTokenConfigured(config.cloudMailPublicTokenConfigured);
+      setCloudMailLoginPasswordConfigured(config.cloudMailLoginPasswordConfigured);
+      setDuckMailApiKey("");
+      setCloudMailPublicToken("");
+      setCloudMailLoginPassword("");
+      toast.success(t("settings.saved"));
+    },
+    onError: (error) => toast.error(error instanceof Error ? error.message : t("errors.generic")),
+  });
+
+  const providers = statusQuery.data?.providers ?? [];
+  const themeItems = [
+    { value: "light", label: t("shell.light"), icon: Sun },
+    { value: "dark", label: t("shell.dark"), icon: Moon },
+    { value: "system", label: t("shell.system"), icon: Monitor },
+  ] as const;
 
   return (
-    <form className="w-full space-y-5" onSubmit={form.handleSubmit((values) => updateMutation.mutate(values))}>
-      <header className="relative sticky top-12 z-30 -mx-2 flex min-h-12 items-center justify-between gap-3 bg-background px-2 py-2 lg:top-20 lg:z-40 lg:before:pointer-events-none lg:before:absolute lg:before:inset-x-0 lg:before:-top-[100vh] lg:before:h-[100vh] lg:before:bg-background lg:before:content-['']">
-        <div className="min-w-0">
-          <h1 className="text-xl font-medium">{t("settings.title")}</h1>
-          <p className="sr-only">{t("settings.description")}</p>
-        </div>
-        <div className="flex shrink-0 flex-wrap items-center gap-2">
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button type="button" variant="ghost" size="icon" className="size-8" aria-label={t("common.reset")} disabled={loading || updateMutation.isPending || !form.formState.isDirty} onClick={reset}>
-                <RotateCcw />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent>{t("common.reset")}</TooltipContent>
-          </Tooltip>
-          <Button type="submit" size="sm" disabled={loading || updateMutation.isPending || !form.formState.isDirty}>
-            {updateMutation.isPending ? <Spinner /> : null}{t("common.save")}
+    <div className="space-y-5">
+      <PageHeader
+        title={t("settings.title")}
+        description="集中管理邮箱配置、网关状态与界面主题。"
+        actions={(
+          <Button variant="secondary" size="sm" onClick={() => void mailQuery.refetch()} disabled={mailQuery.isFetching}>
+            <RefreshCw className={mailQuery.isFetching ? "animate-spin" : undefined} />{t("common.refresh")}
           </Button>
+        )}
+      />
+
+      {mailQuery.isError ? (
+        <div className="rounded-xl border border-destructive/30 bg-destructive/5 px-4 py-3 text-sm text-destructive">
+          邮箱配置加载失败：{mailQuery.error instanceof Error ? mailQuery.error.message : t("errors.generic")}
         </div>
-      </header>
-
-      {loading ? <div className="flex min-h-64 items-center justify-center"><Spinner /></div> : null}
-      {snapshot ? (
-        <Tabs defaultValue="build" className="flex min-w-0 flex-col gap-7 lg:flex-row lg:items-start">
-          <TabsList className="flex h-auto w-full max-w-full shrink-0 justify-start gap-1 overflow-x-auto overscroll-x-contain rounded-none bg-transparent p-0 [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden [&>span]:rounded-md [&>span]:bg-muted/70 [&>span]:shadow-none lg:sticky lg:top-[148px] lg:w-56 lg:flex-col lg:items-stretch lg:overflow-visible">
-            <TabsTrigger className="h-9 w-auto shrink-0 justify-start rounded-md px-3 text-xs data-[state=active]:font-medium lg:w-full" value="build">{t("models.providerGrokBuild")}</TabsTrigger>
-            <TabsTrigger className="h-9 w-auto shrink-0 justify-start rounded-md px-3 text-xs data-[state=active]:font-medium lg:w-full" value="web">{t("settings.web.title")}</TabsTrigger>
-            <TabsTrigger className="h-9 w-auto shrink-0 justify-start rounded-md px-3 text-xs data-[state=active]:font-medium lg:w-full" value="console">{t("console.name")}</TabsTrigger>
-            <TabsTrigger className="h-9 w-auto shrink-0 justify-start rounded-md px-3 text-xs data-[state=active]:font-medium lg:w-full" value="delivery">{t("settings.groups.delivery")}</TabsTrigger>
-            <TabsTrigger className="h-9 w-auto shrink-0 justify-start rounded-md px-3 text-xs data-[state=active]:font-medium lg:w-full" value="policies">{t("settings.groups.policies")}</TabsTrigger>
-            <TabsTrigger className="h-9 w-auto shrink-0 justify-start rounded-md px-3 text-xs data-[state=active]:font-medium lg:w-full" value="accounts">{t("settings.accounts.title")}</TabsTrigger>
-            <TabsTrigger className="h-9 w-auto shrink-0 justify-start rounded-md px-3 text-xs data-[state=active]:font-medium lg:w-full" value="about">{t("updates.title")}</TabsTrigger>
-          </TabsList>
-
-          <div className="min-w-0 flex-1">
-          <SettingsPane value="build">
-          <SettingsSection
-            title={t("models.providerGrokBuild")}
-            action={recommendedBuild && !recommendedBuildApplied ? (
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button type="button" variant="secondary" size="sm" disabled={loading || updateMutation.isPending} onClick={syncRecommendedBuild}>
-                    <Sparkles />{t("settings.provider.syncRecommendedVersion")}
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent>{t("settings.provider.syncRecommendedVersionDescription")}</TooltipContent>
-              </Tooltip>
-            ) : undefined}
-          >
-            <div className="space-y-0">
-              <SettingsField controlId="provider-base-url" className="sm:col-span-2" label={t("settings.provider.baseURL")} description={t("settings.provider.baseURLHelp")} error={form.formState.errors.providerBuild?.baseURL?.message}><Input id="provider-base-url" {...form.register("providerBuild.baseURL")} /></SettingsField>
-              <SettingsField controlId="provider-fallback-base-url" className="sm:col-span-2" label={t("settings.provider.fallbackBaseURL")} description={t("settings.provider.fallbackBaseURLHelp")} error={form.formState.errors.providerBuild?.fallbackBaseURL?.message}><Input id="provider-fallback-base-url" {...form.register("providerBuild.fallbackBaseURL")} /></SettingsField>
-              <SettingsField controlId="provider-client-version" label={t("settings.provider.clientVersion")} description={t("settings.provider.clientVersionHelp")} badge={recommendedBuild ? t("settings.provider.recommendedVersion", { version: recommendedBuild.clientVersion }) : undefined} error={form.formState.errors.providerBuild?.clientVersion?.message}><Input id="provider-client-version" {...form.register("providerBuild.clientVersion")} /></SettingsField>
-              <SettingsField controlId="provider-client-identifier" label={t("settings.provider.clientIdentifier")} description={t("settings.provider.clientIdentifierHelp")} error={form.formState.errors.providerBuild?.clientIdentifier?.message}><Input id="provider-client-identifier" {...form.register("providerBuild.clientIdentifier")} /></SettingsField>
-              <SettingsField controlId="provider-token-auth" label={t("settings.provider.tokenAuth")} description={t("settings.provider.tokenAuthHelp")} error={form.formState.errors.providerBuild?.tokenAuth?.message}><Input id="provider-token-auth" autoComplete="off" {...form.register("providerBuild.tokenAuth")} /></SettingsField>
-              <SettingsField controlId="provider-user-agent" label={t("settings.provider.userAgent")} description={t("settings.provider.userAgentHelp")} error={form.formState.errors.providerBuild?.userAgent?.message}><Input id="provider-user-agent" {...form.register("providerBuild.userAgent")} /></SettingsField>
-              <SettingsField controlId="provider-response-header-timeout" label={t("settingsBuildTransport.responseHeaderTimeout")} description={t("settingsBuildTransport.responseHeaderTimeoutHelp")} error={form.formState.errors.providerBuild?.responseHeaderTimeout?.message}><Controller control={form.control} name="providerBuild.responseHeaderTimeout" render={({ field }) => <DurationInput id="provider-response-header-timeout" value={field.value} onChange={field.onChange} />} /></SettingsField>
-            </div>
-          </SettingsSection>
-          </SettingsPane>
-
-          <SettingsPane value="web">
-          <SettingsSection title={t("settings.web.title")}>
-            <div className="space-y-0">
-              <SettingsField controlId="web-base-url" className="sm:col-span-2" label={t("settings.web.baseURL")} description={t("settings.web.baseURLHelp")} error={form.formState.errors.providerWeb?.baseURL?.message}><Input id="web-base-url" {...form.register("providerWeb.baseURL")} /></SettingsField>
-              <SettingsField controlId="web-statsig-mode" className="sm:col-span-2" label={t("settings.web.statsigMode")} description={t("settings.web.statsigModeHelp")} error={form.formState.errors.providerWeb?.statsigMode?.message}>
-                <Controller control={form.control} name="providerWeb.statsigMode" render={({ field }) => (
-                  <Tabs value={field.value} onValueChange={field.onChange}>
-                    <TabsList id="web-statsig-mode" className="grid w-full grid-cols-2 bg-muted/55">
-                      <TabsTrigger value="manual" className="font-normal">{t("settings.web.statsigManual")}</TabsTrigger>
-                      <TabsTrigger value="url" className="font-normal">{t("settings.web.statsigURL")}</TabsTrigger>
-                    </TabsList>
-                  </Tabs>
-                )} />
-              </SettingsField>
-              {statsigMode === "manual" ? (
-                <SettingsField controlId="web-statsig-manual" className="sm:col-span-2" label={t("settings.web.statsigValue")} description={t("settings.web.statsigValueHelp")} badge={statsigManualConfigured ? t("settings.web.statsigConfigured") : undefined} error={form.formState.errors.providerWeb?.statsigManualValue?.message}>
-                  <Input id="web-statsig-manual" type="password" autoComplete="off" placeholder={statsigManualConfigured ? t("settings.web.statsigKeepConfigured") : t("settings.web.statsigValuePlaceholder")} {...form.register("providerWeb.statsigManualValue")} />
-                </SettingsField>
-              ) : (
-                <SettingsField controlId="web-statsig-url" className="sm:col-span-2" label={t("settings.web.statsigSignerURL")} description={t("settings.web.statsigSignerURLHelp")} error={form.formState.errors.providerWeb?.statsigSignerURL?.message}>
-                  <Input id="web-statsig-url" type="url" placeholder="http://grok-signer-go:8788/sign" {...form.register("providerWeb.statsigSignerURL")} />
-                </SettingsField>
-              )}
-              <SettingsField controlId="web-quota-timeout" label={t("settings.web.quotaTimeout")} description={t("settings.web.quotaTimeoutHelp")} error={form.formState.errors.providerWeb?.quotaTimeout?.message}><Controller control={form.control} name="providerWeb.quotaTimeout" render={({ field }) => <DurationInput id="web-quota-timeout" value={field.value} onChange={field.onChange} />} /></SettingsField>
-              <SettingsField controlId="web-chat-timeout" label={t("settings.web.chatTimeout")} description={t("settings.web.chatTimeoutHelp")} error={form.formState.errors.providerWeb?.chatTimeout?.message}><Controller control={form.control} name="providerWeb.chatTimeout" render={({ field }) => <DurationInput id="web-chat-timeout" value={field.value} onChange={field.onChange} />} /></SettingsField>
-              <SettingsField controlId="web-image-timeout" label={t("settings.web.imageTimeout")} description={t("settings.web.imageTimeoutHelp")} error={form.formState.errors.providerWeb?.imageTimeout?.message}><Controller control={form.control} name="providerWeb.imageTimeout" render={({ field }) => <DurationInput id="web-image-timeout" value={field.value} onChange={field.onChange} />} /></SettingsField>
-              <SettingsField controlId="web-video-timeout" label={t("settings.web.videoTimeout")} description={t("settings.web.videoTimeoutHelp")} error={form.formState.errors.providerWeb?.videoTimeout?.message}><Controller control={form.control} name="providerWeb.videoTimeout" render={({ field }) => <DurationInput id="web-video-timeout" value={field.value} onChange={field.onChange} />} /></SettingsField>
-              <SettingsField controlId="web-media-concurrency" label={t("settings.web.mediaConcurrency")} description={t("settings.web.mediaConcurrencyHelp")} badge={t("settings.restartRequired")} error={form.formState.errors.providerWeb?.mediaConcurrency?.message}><Input id="web-media-concurrency" type="number" min={1} max={64} {...form.register("providerWeb.mediaConcurrency", { valueAsNumber: true })} /></SettingsField>
-              <SettingsField controlId="web-recovery-base" label={t("settings.web.recoveryBackoffBase")} description={t("settings.web.recoveryBackoffBaseHelp")} error={form.formState.errors.providerWeb?.recoveryBackoffBase?.message}><Controller control={form.control} name="providerWeb.recoveryBackoffBase" render={({ field }) => <DurationInput id="web-recovery-base" value={field.value} onChange={field.onChange} />} /></SettingsField>
-              <SettingsField controlId="web-recovery-max" label={t("settings.web.recoveryBackoffMax")} description={t("settings.web.recoveryBackoffMaxHelp")} error={form.formState.errors.providerWeb?.recoveryBackoffMax?.message}><Controller control={form.control} name="providerWeb.recoveryBackoffMax" render={({ field }) => <DurationInput id="web-recovery-max" value={field.value} onChange={field.onChange} />} /></SettingsField>
-              <SettingsField controlId="web-nsfw" label={t("settings.web.allowNSFW")} description={t("settings.web.allowNSFWHelp")}><Controller control={form.control} name="providerWeb.allowNSFW" render={({ field }) => <div className="flex h-8 items-center"><Switch id="web-nsfw" checked={field.value} onCheckedChange={field.onChange} /></div>} /></SettingsField>
-            </div>
-          </SettingsSection>
-          </SettingsPane>
-
-          <SettingsPane value="console">
-          <SettingsSection title={t("console.name")}>
-            <div className="space-y-0">
-              <SettingsField controlId="console-base-url" className="sm:col-span-2" label={t("console.baseURL")} description={t("settings.console.baseURLHelp")} error={form.formState.errors.providerConsole?.baseURL?.message}><Input id="console-base-url" type="url" {...form.register("providerConsole.baseURL")} /></SettingsField>
-              <SettingsField controlId="console-chat-timeout" label={t("console.chatTimeout")} description={t("settings.console.chatTimeoutHelp")} error={form.formState.errors.providerConsole?.chatTimeout?.message}><Controller control={form.control} name="providerConsole.chatTimeout" render={({ field }) => <DurationInput id="console-chat-timeout" value={field.value} onChange={field.onChange} />} /></SettingsField>
-            </div>
-          </SettingsSection>
-          </SettingsPane>
-
-          <SettingsPane value="delivery">
-          <SettingsSection title={t("settings.media.title")}>
-            <div className="space-y-0">
-              <SettingsField controlId="media-max-image-size" label={t("settings.media.maxImageSize")} description={t("settings.media.maxImageSizeHelp")} error={form.formState.errors.media?.maxImageSize?.message}>
-                <Controller control={form.control} name="media.maxImageSize" render={({ field }) => <ByteSizeInput id="media-max-image-size" value={field.value} onChange={field.onChange} />} />
-              </SettingsField>
-              <SettingsField controlId="media-max-total-size" label={t("settings.media.maxTotalSize")} description={t("settings.media.maxTotalSizeHelp")} error={form.formState.errors.media?.maxTotalSize?.message}>
-                <Controller control={form.control} name="media.maxTotalSize" render={({ field }) => <ByteSizeInput id="media-max-total-size" value={field.value} onChange={field.onChange} />} />
-              </SettingsField>
-              <SettingsField controlId="media-cleanup-threshold" label={t("settings.media.cleanupThresholdPercent")} description={t("settings.media.cleanupThresholdPercentHelp")} error={form.formState.errors.media?.cleanupThresholdPercent?.message}>
-                <div className="flex min-w-0">
-                  <Input id="media-cleanup-threshold" type="number" min={50} max={95} className="min-w-0 rounded-r-none" {...form.register("media.cleanupThresholdPercent", { valueAsNumber: true })} />
-                  <div className="flex h-8 w-24 shrink-0 items-center justify-start rounded-r-md bg-secondary/55 px-3 text-xs text-foreground">%</div>
-                </div>
-              </SettingsField>
-              <SettingsField controlId="media-cleanup-interval" label={t("settings.media.cleanupInterval")} description={t("settings.media.cleanupIntervalHelp")} error={form.formState.errors.media?.cleanupInterval?.message}>
-                <Controller control={form.control} name="media.cleanupInterval" render={({ field }) => <DurationInput id="media-cleanup-interval" value={field.value} onChange={field.onChange} />} />
-              </SettingsField>
-              <SettingsField controlId="frontend-public-api-base-url" label={t("settings.media.publicApiBaseURL")} description={t("settings.media.publicApiBaseURLHelp")} error={form.formState.errors.frontend?.publicApiBaseURL?.message} className="sm:col-span-2">
-                <Input id="frontend-public-api-base-url" placeholder="https://api.example.com" {...form.register("frontend.publicApiBaseURL")} />
-              </SettingsField>
-            </div>
-          </SettingsSection>
-
-          <SettingsSection title={t("settings.egress.clearance")}>
-            <div className="space-y-0">
-              <SettingsField controlId="egress-clearance-mode" className="sm:col-span-2" label={t("settings.web.clearanceMode")} description={t("settings.web.clearanceModeHelp")} error={form.formState.errors.providerWeb?.clearanceMode?.message}>
-                <Controller control={form.control} name="providerWeb.clearanceMode" render={({ field }) => (
-                  <Tabs value={field.value} onValueChange={field.onChange}>
-                    <TabsList id="egress-clearance-mode" className="grid w-full grid-cols-3 bg-muted/55">
-                      <TabsTrigger value="manual" className="font-normal">{t("settings.web.clearanceManual")}</TabsTrigger>
-                      <TabsTrigger value="flaresolverr" className="font-normal">{t("settings.web.clearanceFlareSolverr")}</TabsTrigger>
-                      <TabsTrigger value="on_demand" className="font-normal">{t("settings.web.clearanceOnDemand")}</TabsTrigger>
-                    </TabsList>
-                  </Tabs>
-                )} />
-              </SettingsField>
-              {draftClearanceMode !== "manual" ? <>
-                <SettingsField controlId="egress-flaresolverr-url" className="sm:col-span-2" label={t("settings.web.flareSolverrURL")} description={t("settings.web.flareSolverrURLHelp")} error={form.formState.errors.providerWeb?.flareSolverrURL?.message}><Input id="egress-flaresolverr-url" type="url" placeholder="http://flaresolverr:8191" {...form.register("providerWeb.flareSolverrURL")} /></SettingsField>
-                <SettingsField controlId="egress-clearance-timeout" label={t("settings.web.clearanceTimeout")} description={t("settings.web.clearanceTimeoutHelp")} error={form.formState.errors.providerWeb?.clearanceTimeout?.message}><Controller control={form.control} name="providerWeb.clearanceTimeout" render={({ field }) => <DurationInput id="egress-clearance-timeout" value={field.value} onChange={field.onChange} />} /></SettingsField>
-                {draftClearanceMode === "flaresolverr" ? <SettingsField controlId="egress-clearance-refresh" label={t("settings.web.clearanceRefresh")} description={t("settings.web.clearanceRefreshHelp")} error={form.formState.errors.providerWeb?.clearanceRefresh?.message}><Controller control={form.control} name="providerWeb.clearanceRefresh" render={({ field }) => <DurationInput id="egress-clearance-refresh" value={field.value} onChange={field.onChange} />} /></SettingsField> : null}
-              </> : null}
-            </div>
-          </SettingsSection>
-
-          <EgressNodes title={t("settings.egress.title")} clearanceMode={activeClearanceMode} />
-          </SettingsPane>
-
-          <SettingsPane value="policies">
-          <SettingsSection title={t("settings.server.title")}>
-            <div className="space-y-0">
-              <SettingsField controlId="server-max-concurrent-requests" label={t("settings.server.maxConcurrentRequests")} description={t("settings.server.maxConcurrentRequestsHelp")} error={form.formState.errors.server?.maxConcurrentRequests?.message}>
-                <Input id="server-max-concurrent-requests" type="number" min={1} max={100_000} {...form.register("server.maxConcurrentRequests", { valueAsNumber: true })} />
-              </SettingsField>
-            </div>
-          </SettingsSection>
-
-          <SettingsSection title={t("settings.batch.title")}>
-            <div className="space-y-0">
-              <SettingsField controlId="batch-import-concurrency" label={t("settings.batch.importConcurrency")} description={t("settings.batch.importConcurrencyHelp")} error={form.formState.errors.batch?.importConcurrency?.message}><Input id="batch-import-concurrency" type="number" min={1} max={50} {...form.register("batch.importConcurrency", { valueAsNumber: true })} /></SettingsField>
-              <SettingsField controlId="batch-conversion-concurrency" label={t("settings.batch.conversionConcurrency")} description={t("settings.batch.conversionConcurrencyHelp")} error={form.formState.errors.batch?.conversionConcurrency?.message}><Input id="batch-conversion-concurrency" type="number" min={1} max={50} {...form.register("batch.conversionConcurrency", { valueAsNumber: true })} /></SettingsField>
-              <SettingsField controlId="batch-sync-concurrency" label={t("settings.batch.syncConcurrency")} description={t("settings.batch.syncConcurrencyHelp")} error={form.formState.errors.batch?.syncConcurrency?.message}><Input id="batch-sync-concurrency" type="number" min={1} max={50} {...form.register("batch.syncConcurrency", { valueAsNumber: true })} /></SettingsField>
-              <SettingsField controlId="batch-refresh-concurrency" label={t("settings.batch.refreshConcurrency")} description={t("settings.batch.refreshConcurrencyHelp")} error={form.formState.errors.batch?.refreshConcurrency?.message}><Input id="batch-refresh-concurrency" type="number" min={1} max={50} {...form.register("batch.refreshConcurrency", { valueAsNumber: true })} /></SettingsField>
-              <SettingsField controlId="batch-random-delay" label={t("settings.batch.randomDelay")} description={t("settings.batch.randomDelayHelp")} error={form.formState.errors.batch?.randomDelay?.message}><Input id="batch-random-delay" type="number" min={0} max={5_000} step={10} {...form.register("batch.randomDelay", { valueAsNumber: true })} /></SettingsField>
-            </div>
-          </SettingsSection>
-
-          <SettingsSection title={t("settings.routing.title")}>
-            <div className="space-y-0">
-              <SettingsField controlId="routing-sticky-ttl" label={t("settings.routing.stickyTTL")} description={t("settings.routing.stickyTTLHelp")} error={form.formState.errors.routing?.stickyTTL?.message}><Controller control={form.control} name="routing.stickyTTL" render={({ field }) => <DurationInput id="routing-sticky-ttl" value={field.value} onChange={field.onChange} />} /></SettingsField>
-              <SettingsField controlId="routing-cooldown-base" label={t("settings.routing.cooldownBase")} description={t("settings.routing.cooldownBaseHelp")} error={form.formState.errors.routing?.cooldownBase?.message}><Controller control={form.control} name="routing.cooldownBase" render={({ field }) => <DurationInput id="routing-cooldown-base" value={field.value} onChange={field.onChange} />} /></SettingsField>
-              <SettingsField controlId="routing-cooldown-max" label={t("settings.routing.cooldownMax")} description={t("settings.routing.cooldownMaxHelp")} error={form.formState.errors.routing?.cooldownMax?.message}><Controller control={form.control} name="routing.cooldownMax" render={({ field }) => <DurationInput id="routing-cooldown-max" value={field.value} onChange={field.onChange} />} /></SettingsField>
-              <SettingsField controlId="routing-capacity-wait" label={t("settings.routing.capacityWait", { defaultValue: "Saturated account wait" })} description={t("settings.routing.capacityWaitHelp")} error={form.formState.errors.routing?.capacityWait?.message}><Controller control={form.control} name="routing.capacityWait" render={({ field }) => <DurationInput id="routing-capacity-wait" value={field.value} onChange={field.onChange} />} /></SettingsField>
-              <SettingsField controlId="routing-max-attempts" label={t("settings.routing.maxAttempts")} description={t("settingsRoutingAttempts.help")} error={form.formState.errors.routing?.maxAttempts?.message}>
-                <Controller control={form.control} name="routing.maxAttempts" render={({ field }) => {
-                  const unlimited = field.value === UNLIMITED_ROUTING_ATTEMPTS;
-                  return (
-                    <div className="flex h-9 items-center gap-3">
-                      <Input
-                        id="routing-max-attempts"
-                        ref={field.ref}
-                        name={field.name}
-                        type="number"
-                        min={1}
-                        max={MAX_ROUTING_ATTEMPTS}
-                        disabled={unlimited}
-                        value={unlimited || !Number.isFinite(field.value) ? "" : field.value}
-                        placeholder={t("settingsRoutingAttempts.unlimited")}
-                        onBlur={field.onBlur}
-                        onChange={(event) => field.onChange(event.currentTarget.valueAsNumber)}
-                      />
-                      <div className="flex shrink-0 items-center gap-2">
-                        <span className="text-xs text-muted-foreground">{t("settingsRoutingAttempts.unlimited")}</span>
-                        <Switch
-                          id="routing-max-attempts-unlimited"
-                          aria-label={t("settingsRoutingAttempts.unlimited")}
-                          checked={unlimited}
-                          onCheckedChange={(checked) => {
-                            if (checked) {
-                              if (field.value > 0) limitedRoutingAttemptsRef.current = field.value;
-                              setUnlimitedAttemptsConfirm(true);
-                              return;
-                            }
-                            field.onChange(limitedRoutingAttemptsRef.current);
-                          }}
-                        />
-                      </div>
-                    </div>
-                  );
-                }} />
-              </SettingsField>
-              <SettingsField controlId="routing-video-max-attempts" label={t("settings.routing.videoMaxAttempts")} description={t("settings.routing.videoMaxAttemptsHelp")} error={form.formState.errors.routing?.videoMaxAttempts?.message}>
-                <Controller control={form.control} name="routing.videoMaxAttempts" render={({ field }) => {
-                  const unlimited = field.value === UNLIMITED_ROUTING_ATTEMPTS;
-                  return (
-                    <div className="flex h-9 items-center gap-3">
-                      <Input
-                        id="routing-video-max-attempts"
-                        ref={field.ref}
-                        name={field.name}
-                        type="number"
-                        min={1}
-                        max={MAX_ROUTING_ATTEMPTS}
-                        disabled={unlimited}
-                        value={unlimited || !Number.isFinite(field.value) || field.value <= 0 ? "" : field.value}
-                        placeholder={t("settingsRoutingAttempts.unlimited")}
-                        onBlur={field.onBlur}
-                        onChange={(event) => field.onChange(event.currentTarget.valueAsNumber)}
-                      />
-                      <div className="flex shrink-0 items-center gap-2">
-                        <span className="text-xs text-muted-foreground">{t("settingsRoutingAttempts.unlimited")}</span>
-                        <Switch
-                          id="routing-video-max-attempts-unlimited"
-                          aria-label={t("settingsRoutingAttempts.unlimited")}
-                          checked={unlimited}
-                          onCheckedChange={(checked) => {
-                            if (checked) {
-                              if (field.value > 0) limitedVideoRoutingAttemptsRef.current = field.value;
-                              field.onChange(UNLIMITED_ROUTING_ATTEMPTS);
-                              return;
-                            }
-                            field.onChange(limitedVideoRoutingAttemptsRef.current);
-                          }}
-                        />
-                      </div>
-                    </div>
-                  );
-                }} />
-              </SettingsField>
-              <SettingsField controlId="routing-prefer-free-build" label={t("settings.routing.preferFreeBuild")} description={t("settings.routing.preferFreeBuildHelp")}><Controller control={form.control} name="routing.preferFreeBuild" render={({ field }) => <div className="flex h-9 items-center"><Switch id="routing-prefer-free-build" checked={field.value} onCheckedChange={field.onChange} /></div>} /></SettingsField>
-              <SettingsField controlId="routing-mark-build-chat-denied-as-reauth" label={t("settings.routing.markBuildChatDeniedAsReauth")} description={t("settings.routing.markBuildChatDeniedAsReauthHelp")}><Controller control={form.control} name="routing.markBuildChatDeniedAsReauth" render={({ field }) => <div className="flex h-9 items-center"><Switch id="routing-mark-build-chat-denied-as-reauth" checked={field.value} onCheckedChange={field.onChange} /></div>} /></SettingsField>
-<SettingsField controlId="routing-segmented-selector-enabled" label={t("settingsRoutingSegmented.enabled")} description={t("settingsRoutingSegmented.enabledHelp")}><Controller control={form.control} name="routing.segmentedSelector.enabled" render={({ field }) => <div className="flex h-9 items-center"><Switch id="routing-segmented-selector-enabled" checked={field.value} onCheckedChange={field.onChange} /></div>} /></SettingsField>
-              <SettingsField controlId="routing-segmented-min-candidates" label={t("settingsRoutingSegmented.minCandidates")} description={t("settingsRoutingSegmented.minCandidatesHelp")} error={form.formState.errors.routing?.segmentedSelector?.minCandidates?.message}><Input id="routing-segmented-min-candidates" type="number" min={100} max={1_000_000} disabled={!segmentedSelectorEnabled} {...form.register("routing.segmentedSelector.minCandidates", { valueAsNumber: true })} /></SettingsField>
-              <SettingsField controlId="routing-segmented-window-size" label={t("settingsRoutingSegmented.windowSize")} description={t("settingsRoutingSegmented.windowSizeHelp")} error={form.formState.errors.routing?.segmentedSelector?.windowSize?.message}><Input id="routing-segmented-window-size" type="number" min={8} max={256} disabled={!segmentedSelectorEnabled} {...form.register("routing.segmentedSelector.windowSize", { valueAsNumber: true })} /></SettingsField>
-            </div>
-            <AlertDialog open={unlimitedAttemptsConfirm} onOpenChange={setUnlimitedAttemptsConfirm}>
-              <AlertDialogContent>
-                <AlertDialogHeader>
-                  <AlertDialogTitle>{t("settingsRoutingAttempts.unlimitedTitle")}</AlertDialogTitle>
-                  <AlertDialogDescription>{t("settingsRoutingAttempts.unlimitedDescription")}</AlertDialogDescription>
-                </AlertDialogHeader>
-                <AlertDialogFooter>
-                  <AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel>
-                  <AlertDialogAction
-                    className="bg-destructive text-white hover:bg-destructive/90"
-                    onClick={() => {
-                      form.setValue("routing.maxAttempts", UNLIMITED_ROUTING_ATTEMPTS, { shouldDirty: true, shouldTouch: true, shouldValidate: true });
-                      setUnlimitedAttemptsConfirm(false);
-                    }}
-                  >
-                    {t("settingsRoutingAttempts.unlimitedConfirm")}
-                  </AlertDialogAction>
-                </AlertDialogFooter>
-              </AlertDialogContent>
-            </AlertDialog>
-          </SettingsSection>
-
-          <SettingsSection title={t("settings.audit.title")}>
-            <div className="space-y-0">
-              <SettingsField controlId="audit-buffer-size" label={t("settings.audit.bufferSize")} description={t("settings.audit.bufferSizeHelp")} badge={t("settings.restartRequired")} error={form.formState.errors.audit?.bufferSize?.message}><Input id="audit-buffer-size" type="number" min={1} max={262_144} {...form.register("audit.bufferSize", { valueAsNumber: true })} /></SettingsField>
-              <SettingsField controlId="audit-batch-size" label={t("settings.audit.batchSize")} description={t("settings.audit.batchSizeHelp")} error={form.formState.errors.audit?.batchSize?.message}><Input id="audit-batch-size" type="number" min={1} max={4_096} {...form.register("audit.batchSize", { valueAsNumber: true })} /></SettingsField>
-              <SettingsField controlId="audit-flush-interval" label={t("settings.audit.flushInterval")} description={t("settings.audit.flushIntervalHelp")} error={form.formState.errors.audit?.flushInterval?.message}><Controller control={form.control} name="audit.flushInterval" render={({ field }) => <DurationInput id="audit-flush-interval" value={field.value} onChange={field.onChange} />} /></SettingsField>
-              <SettingsField controlId="audit-commit-delay" label={t("settings.audit.commitDelay")} description={t("settings.audit.commitDelayHelp")} error={form.formState.errors.audit?.commitDelayMS?.message}><Input id="audit-commit-delay" type="number" min={1} max={50} {...form.register("audit.commitDelayMS", { valueAsNumber: true })} /></SettingsField>
-            </div>
-          </SettingsSection>
-
-          <SettingsSection title={t("settings.clientKeys.title")}>
-            <div className="space-y-0">
-              <SettingsField controlId="client-key-default-rpm" label={t("settings.clientKeys.rpmLimit")} description={t("settings.clientKeys.rpmLimitHelp")} error={form.formState.errors.clientKeyDefaults?.rpmLimit?.message}><Input id="client-key-default-rpm" type="number" min={1} max={100_000} {...form.register("clientKeyDefaults.rpmLimit", { valueAsNumber: true })} /></SettingsField>
-              <SettingsField controlId="client-key-default-concurrency" label={t("settings.clientKeys.maxConcurrent")} description={t("settings.clientKeys.maxConcurrentHelp")} error={form.formState.errors.clientKeyDefaults?.maxConcurrent?.message}><Input id="client-key-default-concurrency" type="number" min={1} max={1_024} {...form.register("clientKeyDefaults.maxConcurrent", { valueAsNumber: true })} /></SettingsField>
-            </div>
-          </SettingsSection>
-          </SettingsPane>
-
-          <SettingsPane value="accounts">
-            <SettingsSection title={t("settings.accounts.invalidationTitle")}>
-              <div className="space-y-0">
-                <SettingsField controlId="accounts-mark-build-forbidden-reauth" label={t("settingsBuildForbidden.markInvalid")} description={t("settingsBuildForbidden.markInvalidHelp")}>
-                  <Controller control={form.control} name="accounts.markBuildForbiddenReauth" render={({ field }) => (
-                    <div className="flex h-9 items-center">
-                      <Switch id="accounts-mark-build-forbidden-reauth" checked={Boolean(field.value)} onCheckedChange={field.onChange} />
-                    </div>
-                  )} />
-                </SettingsField>
-                <SettingsField
-                  controlId="accounts-build-forbidden-reauth-codes"
-                  className="sm:col-span-2"
-                  label={t("settingsBuildForbidden.codes")}
-                  description={t("settingsBuildForbidden.codesHelp")}
-                  error={form.formState.errors.accounts?.buildForbiddenReauthCodes ? t("settingsBuildForbidden.codesInvalid") : undefined}
-                >
-                  <Textarea
-                    id="accounts-build-forbidden-reauth-codes"
-                    className="min-h-24 font-mono"
-                    disabled={!buildForbiddenReauthEnabled}
-                    placeholder={t("settingsBuildForbidden.codesPlaceholder")}
-                    {...form.register("accounts.buildForbiddenReauthCodes")}
-                  />
-                </SettingsField>
-              </div>
-            </SettingsSection>
-
-            <SettingsSection title={t("settings.accounts.cleanupTitle")}>
-              <div className="space-y-0">
-                <SettingsField controlId="accounts-auto-clean-reauth-enabled" label={t("settings.accounts.autoCleanReauthEnabled")} description={t("settings.accounts.autoCleanReauthEnabledHelp")}>
-                  <Controller control={form.control} name="accounts.autoCleanReauthEnabled" render={({ field }) => (
-                    <div className="flex h-9 items-center">
-                      <Switch
-                        id="accounts-auto-clean-reauth-enabled"
-                        checked={Boolean(field.value)}
-                        onCheckedChange={(checked) => {
-                          if (checked) {
-                            setAutoCleanConfirm("enabled");
-                            return;
-                          }
-                          field.onChange(false);
-                          form.setValue("accounts.autoCleanIncludeDisabled", false, { shouldDirty: true, shouldTouch: true });
-                        }}
-                      />
-                    </div>
-                  )} />
-                </SettingsField>
-                <SettingsField controlId="accounts-auto-clean-reauth-interval" label={t("settings.accounts.autoCleanReauthInterval")} description={t("settings.accounts.autoCleanReauthIntervalHelp")} error={form.formState.errors.accounts?.autoCleanReauthInterval?.message}>
-                  <Controller control={form.control} name="accounts.autoCleanReauthInterval" render={({ field }) => (
-                    <DurationInput id="accounts-auto-clean-reauth-interval" value={field.value} onChange={field.onChange} disabled={!autoCleanEnabled} />
-                  )} />
-                </SettingsField>
-                <SettingsField controlId="accounts-auto-clean-reauth-min-age" label={t("settings.accounts.autoCleanReauthMinAge")} description={t("settings.accounts.autoCleanReauthMinAgeHelp")} error={form.formState.errors.accounts?.autoCleanReauthMinAge?.message}>
-                  <Controller control={form.control} name="accounts.autoCleanReauthMinAge" render={({ field }) => (
-                    <DurationInput id="accounts-auto-clean-reauth-min-age" value={field.value} onChange={field.onChange} disabled={!autoCleanEnabled} />
-                  )} />
-                </SettingsField>
-                <SettingsField controlId="accounts-auto-clean-include-disabled" label={t("settings.accounts.autoCleanIncludeDisabled")} description={t("settings.accounts.autoCleanIncludeDisabledHelp")}>
-                  <Controller control={form.control} name="accounts.autoCleanIncludeDisabled" render={({ field }) => (
-                    <div className="flex h-9 items-center">
-                      <Switch
-                        id="accounts-auto-clean-include-disabled"
-                        checked={Boolean(field.value)}
-                        disabled={!autoCleanEnabled}
-                        onCheckedChange={(checked) => {
-                          if (checked) {
-                            setAutoCleanConfirm("includeDisabled");
-                            return;
-                          }
-                          field.onChange(false);
-                        }}
-                      />
-                    </div>
-                  )} />
-                </SettingsField>
-              </div>
-              <AlertDialog open={autoCleanConfirm !== null} onOpenChange={(open) => { if (!open) setAutoCleanConfirm(null); }}>
-                <AlertDialogContent>
-                  <AlertDialogHeader>
-                    <AlertDialogTitle>
-                      {autoCleanConfirm === "includeDisabled"
-                        ? t("settings.accounts.autoCleanIncludeDisabledTitle")
-                        : t("settings.accounts.autoCleanEnableTitle")}
-                    </AlertDialogTitle>
-                    <AlertDialogDescription>
-                      {autoCleanConfirm === "includeDisabled"
-                        ? t("settings.accounts.autoCleanIncludeDisabledDescription")
-                        : t("settings.accounts.autoCleanEnableDescription")}
-                    </AlertDialogDescription>
-                  </AlertDialogHeader>
-                  <AlertDialogFooter>
-                    <AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel>
-                    <AlertDialogAction
-                      className="bg-destructive text-white hover:bg-destructive/90"
-                      onClick={() => {
-                        if (autoCleanConfirm === "includeDisabled") {
-                          form.setValue("accounts.autoCleanIncludeDisabled", true, { shouldDirty: true, shouldTouch: true, shouldValidate: true });
-                        } else {
-                          form.setValue("accounts.autoCleanReauthEnabled", true, { shouldDirty: true, shouldTouch: true, shouldValidate: true });
-                        }
-                        setAutoCleanConfirm(null);
-                      }}
-                    >
-                      {t("settings.accounts.autoCleanConfirm")}
-                    </AlertDialogAction>
-                  </AlertDialogFooter>
-                </AlertDialogContent>
-              </AlertDialog>
-            </SettingsSection>
-          </SettingsPane>
-
-          <SettingsPane value="about">
-            <VersionUpdateSection />
-          </SettingsPane>
-          </div>
-        </Tabs>
       ) : null}
-    </form>
-  );
-}
 
-function ByteSizeInput({ id, value, onChange }: { id: string; value?: ByteSizeValue; onChange: (value: ByteSizeValue) => void }) {
-  const { t } = useTranslation();
-  const unit = value?.unit ?? "MiB";
-  return (
-    <div className="flex min-w-0">
-      <Input
-        id={id}
-        type="number"
-        min="0.001"
-        step="any"
-        className="min-w-0 rounded-r-none"
-        value={Number.isFinite(value?.value) ? value?.value : ""}
-        onChange={(event) => onChange({ value: event.target.value === "" ? Number.NaN : Number(event.target.value), unit })}
-      />
-      <Select value={unit} onValueChange={(nextUnit) => { if (isByteSizeUnit(nextUnit)) onChange({ value: value?.value ?? 1, unit: nextUnit }); }}>
-        <SelectTrigger className="w-24 shrink-0 rounded-l-none bg-secondary/55" aria-label={t("settings.media.sizeUnit")}>
-          <SelectValue />
-        </SelectTrigger>
-        <SelectContent>
-          <SelectItem value="MiB">MiB</SelectItem>
-          <SelectItem value="GiB">GiB</SelectItem>
-        </SelectContent>
-      </Select>
-    </div>
-  );
-}
-
-function DurationInput({ id, value, onChange, disabled }: { id: string; value?: DurationValue; onChange: (value: DurationValue) => void; disabled?: boolean }) {
-  const { t } = useTranslation();
-  const unit = value?.unit ?? "s";
-  return (
-    <div className="flex min-w-0">
-      <Input
-        id={id}
-        type="number"
-        min="0.001"
-        step="any"
-        disabled={disabled}
-        className="min-w-0 rounded-r-none"
-        value={Number.isFinite(value?.value) ? value?.value : ""}
-        onChange={(event) => onChange({ value: event.target.value === "" ? Number.NaN : Number(event.target.value), unit })}
-      />
-      <Select value={unit} disabled={disabled} onValueChange={(nextUnit) => { if (isDurationUnit(nextUnit)) onChange({ value: value?.value ?? 1, unit: nextUnit }); }}>
-        <SelectTrigger className="w-24 shrink-0 rounded-l-none bg-secondary/55" aria-label={t("settings.durationUnit")}>
-          <SelectValue />
-        </SelectTrigger>
-        <SelectContent>
-          <SelectItem value="s">{t("settings.units.seconds")}</SelectItem>
-          <SelectItem value="m">{t("settings.units.minutes")}</SelectItem>
-          <SelectItem value="h">{t("settings.units.hours")}</SelectItem>
-          <SelectItem value="d">{t("settings.units.days")}</SelectItem>
-        </SelectContent>
-      </Select>
-    </div>
-  );
-}
-
-function SettingsPane({ value, children }: { value: string; children: ReactNode }) {
-  return (
-    <TabsContent value={value} forceMount className="m-0 space-y-8 data-[state=inactive]:hidden">
-      {children}
-    </TabsContent>
-  );
-}
-
-function SettingsSection({ title, action, children }: { title: string; action?: ReactNode; children: ReactNode }) {
-  return (
-    <section className="space-y-3">
-      <div className="flex min-h-8 items-center justify-between gap-3 px-1">
-        <h2 className="text-sm font-medium tracking-tight">{title}</h2>
-        {action}
-      </div>
-      <div className="min-w-0 w-full">{children}</div>
-    </section>
-  );
-}
-
-function SettingsField({ controlId, label, badge, description, error, className, children }: { controlId: string; label: string; badge?: string; description?: string; error?: string; className?: string; children: ReactNode }) {
-  const { t } = useTranslation();
-  return (
-    <div className={cn("min-w-0 py-4", className)}>
-      <div className="grid min-w-0 gap-2.5 sm:grid-cols-[minmax(0,2fr)_minmax(0,1fr)] sm:items-center sm:gap-8">
-        <div className="min-w-0">
-          <div className="flex min-h-5 items-center gap-2">
-            <Label htmlFor={controlId} className="text-xs font-medium">{label}</Label>
-            {badge ? <Badge variant="secondary" className="shrink-0 text-[10px]">{badge}</Badge> : null}
+      <form onSubmit={(event) => { event.preventDefault(); saveMutation.mutate(); }}>
+        <DashboardPanel
+          id="settings-mail-config"
+          title="邮箱配置"
+          actions={(
+            <Button type="submit" size="sm" disabled={mailQuery.isPending || saveMutation.isPending}>
+              {saveMutation.isPending ? <Spinner /> : null}{t("common.save")}
+            </Button>
+          )}
+          contentClassName="space-y-4"
+        >
+          <div className="grid gap-4 sm:grid-cols-2">
+            <div className="space-y-1.5">
+              <Label htmlFor="settings-email-source">默认邮箱来源</Label>
+              <Select value={emailSource} onValueChange={(value) => setEmailSource(value as EmailSource)}>
+                <SelectTrigger id="settings-email-source"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  {emailSources.map((source) => <SelectItem key={source.value} value={source.value}>{source.label}</SelectItem>)}
+                </SelectContent>
+              </Select>
+              <p className="text-xs text-muted-foreground">Outlook / Google 账号池在注册机页面维护。</p>
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="settings-duck-domain">DuckMail 邮箱域名</Label>
+              <Input id="settings-duck-domain" value={duckMailDomain} onChange={(event) => setDuckMailDomain(event.target.value)} placeholder="@example.com" />
+            </div>
           </div>
-          {description ? <p className="mt-1 max-w-xl text-xs leading-5 text-muted-foreground">{description}</p> : null}
-          {error ? <p className="mt-1 text-xs text-destructive">{t("settings.invalidValue")}</p> : null}
-        </div>
-        <div className="min-w-0">{children}</div>
+
+          <div className="space-y-3 rounded-lg border border-border/70 p-3">
+            <h3 className="text-[11px] font-semibold uppercase tracking-[0.1em] text-muted-foreground">DuckMail</h3>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div className="space-y-1.5">
+                <Label htmlFor="settings-duck-base">DuckMail 地址</Label>
+                <Input id="settings-duck-base" value={duckMailApiBase} onChange={(event) => setDuckMailApiBase(event.target.value)} placeholder="https://api.duckmail.example" />
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="settings-duck-key">DuckMail API Key</Label>
+                <Input
+                  id="settings-duck-key"
+                  type="password"
+                  autoComplete="off"
+                  value={duckMailApiKey}
+                  onChange={(event) => setDuckMailApiKey(event.target.value)}
+                  placeholder={duckMailApiKeyConfigured ? "已配置，留空保持不变" : "输入 API Key"}
+                />
+              </div>
+            </div>
+          </div>
+
+          <div className="space-y-3 rounded-lg border border-border/70 p-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <h3 className="text-[11px] font-semibold uppercase tracking-[0.1em] text-muted-foreground">Cloud Mail</h3>
+              <Tabs value={cloudMailAuthMode} onValueChange={(value) => setCloudMailAuthMode(value as "public" | "login")}>
+                <TabsList>
+                  <TabsTrigger value="public">Public Token</TabsTrigger>
+                  <TabsTrigger value="login">账号登录</TabsTrigger>
+                </TabsList>
+              </Tabs>
+            </div>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div className="space-y-1.5">
+                <Label htmlFor="settings-cloud-base">Cloud Mail 地址</Label>
+                <Input id="settings-cloud-base" value={cloudMailApiBase} onChange={(event) => setCloudMailApiBase(event.target.value)} placeholder="https://mail.example.com" />
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="settings-cloud-domains">邮箱域名</Label>
+                <Input id="settings-cloud-domains" value={cloudMailDomains} onChange={(event) => setCloudMailDomains(event.target.value)} placeholder="example.com，多个域名用逗号分隔" />
+              </div>
+              {cloudMailAuthMode === "public" ? (
+                <div className="space-y-1.5 sm:col-span-2">
+                  <Label htmlFor="settings-cloud-token">Public Token</Label>
+                  <Input
+                    id="settings-cloud-token"
+                    type="password"
+                    autoComplete="off"
+                    value={cloudMailPublicToken}
+                    onChange={(event) => setCloudMailPublicToken(event.target.value)}
+                    placeholder={cloudMailPublicTokenConfigured ? "已配置，留空保持不变" : "输入 Public Token"}
+                  />
+                </div>
+              ) : (
+                <>
+                  <div className="space-y-1.5">
+                    <Label htmlFor="settings-cloud-email">登录邮箱</Label>
+                    <Input id="settings-cloud-email" value={cloudMailLoginEmail} onChange={(event) => setCloudMailLoginEmail(event.target.value)} placeholder="admin@example.com" />
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label htmlFor="settings-cloud-password">登录密码</Label>
+                    <Input
+                      id="settings-cloud-password"
+                      type="password"
+                      autoComplete="off"
+                      value={cloudMailLoginPassword}
+                      onChange={(event) => setCloudMailLoginPassword(event.target.value)}
+                      placeholder={cloudMailLoginPasswordConfigured ? "已配置，留空保持不变" : "输入登录密码"}
+                    />
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+        </DashboardPanel>
+      </form>
+
+      <DashboardPanel
+        id="settings-gateway-status"
+        title="网关状态"
+        actions={(
+          <Button variant="ghost" size="sm" onClick={() => void statusQuery.refetch()} disabled={statusQuery.isFetching}>
+            <RefreshCw className={statusQuery.isFetching ? "animate-spin" : undefined} />{t("common.refresh")}
+          </Button>
+        )}
+      >
+        {statusQuery.isPending ? (
+          <div className="flex justify-center py-8"><Spinner className="size-5" /></div>
+        ) : statusQuery.isError ? (
+          <p className="py-6 text-center text-sm text-destructive">网关状态加载失败</p>
+        ) : (
+          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+            {providers.map((provider) => (
+              <div key={provider.provider} className="rounded-lg border border-border/70 bg-secondary/25 px-4 py-3">
+                <div className="flex items-center justify-between gap-3">
+                  <span className="text-sm font-medium">{provider.provider}</span>
+                  <Badge variant="outline">{provider.accounts} 账号</Badge>
+                </div>
+                <p className="mt-1 text-xs text-muted-foreground">{provider.models} 个可用模型</p>
+              </div>
+            ))}
+            {providers.length === 0 ? <p className="py-6 text-center text-sm text-muted-foreground sm:col-span-2 xl:col-span-3">{t("common.noData")}</p> : null}
+          </div>
+        )}
+      </DashboardPanel>
+
+      <div className="grid gap-5 lg:grid-cols-2">
+        <DashboardPanel id="settings-theme" title="主题设置">
+          <p className="text-xs text-muted-foreground">当前主题：{themeItems.find((item) => item.value === (theme ?? "system"))?.label ?? t("shell.system")}</p>
+          <Tabs value={theme ?? "system"} onValueChange={setTheme} className="mt-3">
+            <TabsList className="w-full">
+              {themeItems.map(({ value, label, icon: Icon }) => (
+                <TabsTrigger key={value} value={value} className="flex-1 gap-1.5"><Icon className="size-3.5" />{label}</TabsTrigger>
+              ))}
+            </TabsList>
+          </Tabs>
+        </DashboardPanel>
+
+        <DashboardPanel id="settings-proxies" title="注册代理池">
+          {proxiesQuery.isPending ? (
+            <div className="flex justify-center py-6"><Spinner className="size-5" /></div>
+          ) : proxiesQuery.isError ? (
+            <p className="py-4 text-sm text-destructive">代理池加载失败</p>
+          ) : (
+            <div className="space-y-3">
+              <div className="flex items-center justify-between gap-3 rounded-lg border border-border/70 bg-secondary/25 px-4 py-3">
+                <span className="text-sm">已保存代理</span>
+                <span className="text-lg font-semibold tabular-nums">{proxiesQuery.data?.count ?? 0}</span>
+              </div>
+              <p className="text-xs text-muted-foreground">代理导入与清理请前往注册机页面。</p>
+              <Button variant="secondary" size="sm" asChild><Link to="/register">前往注册机</Link></Button>
+            </div>
+          )}
+        </DashboardPanel>
       </div>
+
+      <p className="px-1 text-xs text-muted-foreground">
+        数据存储于本地 Python 后端；当前语言：{i18n.language === "zh-CN" ? "简体中文" : "English"}。
+      </p>
     </div>
   );
 }

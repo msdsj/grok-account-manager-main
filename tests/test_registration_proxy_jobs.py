@@ -4,8 +4,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from starlette.requests import Request
+
 from grok_account_manager.api.routers.register import start_registration
 from grok_account_manager.api.schemas import RegisterRequest
+from grok_account_manager.core import database as account_db
 from grok_account_manager.api.services.jobs import (
     RegistrationJobManager,
     _build_proxy_pool,
@@ -14,14 +17,29 @@ from grok_account_manager.api.services.pending import PendingResultStore
 from grok_account_manager.core.proxy_pool import ProxyPool
 
 
+def _request() -> Request:
+    return Request({"type": "http", "headers": []})
+
+
 class RegistrationProxyJobTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmpdir = tempfile.TemporaryDirectory()
+        self._patchers = [
+            patch.object(account_db, "DB_PATH", Path(self._tmpdir.name) / "proxy-jobs.db"),
+            patch.object(account_db, "OUTPUT_DIR", Path(self._tmpdir.name)),
+        ]
+        for patcher in self._patchers:
+            patcher.start()
         self.manager = RegistrationJobManager(
             pending_store=PendingResultStore(Path(self._tmpdir.name) / "pending.json")
         )
+        # 生产路径由 start() 写入 _provider_name 后再拉起 worker；
+        # 这些用例直接调 _run_worker，需要自己补齐这一项。
+        self.manager._provider_name = "grok"
 
     def tearDown(self) -> None:
+        for patcher in reversed(self._patchers):
+            patcher.stop()
         self._tmpdir.cleanup()
 
     def test_inline_pool_is_random_and_masks_worker_state(self) -> None:
@@ -191,11 +209,13 @@ class RegistrationProxyJobTests(unittest.TestCase):
         ):
             self.manager._run_worker(1, False)
 
-        initial_proxy = start_session.call_args_list[0].kwargs["proxy_server"]
-        self.assertEqual(len(start_session.call_args_list), 1)
-        self.assertEqual(len(session.restarts), 2)
-        assigned = [initial_proxy, *session.restarts]
-        self.assertEqual(len(assigned), len(set(assigned)))
+        # 浏览器现在「一轮一个」（round-finally 里关掉、下一轮重新拉起），
+        # 所以是 3 次 _start_worker_session、每次一个全新且不重复的代理，
+        # 而不是复用同一个 session 再 restart。
+        proxies = [call.kwargs["proxy_server"] for call in start_session.call_args_list]
+        self.assertEqual(len(proxies), 3)
+        self.assertEqual(len(proxies), len(set(proxies)))
+        self.assertEqual(session.restarts, [])
         self.assertEqual(self.manager._job["issued"], 3)
         self.assertEqual(self.manager._job["proxyPoolUsed"], 3)
         self.assertEqual(self.manager._job["proxyPoolRemaining"], 0)
@@ -213,7 +233,7 @@ class RegistrationProxyJobTests(unittest.TestCase):
             "grok_account_manager.api.routers.register.JOB_MANAGER.start",
             return_value={"id": "proxy-job"},
         ) as start:
-            result = start_registration(body)
+            result = start_registration(body, _request())
 
         self.assertEqual(result, {"job": {"id": "proxy-job"}})
         self.assertTrue(start.call_args.kwargs["proxy_pool_enabled"])
@@ -309,7 +329,7 @@ class RegistrationProxyJobTests(unittest.TestCase):
             ["198.51.100.70:8080", "198.51.100.71:8080"]
         )
         initial_proxy = self.manager._acquire_proxy(1, 1)
-        provider = self.manager._create_provider(False, threading.Event(), 1, 1)
+        provider = self.manager._create_provider("grok", False, threading.Event(), 1, 1)
         provider.max_registration_attempts = 2
         provider.registration_succeeded = False
         session = Session()

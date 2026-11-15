@@ -1,7 +1,6 @@
 import type { ModelRouteDTO } from "@/entities/model/types";
-import { ApiError, apiEventStream, apiRequest, type PaginatedDTO } from "@/shared/api/client";
-import { createObjectDecoder, createPaginatedDecoder, decodeBooleanResult, decodeCountResult, hasShape, isArrayOf, isBoolean, isNumber, isOneOf, isOptional, isString } from "@/shared/api/decoder";
-import { i18n } from "@/shared/i18n";
+import { listGatewayModels, type GatewayModelDTO } from "@/shared/api/gateway";
+import type { PaginatedDTO } from "@/shared/api/client";
 import type { SortOrder } from "@/shared/lib/table-sort";
 
 type ListModelsInput = {
@@ -9,131 +8,65 @@ type ListModelsInput = {
   pageSize: number;
   search?: string;
   status?: string;
-  provider?: "grok_build" | "grok_web" | "grok_console" | "";
-  providerScope?: Array<"grok_build" | "grok_web" | "grok_console">;
-  tierScope?: Array<"free" | "super">;
+  provider?: string;
+  providerScope?: string[];
+  tierScope?: string[];
   activeScope?: boolean;
   sortBy?: string;
   sortOrder?: SortOrder;
 };
 
-const modelRouteValidator = hasShape({
-  id: isString,
-  publicId: isString,
-  provider: isOneOf("grok_build", "grok_web", "grok_console"),
-  upstreamModel: isString,
-  capability: isOneOf("responses", "chat", "image", "image_edit", "video", "stt", "tts", "realtime"),
-  origin: isOneOf("catalog", "discovered", "manual"),
-  enabled: isBoolean,
-  accountIds: isArrayOf(isString),
-  bindingMode: isBoolean,
-  supportedAccounts: isNumber,
-  syncedAccounts: isNumber,
-  totalAccounts: isNumber,
-  capabilityKnown: isBoolean,
-  available: isBoolean,
-  lastSyncedAt: isOptional(isString),
-});
-const decodeModelRoute = createObjectDecoder<ModelRouteDTO>("model route", {
-  id: isString, publicId: isString, provider: isOneOf("grok_build", "grok_web", "grok_console"), upstreamModel: isString,
-  capability: isOneOf("responses", "chat", "image", "image_edit", "video", "stt", "tts", "realtime"), origin: isOneOf("catalog", "discovered", "manual"),
-  enabled: isBoolean, accountIds: isArrayOf(isString), bindingMode: isBoolean, supportedAccounts: isNumber,
-  syncedAccounts: isNumber, totalAccounts: isNumber, capabilityKnown: isBoolean, available: isBoolean, lastSyncedAt: isOptional(isString),
-});
-const decodeModelPage = createPaginatedDecoder<ModelRouteDTO>(modelRouteValidator);
-const modelAccountValidator = hasShape({ id: isString, name: isString });
-const decodeModelAccounts = createObjectDecoder<{ items: ModelAccountOptionDTO[] }>("model accounts", { items: isArrayOf(modelAccountValidator) });
-
-export function listModels(input: ListModelsInput): Promise<PaginatedDTO<ModelRouteDTO>> {
-  const query = new URLSearchParams({ page: String(input.page), pageSize: String(input.pageSize) });
-  if (input.search) query.set("search", input.search);
-  if (input.status) query.set("status", input.status);
-  if (input.provider) query.set("provider", input.provider);
-  for (const value of input.providerScope ?? []) query.append("providerScope", value);
-  for (const value of input.tierScope ?? []) query.append("tierScope", value);
-  if (input.activeScope) query.set("activeScope", "true");
-  if (input.sortBy && input.sortOrder) {
-    query.set("sortBy", input.sortBy);
-    query.set("sortOrder", input.sortOrder);
-  }
-  return apiRequest(`/api/admin/v1/models?${query}`, {}, decodeModelPage);
-}
-
-type ModelSyncEventDTO = {
-  synced?: number;
-  completed?: number;
-  total?: number;
-  code?: string;
-  message?: string;
+const providerAliases: Record<string, string> = {
+  grok_build: "grok",
+  grok_web: "grok",
+  grok_console: "grok",
 };
 
-const decodeModelSyncEvent = createObjectDecoder<ModelSyncEventDTO>("model sync event", {
-  synced: isOptional(isNumber),
-  completed: isOptional(isNumber),
-  total: isOptional(isNumber),
-  code: isOptional(isString),
-  message: isOptional(isString),
-});
+function toModelRoute(model: GatewayModelDTO, index: number): ModelRouteDTO {
+  const enabled = model.enabled !== false;
+  return {
+    id: `${model.provider}:${model.publicModel}:${index}`,
+    publicId: model.publicModel,
+    provider: model.provider,
+    upstreamModel: model.upstreamModel,
+    capability: model.capability as ModelRouteDTO["capability"],
+    origin: "catalog",
+    enabled,
+    accountIds: [],
+    bindingMode: false,
+    supportedAccounts: enabled ? 1 : 0,
+    syncedAccounts: enabled ? 1 : 0,
+    totalAccounts: 1,
+    capabilityKnown: true,
+    available: enabled,
+    weight: typeof model.weight === "number" ? model.weight : 1,
+    config: typeof model.config === "object" && model.config !== null ? model.config : {},
+  };
+}
 
-export type ModelSyncProgressDTO = { completed: number; total: number };
-
-export async function syncModels(onProgress?: (progress: ModelSyncProgressDTO) => void): Promise<{ synced: number }> {
-  let result: { synced: number } | undefined;
-  await apiEventStream("/api/admin/v1/models/sync", {
-    method: "POST",
-    headers: { Accept: "text/event-stream" },
-  }, decodeModelSyncEvent, ({ event, data }) => {
-    if (event === "progress" && typeof data.completed === "number" && typeof data.total === "number" && data.total > 0) {
-      onProgress?.({ completed: Math.min(Math.max(0, data.completed), data.total), total: data.total });
-      return;
-    }
-    if (event === "complete" && typeof data.synced === "number") {
-      result = { synced: data.synced };
-      return;
-    }
-    if (event === "error") {
-      const code = data.code ?? "modelSyncFailed";
-      const message = i18n.exists(`apiErrors.${code}`) ? i18n.t(`apiErrors.${code}`) : (data.message ?? i18n.t("apiErrors.requestFailed"));
-      throw new ApiError(502, code, message);
-    }
-  });
-  if (!result) {
-    throw new ApiError(502, "invalidResponse", i18n.t("apiErrors.invalidResponse"));
+export async function listModels(input: ListModelsInput): Promise<PaginatedDTO<ModelRouteDTO>> {
+  const models = await listGatewayModels();
+  let items = models.map(toModelRoute);
+  if (input.status === "enabled") items = items.filter((model) => model.enabled);
+  if (input.status === "disabled") items = items.filter((model) => !model.enabled);
+  if (input.provider) {
+    const provider = providerAliases[input.provider] ?? input.provider;
+    items = items.filter((model) => model.provider === provider);
   }
-  return result;
-}
-
-export type ModelAccountOptionDTO = { id: string; name: string };
-
-export type CreateModelInput = {
-  publicId: string;
-  provider: ModelRouteDTO["provider"];
-  upstreamModel: string;
-  capability: ModelRouteDTO["capability"];
-  enabled: boolean;
-  accountIds: string[];
-};
-
-export function listModelAccountOptions(provider: ModelRouteDTO["provider"]): Promise<{ items: ModelAccountOptionDTO[] }> {
-  return apiRequest(`/api/admin/v1/models/accounts?provider=${provider}`, {}, decodeModelAccounts);
-}
-
-export function createModel(input: CreateModelInput): Promise<ModelRouteDTO> {
-  return apiRequest("/api/admin/v1/models", { method: "POST", body: input }, decodeModelRoute);
-}
-
-export function updateModel(id: string, input: { publicId: string; enabled: boolean; accountIds: string[] }): Promise<ModelRouteDTO> {
-  return apiRequest(`/api/admin/v1/models/${id}`, { method: "PATCH", body: input }, decodeModelRoute);
-}
-
-export function deleteModel(id: string): Promise<{ deleted: boolean }> {
-  return apiRequest(`/api/admin/v1/models/${id}`, { method: "DELETE" }, decodeBooleanResult<{ deleted: boolean }>("deleted"));
-}
-
-export function deleteModels(ids: string[]): Promise<{ deleted: number }> {
-  return apiRequest("/api/admin/v1/models", { method: "DELETE", body: { ids } }, decodeCountResult<{ deleted: number }>("deleted"));
-}
-
-export function updateModelsEnabled(ids: string[], enabled: boolean): Promise<{ updated: number }> {
-  return apiRequest("/api/admin/v1/models/batch", { method: "PATCH", body: { ids, enabled } }, decodeCountResult<{ updated: number }>("updated"));
+  const search = input.search?.trim().toLocaleLowerCase();
+  if (search) {
+    items = items.filter((model) => (
+      model.publicId.toLocaleLowerCase().includes(search)
+      || model.upstreamModel.toLocaleLowerCase().includes(search)
+    ));
+  }
+  const page = Math.max(1, input.page);
+  const pageSize = Math.max(1, input.pageSize);
+  const total = items.length;
+  return {
+    items: items.slice((page - 1) * pageSize, page * pageSize),
+    page,
+    pageSize,
+    total,
+  };
 }

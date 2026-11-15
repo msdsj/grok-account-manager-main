@@ -2,17 +2,15 @@ import { lazy, Suspense, type ComponentType, type LazyExoticComponent } from "re
 
 import { Spinner } from "@/components/ui/spinner";
 
-const AccountsPage = lazyNamed(() => import("@/features/accounts/accounts-page"), "AccountsPage");
 const AppShell = lazyNamed(() => import("@/app/app-shell"), "AppShell");
 const RequestAuditsPage = lazyNamed(() => import("@/features/audits/request-audits-page"), "RequestAuditsPage");
 const ClientKeysPage = lazyNamed(() => import("@/features/client-keys/client-keys-page"), "ClientKeysPage");
 const CreativeConsolePage = lazyNamed(() => import("@/features/creative-console/creative-console-page"), "CreativeConsolePage");
 const DashboardPage = lazyNamed(() => import("@/features/dashboard/dashboard-page"), "DashboardPage");
 const ApiDocsPage = lazyNamed(() => import("@/features/docs/api-docs-page"), "ApiDocsPage");
-const GalleryPage = lazyNamed(() => import("@/features/media/gallery-page"), "GalleryPage");
-const VideoGalleryPage = lazyNamed(() => import("@/features/media/video-gallery-page"), "VideoGalleryPage");
 const ModelsPage = lazyNamed(() => import("@/features/models/models-page"), "ModelsPage");
-const QualityGuardPage = lazyNamed(() => import("@/features/quality-guard/quality-guard-page"), "QualityGuardPage");
+const ManagedAccountsPage = lazyNamed(() => import("@/features/managed-accounts/managed-accounts-page"), "ManagedAccountsPage");
+const OperationLogsPage = lazyNamed(() => import("@/features/logs/operation-logs-page"), "OperationLogsPage");
 const RegisterTaskPage = lazyNamed(() => import("@/features/register-task/register-task-page"), "RegisterTaskPage");
 const SettingsPage = lazyNamed(() => import("@/features/settings/settings-page"), "SettingsPage");
 
@@ -22,10 +20,6 @@ function lazyNamed<T extends Record<K, ComponentType>, K extends keyof T>(loader
 
 function DeferredPage({ page: Page }: { page: ComponentType }) {
   return <Suspense fallback={<PageLoadingFallback />}><Page /></Suspense>;
-}
-
-export function DeferredAccountsPage() {
-  return <DeferredPage page={AccountsPage} />;
 }
 
 export function DeferredAppShell() {
@@ -40,8 +34,12 @@ export function DeferredModelsPage() {
   return <DeferredPage page={ModelsPage} />;
 }
 
-export function DeferredQualityGuardPage() {
-  return <DeferredPage page={QualityGuardPage} />;
+export function DeferredManagedAccountsPage() {
+  return <DeferredPage page={ManagedAccountsPage} />;
+}
+
+export function DeferredOperationLogsPage() {
+  return <DeferredPage page={OperationLogsPage} />;
 }
 
 export function DeferredRegisterTaskPage() {
@@ -58,14 +56,6 @@ export function DeferredCreativeConsolePage() {
 
 export function DeferredRequestAuditsPage() {
   return <DeferredPage page={RequestAuditsPage} />;
-}
-
-export function DeferredGalleryPage() {
-  return <DeferredPage page={GalleryPage} />;
-}
-
-export function DeferredVideoGalleryPage() {
-  return <DeferredPage page={VideoGalleryPage} />;
 }
 
 export function DeferredApiDocsPage() {

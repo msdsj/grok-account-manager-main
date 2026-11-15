@@ -2,7 +2,7 @@ import unittest
 from unittest.mock import Mock, patch
 from requests.cookies import RequestsCookieJar
 
-from grok_account_manager.grok.oauth_exchange import (
+from grok_account_manager.providers.grok.oauth_exchange import (
     CloudflareBlockedError,
     MAX_CONSECUTIVE_PAGE_ERRORS,
     OAuthTerminalError,
@@ -37,7 +37,7 @@ class OAuthExchangeTests(unittest.TestCase):
 
     def test_fatal_poll_response_raises_terminal_error(self) -> None:
         with patch(
-            "grok_account_manager.grok.oauth_exchange._poll_device_token_once",
+            "grok_account_manager.providers.grok.oauth_exchange._poll_device_token_once",
             return_value=("fatal", "Grok OAuth 授权已被拒绝"),
         ):
             with self.assertRaises(OAuthTerminalError):
@@ -50,7 +50,7 @@ class OAuthExchangeTests(unittest.TestCase):
                 response.status_code = status_code
                 response.json.return_value = {"error": "temporarily_unavailable"}
                 with patch(
-                    "grok_account_manager.grok.oauth_exchange.requests.post",
+                    "grok_account_manager.providers.grok.oauth_exchange.requests.post",
                     return_value=response,
                 ):
                     status, payload = _poll_device_token_once(
@@ -138,7 +138,7 @@ class OAuthExchangeTests(unittest.TestCase):
 
     def test_direct_authorization_polls_without_touching_browser(self) -> None:
         with patch(
-            "grok_account_manager.grok.oauth_exchange._poll_device_token_once",
+            "grok_account_manager.providers.grok.oauth_exchange._poll_device_token_once",
             return_value=("complete", {"access_token": "access", "refresh_token": "refresh"}),
         ):
             result = _drive_device_authorization_and_poll(
@@ -181,7 +181,7 @@ class OAuthExchangeTests(unittest.TestCase):
         response.status_code = 400
         response.json.return_value = {"error": "expired_token"}
         with patch(
-            "grok_account_manager.grok.oauth_exchange.requests.post",
+            "grok_account_manager.providers.grok.oauth_exchange.requests.post",
             return_value=response,
         ):
             status, payload = _poll_device_token_once(
@@ -195,14 +195,14 @@ class OAuthExchangeTests(unittest.TestCase):
     def test_repeated_page_driver_errors_stop_early(self) -> None:
         with (
             patch(
-                "grok_account_manager.grok.oauth_exchange._poll_device_token_once",
+                "grok_account_manager.providers.grok.oauth_exchange._poll_device_token_once",
                 return_value=("pending", None),
             ),
             patch(
-                "grok_account_manager.grok.oauth_exchange._drive_device_authorization_page",
+                "grok_account_manager.providers.grok.oauth_exchange._drive_device_authorization_page",
                 side_effect=RuntimeError("page disconnected"),
             ) as drive_page,
-            patch("grok_account_manager.grok.oauth_exchange.time.sleep"),
+            patch("grok_account_manager.providers.grok.oauth_exchange.time.sleep"),
         ):
             with self.assertRaisesRegex(RuntimeError, "连续驱动失败"):
                 self._drive()
@@ -212,11 +212,11 @@ class OAuthExchangeTests(unittest.TestCase):
     def test_cloudflare_block_is_terminal(self) -> None:
         with (
             patch(
-                "grok_account_manager.grok.oauth_exchange._poll_device_token_once",
+                "grok_account_manager.providers.grok.oauth_exchange._poll_device_token_once",
                 return_value=("pending", None),
             ),
             patch(
-                "grok_account_manager.grok.oauth_exchange._drive_device_authorization_page",
+                "grok_account_manager.providers.grok.oauth_exchange._drive_device_authorization_page",
                 return_value="blocked",
             ),
         ):
@@ -239,11 +239,11 @@ class OAuthExchangeTests(unittest.TestCase):
 
         with (
             patch(
-                "grok_account_manager.grok.oauth_exchange._poll_device_token_once",
+                "grok_account_manager.providers.grok.oauth_exchange._poll_device_token_once",
                 return_value=("pending", None),
             ),
             patch(
-                "grok_account_manager.grok.oauth_exchange._drive_device_authorization_page",
+                "grok_account_manager.providers.grok.oauth_exchange._drive_device_authorization_page",
                 return_value="device-invalid-action",
             ) as drive_page,
         ):

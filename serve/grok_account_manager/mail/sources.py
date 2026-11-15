@@ -93,7 +93,7 @@ class GoogleAccount:
 
 
 def _split_by_dashes(line: str) -> list[str]:
-    """按 Kiro 的 `----` 格式拆字段；多余横杠归还给前一字段。"""
+    """按 `----` 格式拆字段；多余横杠归还给前一字段。"""
     parts: list[str] = []
     last = 0
     for match in re.finditer(r"-{4,}", line):
@@ -440,34 +440,45 @@ def load_google_accounts_data(inline_data: str = "", file_path: str = "") -> str
 
 
 class DuckMailMailbox:
-    def __init__(self, email: str, token: str) -> None:
+    def __init__(self, email: str, token: str, source: "DuckMailSource | None" = None) -> None:
         self.email = email
         self._token = token
+        self._source = source
 
     @classmethod
-    def create(cls) -> "DuckMailMailbox":
-        email, token = get_email_and_token()
+    def create(cls, source: "DuckMailSource | None" = None) -> "DuckMailMailbox":
+        email, token = get_email_and_token(
+            base_url=source.base_url if source else None,
+            api_key=source.api_key if source else None,
+            domain=source.domain if source else None,
+        )
         if not email or not token:
             raise RuntimeError("获取 DuckMail 邮箱失败")
-        return cls(email=email, token=token)
+        return cls(email=email, token=token, source=source)
 
     def wait_for_code(self, timeout: int = 180, interval: int = 3, stop_event=None) -> str | None:
         if stop_event and stop_event.is_set():
             raise RuntimeError("任务已停止")
-        return get_oai_code(
-            self._token,
-            self.email,
-            stop_event=stop_event,
-            timeout=timeout,
-            interval=interval,
-        )
+        kwargs = {
+            "stop_event": stop_event,
+            "timeout": timeout,
+            "interval": interval,
+        }
+        if self._source is not None:
+            kwargs["base_url"] = self._source.base_url
+        return get_oai_code(self._token, self.email, **kwargs)
 
 
 class DuckMailSource:
     name = "duckmail"
 
+    def __init__(self, api_base: str = "", api_key: str = "", domain: str = "") -> None:
+        self.base_url = api_base.strip() or os.environ.get("DUCKMAIL_BASE_URL", "https://api.duckmail.sbs")
+        self.api_key = api_key.strip() or os.environ.get("DUCKMAIL_API_KEY", "")
+        self.domain = domain.strip() or os.environ.get("DUCKMAIL_DOMAIN", "@msdsj.cyou")
+
     def create_mailbox(self, log_callback=None) -> DuckMailMailbox:
-        return DuckMailMailbox.create()
+        return DuckMailMailbox.create(self)
 
 
 class OutlookAccountPool:
@@ -617,7 +628,11 @@ def build_mailbox_source(
     outlook_file: str = "",
     google_data: str = "",
     google_file: str = "",
+    duck_mail_api_base: str = "",
+    duck_mail_api_key: str = "",
+    duck_mail_domain: str = "",
     cloud_mail_api_base: str = "",
+    cloud_mail_auth_mode: str = "",
     cloud_mail_public_token: str = "",
     cloud_mail_login_email: str = "",
     cloud_mail_login_password: str = "",
@@ -625,7 +640,7 @@ def build_mailbox_source(
 ) -> MailboxSource:
     source = (email_source or "duckmail").strip().lower()
     if source == "duckmail":
-        return DuckMailSource()
+        return DuckMailSource(duck_mail_api_base, duck_mail_api_key, duck_mail_domain)
     if source == "outlook":
         data = load_outlook_accounts_data(outlook_data, outlook_file)
         accounts = parse_outlook_accounts(data)
@@ -635,12 +650,25 @@ def build_mailbox_source(
         accounts = parse_google_accounts(data)
         return GoogleAccountPool(accounts, name=source)
     if source == "cloud_mail":
+        auth_mode = (cloud_mail_auth_mode or os.environ.get("CLOUD_MAIL_AUTH_MODE", "")).strip().lower()
+        api_base = cloud_mail_api_base.strip() or os.environ.get("CLOUD_MAIL_API_BASE", "")
+        public_token = cloud_mail_public_token.strip() or os.environ.get("CLOUD_MAIL_PUBLIC_TOKEN", "")
+        login_email = cloud_mail_login_email.strip() or os.environ.get("CLOUD_MAIL_LOGIN_EMAIL", "")
+        login_password = cloud_mail_login_password.strip() or os.environ.get("CLOUD_MAIL_LOGIN_PASSWORD", "")
+        domains = cloud_mail_domains.strip() or os.environ.get("CLOUD_MAIL_DOMAINS", "")
+        if auth_mode not in {"login", "public"}:
+            auth_mode = "login" if login_email and login_password else "public"
+        if auth_mode == "login":
+            public_token = ""
+        elif auth_mode == "public":
+            login_email = ""
+            login_password = ""
         return CloudMailSource(
-            api_base=cloud_mail_api_base,
-            public_token=cloud_mail_public_token,
-            login_email=cloud_mail_login_email,
-            login_password=cloud_mail_login_password,
-            domains=cloud_mail_domains,
+            api_base=api_base,
+            public_token=public_token,
+            login_email=login_email,
+            login_password=login_password,
+            domains=domains,
         )
     raise ValueError(f"未知邮箱源: {email_source}")
 

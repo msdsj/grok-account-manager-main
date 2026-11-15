@@ -48,11 +48,15 @@ export const TabsList = React.forwardRef<React.ElementRef<typeof TabsPrimitive.L
     }, [updateIndicator]);
 
     return (
-      <TabsPrimitive.List ref={setListRef} className={cn("relative isolate inline-flex h-8 w-fit items-center gap-1 rounded-full bg-muted p-0.5", className)} {...props}>
+      <TabsPrimitive.List
+        ref={setListRef}
+        className={cn("relative isolate inline-flex h-9 w-fit items-center gap-0.5 rounded-lg bg-muted p-[3px] dark:bg-secondary/60", className)}
+        {...props}
+      >
         {indicator ? (
           <span
             aria-hidden="true"
-            className="pointer-events-none absolute left-0 top-0 z-0 rounded-full bg-background shadow-sm transition-[transform,width,height] duration-200 ease-[cubic-bezier(0.22,1,0.36,1)] motion-reduce:transition-none"
+            className="pointer-events-none absolute left-0 top-0 z-0 rounded-[inherit] border border-border/60 bg-[var(--segment-active)] shadow-[0_1px_2px_rgba(0,0,0,0.08)] transition-[transform,width,height] duration-200 ease-[cubic-bezier(0.22,1,0.36,1)] motion-reduce:transition-none"
             style={{ width: indicator.width, height: indicator.height, transform: `translate3d(${indicator.left}px, ${indicator.top}px, 0)` }}
           />
         ) : null}
@@ -65,7 +69,7 @@ export const TabsList = React.forwardRef<React.ElementRef<typeof TabsPrimitive.L
 export function TabsTrigger({ className, ...props }: React.ComponentProps<typeof TabsPrimitive.Trigger>) {
   return (
     <TabsPrimitive.Trigger
-      className={cn("relative z-10 inline-flex h-7 items-center justify-center rounded-full px-3 text-xs font-medium text-muted-foreground outline-none transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/50 data-[state=active]:text-foreground", className)}
+      className={cn("relative z-10 inline-flex h-8 items-center justify-center gap-1.5 whitespace-nowrap rounded-md px-3 text-[13px] font-normal text-muted-foreground outline-none transition-colors hover:text-foreground focus-visible:ring-[3px] focus-visible:ring-ring/25 data-[state=active]:font-medium data-[state=active]:text-foreground disabled:pointer-events-none disabled:opacity-40 [&_svg]:shrink-0", className)}
       {...props}
     />
   );

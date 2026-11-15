@@ -6,6 +6,7 @@ import time
 import unittest
 from unittest.mock import Mock, patch
 
+from grok_account_manager.core import database as account_db
 from grok_account_manager.api.services.pending import (
     OAUTH_PENDING,
     PERSISTENCE_FAILED,
@@ -22,8 +23,16 @@ class RegistrationJobManagerTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmpdir = tempfile.TemporaryDirectory()
         self.pending_store = PendingResultStore(Path(self._tmpdir.name) / "pending.json")
+        self._patchers = [
+            patch.object(account_db, "DB_PATH", Path(self._tmpdir.name) / "jobs.db"),
+            patch.object(account_db, "OUTPUT_DIR", Path(self._tmpdir.name)),
+        ]
+        for patcher in self._patchers:
+            patcher.start()
 
     def tearDown(self) -> None:
+        for patcher in reversed(self._patchers):
+            patcher.stop()
         self._tmpdir.cleanup()
 
     def _manager(self) -> RegistrationJobManager:
@@ -38,6 +47,12 @@ class RegistrationJobManagerTests(unittest.TestCase):
                 clear=False,
             ),
             patch("grok_account_manager.api.services.jobs.threading.Thread.start"),
+            # 本用例只关心 OAuth 阶段并发，不能被本机 output/registration-proxies.json
+            # 里残留的代理把 total/concurrency 压下来（否则并发断言会随环境漂移）。
+            patch(
+                "grok_account_manager.api.services.jobs._build_proxy_pool",
+                return_value=(None, ""),
+            ),
         ):
             job = manager.start(
                 total=5,
@@ -438,6 +453,7 @@ class RegistrationJobManagerTests(unittest.TestCase):
 
         round_stop = threading.Event()
         provider = manager._create_provider(
+            "grok",
             False,
             CombinedStopEvent(manager._stop_event, round_stop),
             1,

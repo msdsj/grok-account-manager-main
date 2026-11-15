@@ -1,7 +1,7 @@
 [project]
  name = "grok-account-manager"
 version = "0.1.0"
-description = "MSDSJ Grok account registration and credential manager"
+description = "MSDSJ multi-provider account manager with Grok, GPT and Kiro gateways"
 readme = "README.md"
 license = { file = "LICENSE" }
 # 上限保留给邮箱与浏览器自动化稳定性；升级 Python 前需要重新验证注册流程。
@@ -18,7 +18,6 @@ dependencies = [
 [project.scripts]
 grok-account-manager = "grok_account_manager.cli:main"
 grok-account-manager-api = "grok_account_manager.api.main:main"
-grok-account-manager-web = "grok_account_manager.api.main:main"
 
 [build-system]
 requires = ["hatchling"]

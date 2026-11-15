@@ -1,8 +1,6 @@
 # 首次运行
 
-本地中转默认使用 `ghcr.io/chenyme/grok2api:latest` 作为官方候选镜像，并已内置
-grok2api v3.1.4 源码和 Dockerfile 作为兼容回退。新用户不需要另外克隆或配置
-`grok2api` 项目。
+项目后端是单一 Python FastAPI 进程，注册任务、账号管理、三网关 `/v1` 调用与审计都在其中完成，不依赖 Docker、Go 网关或 Node sidecar。
 
 ## 环境
 
@@ -10,7 +8,6 @@ grok2api v3.1.4 源码和 Dockerfile 作为兼容回退。新用户不需要另�
 - Python 3.12 或 3.13
 - [uv](https://docs.astral.sh/uv/)
 - Node.js 20+，以及 pnpm 11+ 或 npm
-- Docker Desktop，并确认 Docker daemon 已启动
 - 注册功能需要 Chrome/Chromium
 
 ## 一键启动
@@ -22,15 +19,17 @@ cp .env.example .env
 ./scripts/start.sh
 ```
 
-`start.sh` 会按顺序拉取本项目最新代码、同步 Python 依赖、构建 React 控制台、
-预拉取官方候选镜像，并从仓库内 `gateway/` 构建 v3.1.4 回退镜像，然后启动
-FastAPI。启动本地中转时还会解析候选的 `RepoDigest` 并执行隔离探针；候选验证
-失败时自动使用回退镜像。首次准备镜像和依赖需要联网。
+`start.sh` 会拉取最新代码、同步 Python 依赖、安装并构建 React 控制台，然后启动 FastAPI。首次安装依赖需要联网。
 
 打开：<http://127.0.0.1:43187>
 
-登录后，侧边栏的“注册机”进入本项目内置的注册任务页面。注册机的邮箱、代理、
-并发和 OAuth 设置都由 FastAPI 本地 API 处理，不调用其他项目的注册功能。
+默认管理员账号是 `admin` / `admin`，可在 `.env` 中用 `ADMIN_USERNAME` / `ADMIN_PASSWORD` 覆盖首次初始化的值；登录后也可以在控制台修改密码。
+
+登录后：
+
+- 侧边栏“注册机”进入注册任务页面，邮箱、代理、并发和 OAuth 设置都由本地 API 处理。
+- “账号标签”“模型路由”“密钥”“请求审计”管理账号与内置网关。
+- “设置”管理邮箱配置、网关状态和界面主题。
 
 ## 开发模式
 
@@ -44,8 +43,7 @@ npm install
 npm run dev
 ```
 
-打开 <http://localhost:43188>。Vite 只代理本项目的 FastAPI，注册机路由仍然是
-`/register`。
+打开 <http://localhost:43188>。Vite 会把 `/api`、`/v1`、`/healthz`、`/readyz` 代理到 FastAPI。
 
 ## 后续更新
 
@@ -53,15 +51,10 @@ npm run dev
 ./scripts/update.sh
 ```
 
-脚本会预拉取当前 shell 环境中 `GROK_ACCOUNT_MANAGER_GATEWAY_IMAGE` 指定的候选；
-未设置时使用 `ghcr.io/chenyme/grok2api:latest`。要预拉取固定版本，可执行
-`GROK_ACCOUNT_MANAGER_GATEWAY_IMAGE=... ./scripts/update.sh`；运行时也可在 `.env`
-填写版本 tag 或 digest。无论候选预拉取是否成功，脚本都会继续构建仓库内置的
-v3.1.4 回退镜像；实际启动仍以 `RepoDigest` 和隔离探针结果为准。脚本不会读取或
-删除电脑上其他项目的源码。
+脚本只做三件事：拉取代码、同步 Python 依赖、构建前端。
 
 ## 数据与停止
 
-- 账号数据库和凭证位于 `output/`；网关数据固定在 `output/grok2api-v2-data/`，更新或镜像回退不会删除它们。
+- 账号数据库位于 `output/grok-account-manager.db`，是账号、标签、日志与网关审计的唯一来源。
 - 按 `Ctrl+C` 停止 FastAPI；再按 `Ctrl+C` 停止 Vite。
-- 需要清理本项目容器时，只处理名称以 `grok-account-manager-` 开头的资源，避免误删其他项目。
+- 备份时以 SQLite 数据库和 `output/` 下的邮箱/代理池文件为准，不要提交到 Git。

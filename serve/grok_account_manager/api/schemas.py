@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 class RegisterRequest(BaseModel):
     total: int = 1
     concurrency: int = 1
+    provider: str = "grok"  # "grok" or "chatgpt"
     oauthExchange: bool = True
     autoImportSub2Api: bool = False
     minimizeBrowsers: bool = True
@@ -18,7 +19,11 @@ class RegisterRequest(BaseModel):
     outlookAccountsFile: str = ""
     googleData: str = ""
     googleAccountsFile: str = ""
+    duckMailApiBase: str = Field(default="", max_length=4_096)
+    duckMailApiKey: str = Field(default="", max_length=16_384)
+    duckMailDomain: str = Field(default="", max_length=1_024)
     cloudMailApiBase: str = Field(default="", max_length=4_096)
+    cloudMailAuthMode: str = Field(default="", max_length=32)
     cloudMailPublicToken: str = Field(default="", max_length=16_384)
     cloudMailLoginEmail: str = Field(default="", max_length=320)
     cloudMailLoginPassword: str = Field(default="", max_length=4_096)
@@ -41,6 +46,25 @@ class ExportRequest(BaseModel):
 
 class OutlookMailboxPoolRequest(BaseModel):
     data: str = Field(default="", max_length=1_000_000)
+
+
+class AccountTagsRequest(BaseModel):
+    exportKeys: list[str] = Field(default_factory=list)
+    tags: list[str] = Field(default_factory=list)
+    mode: str = Field(default="replace", max_length=16)
+
+
+class MailConfigRequest(BaseModel):
+    emailSource: str = ""
+    duckMailApiBase: str = Field(default="", max_length=4_096)
+    duckMailApiKey: str | None = Field(default=None, max_length=16_384)
+    duckMailDomain: str = Field(default="", max_length=1_024)
+    cloudMailApiBase: str = Field(default="", max_length=4_096)
+    cloudMailDomains: str = Field(default="", max_length=100_000)
+    cloudMailAuthMode: str = Field(default="login", max_length=32)
+    cloudMailPublicToken: str | None = Field(default=None, max_length=16_384)
+    cloudMailLoginEmail: str = Field(default="", max_length=320)
+    cloudMailLoginPassword: str | None = Field(default=None, max_length=4_096)
 
 
 class DeleteAccountsRequest(BaseModel):

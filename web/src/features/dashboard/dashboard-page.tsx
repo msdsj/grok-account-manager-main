@@ -11,8 +11,8 @@ import { DashboardOverview, DashboardResources } from "@/features/dashboard/dash
 import { DashboardProviderDistribution } from "@/features/dashboard/dashboard-provider-distribution";
 import { DashboardTopModels } from "@/features/dashboard/dashboard-top-models";
 import { DashboardTrend } from "@/features/dashboard/dashboard-trend";
-import { VersionUpdateBanner } from "@/features/system/version-update";
 import { ErrorState } from "@/shared/components/data-state";
+import { PageHeader } from "@/shared/components/page-header";
 import { PeriodSelector } from "@/shared/components/period-selector";
 import { PERIOD_DAYS, toPeriodValue, type PeriodDays } from "@/shared/lib/period";
 
@@ -63,10 +63,11 @@ export function DashboardPage() {
 
   return (
     <div className="space-y-5">
-      <div className="space-y-5">
-        <header className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-          <h1 className="text-xl font-medium">{t("dashboard.title")}</h1>
-          <div className="flex min-w-0 shrink-0 items-center gap-2">
+      <PageHeader
+        title={t("dashboard.title")}
+        description={t("dashboard.description")}
+        actions={(
+          <>
             <PeriodSelector
               value={periodDays}
               onChange={(value) => setPreferences((current) => ({ ...current, periodDays: value }))}
@@ -82,17 +83,13 @@ export function DashboardPage() {
               <RefreshCw className={manualRefreshing ? "animate-spin" : undefined} />
               {t("common.refresh")}
             </Button>
-          </div>
-        </header>
-
-        <VersionUpdateBanner />
-      </div>
-
-      <DashboardCommunity />
+          </>
+        )}
+      />
 
       <DashboardOverview dashboard={dashboard} locale={i18n.language} loading={loading} />
 
-      <div className="grid items-stretch gap-2 xl:grid-cols-[minmax(0,3fr)_minmax(360px,2fr)]">
+      <div className="grid items-stretch gap-3 xl:grid-cols-[minmax(0,3fr)_minmax(340px,2fr)]">
         <DashboardTrend
           dashboard={dashboard}
           locale={i18n.language}
@@ -101,13 +98,15 @@ export function DashboardPage() {
         <DashboardProviderDistribution dashboard={dashboard} locale={i18n.language} loading={loading} />
       </div>
 
-      <div className="grid items-stretch gap-2 xl:grid-cols-[minmax(0,3fr)_minmax(360px,2fr)]">
+      <div className="grid items-stretch gap-3 xl:grid-cols-[minmax(0,3fr)_minmax(340px,2fr)]">
         <DashboardTopModels dashboard={dashboard} locale={i18n.language} loading={loading} />
-        <div className="grid min-h-0 grid-rows-[auto_minmax(0,1fr)] gap-2 xl:h-full">
+        <div className="grid min-h-0 grid-rows-[auto_minmax(0,1fr)] gap-3 xl:h-full">
           <DashboardActivity dashboard={dashboard} locale={i18n.language} loading={loading} />
           <DashboardResources dashboard={dashboard} locale={i18n.language} loading={loading} />
         </div>
       </div>
+
+      <DashboardCommunity />
     </div>
   );
 }

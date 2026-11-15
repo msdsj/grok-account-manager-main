@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import threading
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -11,17 +11,23 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
-from .config import CREDENTIALS_DIR, WEB_DIST_DIR
-from .routers import accounts, mailboxes, proxy, register, relay, state
-from .services.database import init_db
+from ..gateway import catalog as model_catalog
+from ..core.paths import CREDENTIALS_DIR, WEB_DIST_DIR
+from .routers import accounts, admin_auth, admin_stats, gateway, logs, mailboxes, register, state
+from ..core import audit
+from ..core import database as app_db
+from .services.accounts import migrate_legacy_storage_once
+from ..core.database import init_db
 from .services.jobs import JOB_MANAGER
-from .services.relay import RELAY_MANAGER
 
 
 def create_app() -> FastAPI:
     load_dotenv()
     CREDENTIALS_DIR.mkdir(parents=True, exist_ok=True)
     init_db()
+    migrate_legacy_storage_once()
+    model_catalog.ensure_seeded()
+    admin_auth.ensure_admin()
 
     app = FastAPI(
         title="Grok 2api API",
@@ -40,11 +46,14 @@ def create_app() -> FastAPI:
     )
 
     app.include_router(state.router)
+    app.include_router(admin_auth.router)
+    app.include_router(admin_stats.router)
     app.include_router(register.router)
     app.include_router(mailboxes.router)
     app.include_router(accounts.router)
-    app.include_router(relay.router)
-    app.include_router(proxy.router)
+    app.include_router(logs.router)
+    app.include_router(gateway.router)
+    app.include_router(state.router)
 
     @app.exception_handler(HTTPException)
     async def http_exception_handler(_request: Request, exc: HTTPException) -> JSONResponse:
@@ -56,23 +65,32 @@ def create_app() -> FastAPI:
 
     @app.on_event("shutdown")
     def shutdown_services() -> None:
+        audit.log_system("info", "app", "服务停止")
         JOB_MANAGER.stop(wait=True, timeout=12)
-        RELAY_MANAGER.stop()
 
     @app.on_event("startup")
-    def start_relay_engine() -> None:
-        # The managed gateway takes tens of seconds to boot (Docker container / Go binary), so start
-        # it in the background instead of blocking the FastAPI startup handshake on it.
-        def _boot() -> None:
-            try:
-                # A backend restart is the explicit update boundary: refresh
-                # and validate the requested gateway image once, while normal
-                # API traffic keeps reusing the healthy runtime.
-                RELAY_MANAGER.start(force_update=True)
-            except Exception as error:
-                print(f"[app] 本地网关自动启动失败，将在首次使用时重试: {error}")
+    def log_startup() -> None:
+        audit.log_system("info", "app", "服务启动")
 
-        threading.Thread(target=_boot, name="relay-autostart", daemon=True).start()
+    @app.get("/healthz", include_in_schema=False)
+    def healthz() -> dict:
+        return {"status": "ok", "service": "grok-account-manager", "time": int(time.time() * 1000)}
+
+    @app.get("/readyz", include_in_schema=False)
+    def readyz() -> JSONResponse:
+        try:
+            accounts_count = len(app_db.list_accounts())
+            models_count = len(model_catalog.list_models(enabled_only=False))
+        except Exception as error:
+            return JSONResponse({"status": "error", "error": str(error)}, status_code=503)
+        return JSONResponse(
+            {
+                "status": "ready",
+                "accounts": accounts_count,
+                "models": models_count,
+                "web": WEB_DIST_DIR.exists(),
+            }
+        )
 
     @app.get("/{request_path:path}", include_in_schema=False, response_model=None)
     def serve_spa(request_path: str):

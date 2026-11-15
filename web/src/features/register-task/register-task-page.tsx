@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { FolderOpen, Play, RefreshCw, RotateCw, Save, Square, Trash2, Upload } from "lucide-react";
+import { FolderOpen, KeyRound, Play, RotateCw, Save, Square, Trash2, Upload } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
@@ -15,19 +15,21 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { DashboardPanel } from "@/features/dashboard/dashboard-panel";
+import { PageHeader } from "@/shared/components/page-header";
 import {
   countOutlookAccounts,
   countGoogleAccounts,
   clearRegistrationProxyPool,
   getRegistrationProxyPool,
   getCurrentJob,
+  getMailConfig,
   getOutlookMailboxPool,
   retryRegistration,
   saveOutlookMailboxPool,
+  saveMailConfig,
   saveRegistrationProxyPool,
   startRegistration,
   stopRegistration,
-  syncAccountsToPool,
   type EmailSource,
   type JobStatus,
 } from "@/features/register-task/register-task-api";
@@ -59,6 +61,7 @@ function statusTone(status?: JobStatus): "default" | "secondary" | "destructive"
 export function RegisterTaskPage() {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
+  const [provider, setProvider] = useState<"grok" | "chatgpt">("grok");
   const [total, setTotal] = useState(1);
   const [concurrency, setConcurrency] = useState(1);
   const [emailSource, setEmailSource] = useState<EmailSource>("duckmail");
@@ -78,11 +81,18 @@ export function RegisterTaskPage() {
   const [googleData, setGoogleData] = useState("");
   const [cloudMailApiBase, setCloudMailApiBase] = useState("");
   const [cloudMailDomains, setCloudMailDomains] = useState("");
-  const [cloudMailAuthMode, setCloudMailAuthMode] = useState<"public" | "login">("public");
+  const [cloudMailAuthMode, setCloudMailAuthMode] = useState<"public" | "login">("login");
   const [cloudMailPublicToken, setCloudMailPublicToken] = useState("");
   const [cloudMailLoginEmail, setCloudMailLoginEmail] = useState("");
   const [cloudMailLoginPassword, setCloudMailLoginPassword] = useState("");
+  const [duckMailApiBase, setDuckMailApiBase] = useState("");
+  const [duckMailApiKey, setDuckMailApiKey] = useState("");
+  const [duckMailDomain, setDuckMailDomain] = useState("");
+  const [duckMailApiKeyConfigured, setDuckMailApiKeyConfigured] = useState(false);
+  const [cloudMailPublicTokenConfigured, setCloudMailPublicTokenConfigured] = useState(false);
+  const [cloudMailLoginPasswordConfigured, setCloudMailLoginPasswordConfigured] = useState(false);
   const loadedOutlookPool = useRef(false);
+  const loadedMailConfig = useRef(false);
 
   const jobQuery = useQuery({
     queryKey: ["register-job"],
@@ -103,6 +113,12 @@ export function RegisterTaskPage() {
     staleTime: 10_000,
   });
 
+  const mailConfigQuery = useQuery({
+    queryKey: ["register-mail-config"],
+    queryFn: getMailConfig,
+    staleTime: Infinity,
+  });
+
   useEffect(() => {
     const savedData = outlookPoolQuery.data?.data;
     if (
@@ -116,11 +132,28 @@ export function RegisterTaskPage() {
     }
   }, [emailSource, outlookData, outlookPoolQuery.data?.data]);
 
+  useEffect(() => {
+    const config = mailConfigQuery.data;
+    if (!config || loadedMailConfig.current) return;
+    if (EMAIL_SOURCES.includes(config.emailSource)) setEmailSource(config.emailSource);
+    setDuckMailApiBase(config.duckMailApiBase);
+    setDuckMailDomain(config.duckMailDomain);
+    setDuckMailApiKeyConfigured(config.duckMailApiKeyConfigured);
+    setCloudMailApiBase(config.cloudMailApiBase);
+    setCloudMailDomains(config.cloudMailDomains);
+    setCloudMailAuthMode(config.cloudMailAuthMode);
+    setCloudMailPublicTokenConfigured(config.cloudMailPublicTokenConfigured);
+    setCloudMailLoginEmail(config.cloudMailLoginEmail);
+    setCloudMailLoginPasswordConfigured(config.cloudMailLoginPasswordConfigured);
+    loadedMailConfig.current = true;
+  }, [mailConfigQuery.data]);
+
   const invalidate = () => void queryClient.invalidateQueries({ queryKey: ["register-job"] });
 
   const startMutation = useMutation({
     mutationFn: () =>
       startRegistration({
+        provider,
         total,
         concurrency,
         oauthExchange,
@@ -129,8 +162,12 @@ export function RegisterTaskPage() {
         emailSource,
         outlookData: emailSource === "outlook" ? outlookData : "",
         googleData: emailSource === "google" ? googleData : "",
+        duckMailApiBase: emailSource === "duckmail" ? duckMailApiBase : "",
+        duckMailApiKey: emailSource === "duckmail" ? duckMailApiKey : "",
+        duckMailDomain: emailSource === "duckmail" ? duckMailDomain : "",
         cloudMailApiBase: emailSource === "cloud_mail" ? cloudMailApiBase : "",
         cloudMailDomains: emailSource === "cloud_mail" ? cloudMailDomains : "",
+        cloudMailAuthMode: emailSource === "cloud_mail" ? cloudMailAuthMode : undefined,
         cloudMailPublicToken: emailSource === "cloud_mail" && cloudMailAuthMode === "public" ? cloudMailPublicToken : "",
         cloudMailLoginEmail: emailSource === "cloud_mail" && cloudMailAuthMode === "login" ? cloudMailLoginEmail : "",
         cloudMailLoginPassword: emailSource === "cloud_mail" && cloudMailAuthMode === "login" ? cloudMailLoginPassword : "",
@@ -151,12 +188,6 @@ export function RegisterTaskPage() {
     mutationFn: retryRegistration,
     onSuccess: () => { toast.success(t("registerTask.started")); invalidate(); },
     onError: (error) => toast.error(error instanceof Error ? error.message : t("registerTask.startFailed")),
-  });
-
-  const syncMutation = useMutation({
-    mutationFn: syncAccountsToPool,
-    onSuccess: (result) => toast.success(t("registerTask.syncCompleted", { count: result.requested })),
-    onError: (error) => toast.error(error instanceof Error ? error.message : t("registerTask.syncFailed")),
   });
 
   const saveOutlookPoolMutation = useMutation({
@@ -183,6 +214,38 @@ export function RegisterTaskPage() {
       toast.success(t("registerTask.proxyPoolSaved", { count: result.count, added: result.added }));
     },
     onError: (error) => toast.error(error instanceof Error ? error.message : t("registerTask.proxyPoolSaveFailed")),
+  });
+
+  const saveMailConfigMutation = useMutation({
+    mutationFn: () => saveMailConfig({
+      emailSource,
+      duckMailApiBase,
+      duckMailApiKey: duckMailApiKey.trim() || undefined,
+      duckMailDomain,
+      cloudMailApiBase,
+      cloudMailDomains,
+      cloudMailAuthMode,
+      cloudMailPublicToken: cloudMailPublicToken.trim() || undefined,
+      cloudMailLoginEmail,
+      cloudMailLoginPassword: cloudMailLoginPassword.trim() || undefined,
+    }),
+    onSuccess: (config) => {
+      queryClient.setQueryData(["register-mail-config"], config);
+      setDuckMailApiBase(config.duckMailApiBase);
+      setDuckMailDomain(config.duckMailDomain);
+      setDuckMailApiKey("");
+      setDuckMailApiKeyConfigured(config.duckMailApiKeyConfigured);
+      setCloudMailApiBase(config.cloudMailApiBase);
+      setCloudMailDomains(config.cloudMailDomains);
+      setCloudMailAuthMode(config.cloudMailAuthMode);
+      setCloudMailPublicToken("");
+      setCloudMailPublicTokenConfigured(config.cloudMailPublicTokenConfigured);
+      setCloudMailLoginEmail(config.cloudMailLoginEmail);
+      setCloudMailLoginPassword("");
+      setCloudMailLoginPasswordConfigured(config.cloudMailLoginPasswordConfigured);
+      toast.success(t("registerTask.mailConfigSaved"));
+    },
+    onError: (error) => toast.error(error instanceof Error ? error.message : t("registerTask.mailConfigSaveFailed")),
   });
 
   const clearProxyPoolMutation = useMutation({
@@ -223,23 +286,47 @@ export function RegisterTaskPage() {
     cloudMailApiBase.trim()
     && cloudMailDomains.trim()
     && (
-      (cloudMailAuthMode === "public" && cloudMailPublicToken.trim())
-      || (cloudMailAuthMode === "login" && cloudMailLoginEmail.trim() && cloudMailLoginPassword.trim())
+      (cloudMailAuthMode === "public" && (cloudMailPublicToken.trim() || cloudMailPublicTokenConfigured))
+      || (cloudMailAuthMode === "login" && cloudMailLoginEmail.trim() && (cloudMailLoginPassword.trim() || cloudMailLoginPasswordConfigured))
     ),
+  );
+  const duckMailReady = Boolean(
+    duckMailApiBase.trim()
+    && duckMailDomain.trim()
+    && (duckMailApiKey.trim() || duckMailApiKeyConfigured),
   );
   const startDisabled =
     running
     || startMutation.isPending
     || (emailSource === "outlook" && outlookAccountCount === 0)
     || (emailSource === "google" && googleAccountCount === 0)
+    || (emailSource === "duckmail" && !duckMailReady)
     || (emailSource === "cloud_mail" && !cloudMailReady);
 
   return (
     <div className="space-y-5">
-      <header className="flex min-h-8 items-center">
-        <h1 className="text-xl font-medium">{t("registerTask.title")}</h1>
-        <p className="sr-only">{t("registerTask.description")}</p>
-      </header>
+      <PageHeader title={t("registerTask.title")} description={t("registerTask.description")} />
+
+      <div className="max-w-sm space-y-1.5">
+        <Label htmlFor="reg-provider">{t("registerTask.providerLabel")}</Label>
+        <Select
+          value={provider}
+          onValueChange={(value) => setProvider(value as "grok" | "chatgpt")}
+          disabled={running}
+        >
+          <SelectTrigger id="reg-provider" className="w-full"><SelectValue /></SelectTrigger>
+          <SelectContent>
+            <SelectItem value="grok">Grok (X.com)</SelectItem>
+            <SelectItem value="chatgpt">ChatGPT (OpenAI)</SelectItem>
+          </SelectContent>
+        </Select>
+      </div>
+
+      {provider === "chatgpt" ? (
+        <p className="max-w-sm text-xs text-muted-foreground">
+          {t("registerTask.chatgptHelp")}
+        </p>
+      ) : null}
 
       <div className="grid gap-4 lg:grid-cols-2">
         <DashboardPanel id="register-form" title={t("registerTask.title")}>
@@ -270,6 +357,7 @@ export function RegisterTaskPage() {
                 />
               </div>
             </div>
+
             <div className="space-y-1.5">
               <Label>{t("registerTask.emailSourceLabel")}</Label>
               <Select value={emailSource} onValueChange={(value) => setEmailSource(value as EmailSource)} disabled={running}>
@@ -337,6 +425,56 @@ export function RegisterTaskPage() {
                 </p>
               </div>
             ) : null}
+            {emailSource === "duckmail" ? (
+              <div className="space-y-3 border-y py-3">
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <div className="space-y-1.5">
+                    <Label htmlFor="reg-duck-mail-api">{t("registerTask.duckMailApiBaseLabel")}</Label>
+                    <Input
+                      id="reg-duck-mail-api"
+                      value={duckMailApiBase}
+                      disabled={running}
+                      placeholder={t("registerTask.duckMailApiBasePlaceholder")}
+                      onChange={(event) => setDuckMailApiBase(event.target.value)}
+                    />
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label htmlFor="reg-duck-mail-domain">{t("registerTask.duckMailDomainLabel")}</Label>
+                    <Input
+                      id="reg-duck-mail-domain"
+                      value={duckMailDomain}
+                      disabled={running}
+                      placeholder={t("registerTask.duckMailDomainPlaceholder")}
+                      onChange={(event) => setDuckMailDomain(event.target.value)}
+                    />
+                  </div>
+                </div>
+                <div className="space-y-1.5">
+                  <Label htmlFor="reg-duck-mail-key">{t("registerTask.duckMailApiKeyLabel")}</Label>
+                  <Input
+                    id="reg-duck-mail-key"
+                    type="password"
+                    autoComplete="off"
+                    value={duckMailApiKey}
+                    disabled={running}
+                    placeholder={duckMailApiKeyConfigured ? t("registerTask.secretSavedPlaceholder") : ""}
+                    onChange={(event) => setDuckMailApiKey(event.target.value)}
+                  />
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="secondary"
+                    disabled={running || saveMailConfigMutation.isPending}
+                    onClick={() => saveMailConfigMutation.mutate()}
+                  >
+                    <KeyRound />{t("registerTask.saveMailConfig")}
+                  </Button>
+                  {duckMailApiKeyConfigured ? <span className="text-xs text-muted-foreground">{t("registerTask.secretSaved")}</span> : null}
+                </div>
+              </div>
+            ) : null}
             {emailSource === "cloud_mail" ? (
               <div className="space-y-3 border-y py-3">
                 <div className="grid gap-3 sm:grid-cols-2">
@@ -379,6 +517,7 @@ export function RegisterTaskPage() {
                       autoComplete="off"
                       value={cloudMailPublicToken}
                       disabled={running}
+                      placeholder={cloudMailPublicTokenConfigured ? t("registerTask.secretSavedPlaceholder") : ""}
                       onChange={(event) => setCloudMailPublicToken(event.target.value)}
                     />
                   </div>
@@ -403,12 +542,28 @@ export function RegisterTaskPage() {
                         autoComplete="current-password"
                         value={cloudMailLoginPassword}
                         disabled={running}
+                        placeholder={cloudMailLoginPasswordConfigured ? t("registerTask.secretSavedPlaceholder") : ""}
                         onChange={(event) => setCloudMailLoginPassword(event.target.value)}
                       />
                     </div>
                   </div>
                 )}
                 <p className="text-xs text-muted-foreground">{t("registerTask.cloudMailHelp")}</p>
+                <div className="flex flex-wrap items-center gap-2">
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="secondary"
+                    disabled={running || saveMailConfigMutation.isPending}
+                    onClick={() => saveMailConfigMutation.mutate()}
+                  >
+                    <Save />{t("registerTask.saveMailConfig")}
+                  </Button>
+                  {((cloudMailAuthMode === "public" && cloudMailPublicTokenConfigured)
+                    || (cloudMailAuthMode === "login" && cloudMailLoginPasswordConfigured))
+                    ? <span className="text-xs text-muted-foreground">{t("registerTask.secretSaved")}</span>
+                    : null}
+                </div>
               </div>
             ) : null}
             <div className="space-y-1.5">
@@ -473,16 +628,13 @@ export function RegisterTaskPage() {
               <Button size="sm" variant="secondary" disabled={running || retryMutation.isPending} onClick={() => retryMutation.mutate()}>
                 <RotateCw />{t("registerTask.retry")}
               </Button>
-              <Button size="sm" variant="secondary" disabled={syncMutation.isPending} onClick={() => syncMutation.mutate()}>
-                <RefreshCw />{t("registerTask.syncNow")}
-              </Button>
             </div>
           </div>
         </DashboardPanel>
 
         <DashboardPanel
           id="register-status"
-          title={t("registerTask.title")}
+          title={t("accounts.status")}
           actions={job ? <Badge variant={statusTone(job.status)}>{t(STATUS_I18N_KEY[job.status])}</Badge> : undefined}
         >
           {job ? (

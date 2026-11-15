@@ -2,7 +2,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from grok_account_manager.core.network import build_browser_http_session
-from grok_account_manager.grok.client import fetch_complete_credential
+from grok_account_manager.providers.grok.client import fetch_complete_credential
 
 
 class GrokClientNetworkTests(unittest.TestCase):
@@ -28,7 +28,7 @@ class GrokClientNetworkTests(unittest.TestCase):
         }
         http_session._grok_browser_user_agent = "Mozilla/5.0 Test Chrome/146.0.0.0"
 
-        with patch("grok_account_manager.grok.client.requests.get") as legacy_get:
+        with patch("grok_account_manager.providers.grok.client.requests.get") as legacy_get:
             fetch_complete_credential(
                 email="registered@example.com",
                 sso_token="access-token",
@@ -48,7 +48,7 @@ class GrokClientNetworkTests(unittest.TestCase):
         response = Mock()
         response.json.return_value = {}
         with patch(
-            "grok_account_manager.grok.client.requests.get",
+            "grok_account_manager.providers.grok.client.requests.get",
             return_value=response,
         ) as legacy_get:
             fetch_complete_credential(

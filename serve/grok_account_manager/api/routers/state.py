@@ -6,7 +6,6 @@ from fastapi import APIRouter
 
 from ..services.accounts import list_accounts
 from ..services.jobs import JOB_MANAGER
-from ..services.relay import RELAY_MANAGER
 
 router = APIRouter(tags=["state"])
 
@@ -21,7 +20,6 @@ def get_state() -> dict:
     return {
         "job": JOB_MANAGER.snapshot(),
         "accounts": list_accounts(),
-        "relay": RELAY_MANAGER.snapshot(),
     }
 
 

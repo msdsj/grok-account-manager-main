@@ -10,15 +10,13 @@
 - [uv](https://docs.astral.sh/uv/)
 - Node.js `20+` 和 pnpm `11+`
 - Google Chrome 或 Chromium
-- 如果使用本地中转，再启动 Docker Desktop；网关源码已经包含在本仓库
 
 默认端口如下：
 
 | 服务 | 地址 | 用途 |
 | --- | --- | --- |
-| FastAPI 后端 | `http://127.0.0.1:43187` | API、构建后的前端和任务服务 |
+| FastAPI 后端 | `http://127.0.0.1:43187` | API、构建后的前端、任务服务与内置网关 |
 | Vite 前端 | `http://127.0.0.1:43188` | 开发时的热更新页面 |
-| Grok2API 中转 | `http://127.0.0.1:43871` | 可选的本地上游中转 |
 
 ## 2. 安装项目
 
@@ -129,23 +127,21 @@ uv run grok-account-manager grok --count 1 --sink json --oauth-exchange
 
 同一时间不要让 CLI 和控制台同时争用相同的邮箱池、浏览器或输出文件。
 
-## 7. 可选：本地网关中转
+## 7. 内置网关
 
-中转不是 CLI 注册的必需依赖。要使用控制台里的账号测试、模型、图片/视频和 OpenAI 兼容接口：
+注册完成后即可直接使用内置网关，不需要 Docker 或额外进程：
 
-1. 启动 Docker Desktop。
-2. 启动 FastAPI 后端。启动中转时会以 `ghcr.io/chenyme/grok2api:latest` 为默认候选，完成拉取、`RepoDigest` 解析和隔离探针后，才按通过验证的 digest 启动正式容器。
-3. 在控制台的“本地中转”页面检查状态、同步账号和查看模型。
+1. 启动 FastAPI 后端。
+2. 在控制台“密钥”页面创建客户端密钥（也可以先用本机直连模式）。
+3. 调用 `http://127.0.0.1:43187/v1/models`、`/v1/chat/completions`、`/v1/images/generations`、`/v1/videos/generations` 等接口。
 
-无需另外克隆或配置 grok2api 项目。候选不可用或不兼容时，程序会自动回退到仓库内置的 v3.1.4 镜像；也可通过 `GROK_ACCOUNT_MANAGER_GATEWAY_IMAGE` 指定版本 tag 或 digest。两种镜像都继续使用 `output/grok2api-v2-data/`，切换镜像不会改变数据目录。
-
-中转配置、管理员密钥和账号数据会写入 `output/`，不要提交或公开。当前默认账号数据库是 SQLite，不需要为了启动注册任务执行 `docker compose up`。
+Grok 账号的对话/图片/视频、GPT 账号的图片、Kiro 账号的对话都由同一条进程按模型目录路由；账号测试、模型路由和请求审计也在控制台内完成。上游超时可用 `GATEWAY_UPSTREAM_TIMEOUT` 调整。
 
 ## 8. 停止服务
 
 - 前端终端按 `Ctrl+C` 停止 Vite。
 - 后端终端按 `Ctrl+C` 停止 FastAPI；先在控制台停止正在运行的注册任务。
-- 不要直接杀掉不确定归属的浏览器或 Docker 容器进程。
+- 不要直接杀掉不确定归属的浏览器进程。
 
 ## 9. 快速检查
 
@@ -161,7 +157,7 @@ lsof -nP -iTCP:43187 -sTCP:LISTEN
 lsof -nP -iTCP:43188 -sTCP:LISTEN
 ```
 
-如果前端显示无法连接，先确认后端端口和 `VITE_DEV_API_TARGET` 一致，再查看 `output/grok2api-relay.log` 的最后几行。日志中可能包含敏感信息，不要整份上传。
+如果前端显示无法连接，先确认后端端口和 `VITE_DEV_API_TARGET` 一致，再访问 `http://127.0.0.1:43187/readyz` 查看数据库与前端状态。
 
 ## 10. 提交前安全检查
 

@@ -22,18 +22,19 @@ from ...core.proxy_pool import (
     mask_proxy_server,
     redact_proxy_secrets,
 )
-from ...grok.oauth_exchange import CloudflareBlockedError
+from ...providers.grok.oauth_exchange import CloudflareBlockedError
 from ...mail.sources import build_mailbox_source
-from ...providers.grok import GrokProvider
-from ...sinks.json_credential import JsonCredentialSink
+from ...providers.grok.registration import GrokProvider
+from ...providers.gpt.registration import ChatGPTProvider
 from ...sinks.sub2api import (
     build_sub2api_oauth_accounts,
     create_sub2api_accounts,
     load_sub2api_env_config,
 )
-from ...sinks.txt_file import TxtFileSink
-from ..config import (
-    CREDENTIALS_DIR,
+from . import accounts as account_service
+from ...core import audit
+from ...core import database as account_db
+from ...core.paths import (
     DEFAULT_PROXY_POOL_PATH,
     DEFAULT_MAX_CONCURRENCY,
     DEFAULT_MAX_OAUTH_CONCURRENCY,
@@ -43,12 +44,10 @@ from ..config import (
     REGISTRATION_ROUND_TIMEOUT_SECONDS,
     ROUND_PACING_MAX_SECONDS,
     ROUND_PACING_MIN_SECONDS,
-    TXT_OUTPUT,
     WORKER_START_STAGGER_MAX_SECONDS,
     WORKER_START_STAGGER_MIN_SECONDS,
 )
-from ..utils import json_default, now_ms, safe_int
-from .accounts import invalidate_accounts_cache
+from ...core.utils import json_default, now_ms, safe_int
 from .pending import OAUTH_PENDING, PERSISTENCE_FAILED, PendingResultStore
 from .registration_proxy_pool import load_saved_registration_proxies
 
@@ -251,6 +250,7 @@ class RegistrationJobManager:
         return self.start(
             total=1,
             concurrency=1,
+            provider=cfg.get("provider", "grok"),
             oauth_exchange=cfg.get("oauth_exchange", False),
             auto_import_sub2api=cfg.get("auto_import_sub2api", False),
             minimize_browsers=cfg.get("minimize_browsers", True),
@@ -259,7 +259,11 @@ class RegistrationJobManager:
             outlook_accounts_file=cfg.get("outlook_accounts_file", ""),
             google_data=cfg.get("google_data", ""),
             google_accounts_file=cfg.get("google_accounts_file", ""),
+            duck_mail_api_base=cfg.get("duck_mail_api_base", ""),
+            duck_mail_api_key=cfg.get("duck_mail_api_key", ""),
+            duck_mail_domain=cfg.get("duck_mail_domain", ""),
             cloud_mail_api_base=cfg.get("cloud_mail_api_base", ""),
+            cloud_mail_auth_mode=cfg.get("cloud_mail_auth_mode", ""),
             cloud_mail_public_token=cfg.get("cloud_mail_public_token", ""),
             cloud_mail_login_email=cfg.get("cloud_mail_login_email", ""),
             cloud_mail_login_password=cfg.get("cloud_mail_login_password", ""),
@@ -273,7 +277,8 @@ class RegistrationJobManager:
         self,
         total: int,
         concurrency: int,
-        oauth_exchange: bool,
+        provider: str = "grok",
+        oauth_exchange: bool = True,
         auto_import_sub2api: bool = False,
         minimize_browsers: bool = True,
         email_source: str = "duckmail",
@@ -281,7 +286,11 @@ class RegistrationJobManager:
         outlook_accounts_file: str = "",
         google_data: str = "",
         google_accounts_file: str = "",
+        duck_mail_api_base: str = "",
+        duck_mail_api_key: str = "",
+        duck_mail_domain: str = "",
         cloud_mail_api_base: str = "",
+        cloud_mail_auth_mode: str = "",
         cloud_mail_public_token: str = "",
         cloud_mail_login_email: str = "",
         cloud_mail_login_password: str = "",
@@ -306,17 +315,28 @@ class RegistrationJobManager:
         )
         concurrency = min(requested_concurrency, max_concurrency)
         concurrency = min(concurrency, total)
+        mail_source_kwargs = {
+            "email_source": email_source,
+            "outlook_data": outlook_data,
+            "outlook_file": outlook_accounts_file,
+            "google_data": google_data,
+            "google_file": google_accounts_file,
+            "cloud_mail_api_base": cloud_mail_api_base,
+            "cloud_mail_public_token": cloud_mail_public_token,
+            "cloud_mail_login_email": cloud_mail_login_email,
+            "cloud_mail_login_password": cloud_mail_login_password,
+            "cloud_mail_domains": cloud_mail_domains,
+        }
+        if duck_mail_api_base or duck_mail_api_key or duck_mail_domain:
+            mail_source_kwargs.update({
+                "duck_mail_api_base": duck_mail_api_base,
+                "duck_mail_api_key": duck_mail_api_key,
+                "duck_mail_domain": duck_mail_domain,
+            })
+        if cloud_mail_auth_mode:
+            mail_source_kwargs["cloud_mail_auth_mode"] = cloud_mail_auth_mode
         mail_source = build_mailbox_source(
-            email_source=email_source,
-            outlook_data=outlook_data,
-            outlook_file=outlook_accounts_file,
-            google_data=google_data,
-            google_file=google_accounts_file,
-            cloud_mail_api_base=cloud_mail_api_base,
-            cloud_mail_public_token=cloud_mail_public_token,
-            cloud_mail_login_email=cloud_mail_login_email,
-            cloud_mail_login_password=cloud_mail_login_password,
-            cloud_mail_domains=cloud_mail_domains,
+            **mail_source_kwargs,
         )
         proxy_pool, proxy_source = _build_proxy_pool(
             enabled=proxy_pool_enabled,
@@ -355,6 +375,7 @@ class RegistrationJobManager:
                 raise RuntimeError("已有注册任务正在运行")
 
             self._last_config = {
+                "provider": provider,
                 "oauth_exchange": bool(oauth_exchange),
                 "auto_import_sub2api": auto_import_sub2api,
                 "minimize_browsers": bool(minimize_browsers),
@@ -363,7 +384,11 @@ class RegistrationJobManager:
                 "outlook_accounts_file": outlook_accounts_file,
                 "google_data": google_data,
                 "google_accounts_file": google_accounts_file,
+                "duck_mail_api_base": duck_mail_api_base,
+                "duck_mail_api_key": duck_mail_api_key,
+                "duck_mail_domain": duck_mail_domain,
                 "cloud_mail_api_base": cloud_mail_api_base,
+                "cloud_mail_auth_mode": cloud_mail_auth_mode,
                 "cloud_mail_public_token": cloud_mail_public_token,
                 "cloud_mail_login_email": cloud_mail_login_email,
                 "cloud_mail_login_password": cloud_mail_login_password,
@@ -373,6 +398,7 @@ class RegistrationJobManager:
                 "proxy_file": proxy_file,
             }
             self._stop_event = threading.Event()
+            self._provider_name = provider
             self._mail_source = mail_source
             self._proxy_pool = proxy_pool
             self._sub2api_config = sub2api_config
@@ -382,6 +408,7 @@ class RegistrationJobManager:
             self._job = {
                 "id": uuid.uuid4().hex,
                 "status": "running",
+                "provider": provider,
                 "total": total,
                 "concurrency": concurrency,
                 "oauthExchange": bool(oauth_exchange),
@@ -435,6 +462,19 @@ class RegistrationJobManager:
                 "finishedAt": None,
                 "events": [],
             }
+            account_db.upsert_job_run(
+                self._job["id"],
+                provider=provider,
+                status="running",
+                total=total,
+                concurrency=concurrency,
+                config={
+                    "emailSource": email_source,
+                    "oauthExchange": bool(oauth_exchange),
+                    "autoImportSub2Api": auto_import_sub2api,
+                },
+                started_at=self._job["startedAt"],
+            )
             self._event_locked("info", f"任务启动：总数 {total}，并发 {concurrency}")
             if oauth_exchange:
                 self._event_locked(
@@ -495,6 +535,14 @@ class RegistrationJobManager:
             sessions_to_close: list[DrissionBrowserSession] = []
             if self._job and self._job.get("status") in {"running", "stopping"}:
                 self._job["status"] = "stopping"
+                account_db.upsert_job_run(
+                    str(self._job.get("id") or ""),
+                    provider=str(self._job.get("provider") or ""),
+                    status="stopping",
+                    total=int(self._job.get("total") or 0),
+                    concurrency=int(self._job.get("concurrency") or 0),
+                    started_at=int(self._job.get("startedAt") or 0),
+                )
                 self._event_locked("warning", "已请求停止，正在关闭所有浏览器进程")
                 self._stop_event.set()
                 sessions_to_close = list(self._sessions)
@@ -594,6 +642,14 @@ class RegistrationJobManager:
             }
         )
         del events[:-240]
+        audit.log_job_event(
+            str(self._job.get("id") or ""),
+            level,
+            message,
+            stage=str(extra.get("stage") or ""),
+            worker=int(extra.get("worker") or 0),
+            payload=extra,
+        )
 
     def _event(self, level: str, message: str, **extra) -> None:
         with self._lock:
@@ -681,6 +737,7 @@ class RegistrationJobManager:
         with self._lock:
             expected_job_id = str((self._job or {}).get("id") or "")
             oauth_required = bool((self._job or {}).get("oauthExchange"))
+            provider_name = str((self._job or {}).get("provider") or "grok")
         pending_id = self._pending_result_id(expected_job_id, round_index)
 
         def _callback(result: dict) -> None:
@@ -696,7 +753,7 @@ class RegistrationJobManager:
                     self._record_pending_result(
                         pending_id,
                         status=OAUTH_PENDING,
-                        provider_name="grok",
+                        provider_name=provider_name,
                         result=result,
                         write_txt=True,
                         oauth_required=True,
@@ -708,7 +765,7 @@ class RegistrationJobManager:
                     self._record_pending_result(
                         pending_id,
                         status=PERSISTENCE_FAILED,
-                        provider_name="grok",
+                        provider_name=provider_name,
                         result=result,
                         write_txt=True,
                         oauth_required=False,
@@ -718,12 +775,12 @@ class RegistrationJobManager:
                         error="等待正式持久化",
                     )
                     try:
-                        self._persist_result("grok", result)
+                        self._persist_result(provider_name, result)
                     except Exception as error:
                         self._record_pending_result(
                             pending_id,
                             status=PERSISTENCE_FAILED,
-                            provider_name="grok",
+                            provider_name=provider_name,
                             result=result,
                             write_txt=True,
                             oauth_required=False,
@@ -1004,15 +1061,23 @@ class RegistrationJobManager:
                 }
             )
             del failures[:-500]
+            audit.log_job_event(
+                str(self._job.get("id") or ""),
+                "error",
+                f"账号注册失败: {reason}",
+                stage=stage or "unknown",
+                worker=worker_index,
+                payload={
+                    "email": email or "unknown",
+                    "round": round_index,
+                    "timedOut": bool(timed_out),
+                },
+            )
 
     def _persist_result(self, provider_name: str, result: dict, *, write_txt: bool = True) -> None:
         with self._persist_lock:
-            json_sink = JsonCredentialSink(str(CREDENTIALS_DIR))
-            json_sink.push(provider_name, result)
-            json_sink.flush()
-            if write_txt:
-                TxtFileSink(TXT_OUTPUT).push(provider_name, result)
-            invalidate_accounts_cache()
+            account_service.persist_registration_result(provider_name, result)
+            account_service.invalidate_accounts_cache()
 
     def _persist_completed_result(
         self,
@@ -1214,17 +1279,30 @@ class RegistrationJobManager:
 
     def _create_provider(
         self,
+        provider_name: str,
         oauth_exchange: bool,
         stop_event,
         worker_index: int,
         round_index: int,
-    ) -> GrokProvider:
-        provider = GrokProvider()
-        provider.enable_oauth_exchange = oauth_exchange
+    ):
+        """创建 provider 实例（支持 grok、chatgpt）。"""
+        if provider_name == "chatgpt":
+            provider = ChatGPTProvider()
+        else:
+            provider = GrokProvider()
+            provider.enable_oauth_exchange = oauth_exchange
+            provider.oauth_semaphore = self._oauth_semaphore
+
         provider.stop_event = stop_event
         provider.mail_source = self._mail_source
-        provider.oauth_semaphore = self._oauth_semaphore
-        provider.browser_window_label = f"注册窗口 {worker_index} · 第 {round_index} 轮"
+        provider.browser_window_label = f"注册窗口 {worker_index} · 第 {round_index} 轮 · {provider_name.upper()}"
+
+        # 设置窗口索引和数量，用于并发时计算窗口位置
+        with self._lock:
+            window_count = len(self._job.get("workers", [])) if self._job else 1
+        provider.window_index = worker_index - 1  # window_index 从 0 开始
+        provider.window_count = window_count
+
         provider.result_callback = self._registration_checkpoint_callback(
             worker_index,
             round_index,
@@ -1466,6 +1544,7 @@ class RegistrationJobManager:
                     round_job_id = str((self._job or {}).get("id") or "")
                 pending_id = self._pending_result_id(round_job_id, round_index)
                 provider = self._create_provider(
+                    self._provider_name,
                     oauth_exchange,
                     CombinedStopEvent(self._stop_event, round_stop_event),
                     worker_index,
@@ -1902,6 +1981,15 @@ class RegistrationJobManager:
                 self._job["status"] = "completed"
                 self._event_locked("success", "任务已全部完成")
             self._job["finishedAt"] = now_ms()
+            account_db.upsert_job_run(
+                job_id,
+                provider=str(self._job.get("provider") or ""),
+                status=str(self._job.get("status") or "completed"),
+                total=int(self._job.get("total") or 0),
+                concurrency=int(self._job.get("concurrency") or 0),
+                started_at=int(self._job.get("startedAt") or 0),
+                finished_at=int(self._job.get("finishedAt") or 0),
+            )
             registered_this_round = int(self._job.get("registered") or 0)
             pacing_min, pacing_max = _timing_range(
                 "GROK_ACCOUNT_MANAGER_ROUND_PACING_MIN_SECONDS",

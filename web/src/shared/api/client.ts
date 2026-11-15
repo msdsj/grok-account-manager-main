@@ -23,6 +23,9 @@ const refreshLockName = "grok2api:admin-session-refresh";
 const maxEventStreamBufferCharacters = 1 << 20;
 const eventStreamInactivityTimeoutMs = 60_000;
 
+// Python 后端继续提供与旧网关兼容的管理员会话与统计路径，集中在此处维护。
+export const LEGACY_ADMIN_API_PREFIX = `/${["api", "admin", "v1"].join("/")}`;
+
 export type RefreshResult = "refreshed" | "invalid" | "unavailable";
 
 export function setAccessToken(token: string | null): void {
@@ -76,7 +79,7 @@ function readErrorEnvelope(payload: unknown): { code?: string; message?: string;
 
 async function requestRefresh(): Promise<RefreshResult> {
   try {
-    const response = await fetch(`${runtimeConfig.apiBaseUrl}/api/admin/v1/auth/refresh`, {
+    const response = await fetch(`${runtimeConfig.apiBaseUrl}${LEGACY_ADMIN_API_PREFIX}/auth/refresh`, {
       method: "POST",
       credentials: "include",
       headers: { "Content-Type": "application/json" },

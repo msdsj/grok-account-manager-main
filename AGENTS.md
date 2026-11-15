@@ -4,16 +4,22 @@
 
 This repository contains the MSDSJ `grok-account-manager` Python automation
 package with a React control panel. Python backend source lives in
-`serve/grok_account_manager/`: `cli.py` is the CLI entry, `api/` contains the
-FastAPI backend, `providers/` contains registration flows such as `grok.py`, and
-`sinks/` contains output targets such as TXT, JSON credentials, and Sub2API. The
-React app lives in `web/src/`, with Vite configuration in `web/vite.config.ts`.
+`serve/grok_account_manager/` with four layers: `api/` (FastAPI routers and
+application services), `core/` (database, audit, browser, paths), `gateway/`
+(shared model catalog/pool/auth/audit), and `providers/{grok,gpt,kiro}/` (each
+business board owns registration, models, and its gateway adapter). `sinks/`
+contains output targets such as TXT, JSON credentials, and Sub2API. The React
+app lives in `web/src/`, with Vite configuration in `web/vite.config.ts`.
 Browser patch assets are in `extensions/turnstile_patch/`. Runtime output is
 written under `output/` and should not be treated as source.
 
 ## Build, Test, and Development Commands
 
 - `uv sync`: install Python dependencies from `pyproject.toml` and `uv.lock`.
+- `./scripts/start.sh`: one-command startup (deps, frontend build, FastAPI).
+- `./scripts/update.sh`: pull code, sync dependencies, rebuild frontend.
+- `./scripts/verify.sh`: compile checks, full test suite, frontend build, and
+  startup smoke checks against `/healthz`, `/readyz`, `/v1/models`.
 - `uv run grok-account-manager grok --count 1 --sink json+txt`: run one local
   registration round and write JSON plus TXT outputs.
 - `uv run grok-account-manager-api`: start the FastAPI backend on
@@ -26,18 +32,19 @@ written under `output/` and should not be treated as source.
 
 Use Python 3.12 or 3.13; the project explicitly excludes 3.14. Follow existing
 Python style: 4-space indentation, type hints for public interfaces, small
-provider/sink classes, and clear snake_case names. Keep provider modules named
-after their platform, for example `providers/grok.py`. Frontend code uses
-strict TypeScript, React function components, PascalCase component names, and
-camelCase state/helpers. Keep UI text consistent with the existing Chinese
-interface.
+provider/sink classes, and clear snake_case names. Keep provider modules inside
+their business board, for example `providers/grok/registration.py` and
+`providers/kiro/gateway/adapter.py`. Frontend code uses strict TypeScript, React
+function components, PascalCase component names, and camelCase state/helpers.
+Keep UI text consistent with the existing Chinese interface.
 
 ## Testing Guidelines
 
-No dedicated test suite is currently present. Before submitting backend
-changes, at minimum run `uv run python -m compileall serve tests`. For frontend changes,
-run `cd web && npm run build`. If adding tests, place Python tests under
-`tests/` mirroring `serve/grok_account_manager/`, and name files `test_<module>.py`.
+Place Python tests under `tests/` mirroring `serve/grok_account_manager/`, and
+name files `test_<module>.py`. Before submitting backend changes run
+`uv run python -m unittest discover -s tests`; for frontend changes run
+`cd web && npm run build`. Gateway adapters have offline integration tests with
+mock upstream servers in `tests/test_gateway_integration.py`.
 
 ## Commit & Pull Request Guidelines
 

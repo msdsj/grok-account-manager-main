@@ -55,7 +55,9 @@ class NetworkContextTests(unittest.TestCase):
         session = build_browser_http_session(object())
         try:
             self.assertEqual(session.proxies, {})
-            self.assertFalse(session.trust_env)
+            # 没有显式 per-round 代理时保留 trust_env，才能走系统代理
+            # （手动 xAI OAuth 依赖同一条出口）。只有显式传代理时才关掉。
+            self.assertTrue(session.trust_env)
             self.assertEqual(session._grok_browser_user_agent, "")
         finally:
             session.close()

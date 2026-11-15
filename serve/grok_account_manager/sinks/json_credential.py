@@ -10,12 +10,13 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
-from ..grok.client import build_cockpit_grok_credential
+from ..providers.grok.client import build_cockpit_grok_credential
 
 if TYPE_CHECKING:
     from ..providers.base import RegistrationResult
 
 CREDENTIALS_FILENAME = "grok_credentials.json"
+CHATGPT_CREDENTIALS_FILENAME = "chatgpt_credentials.json"
 
 
 def _normalized_email(credential: dict) -> str:
@@ -141,19 +142,34 @@ class JsonCredentialSink:
 
     def push(self, provider_name: str, result: RegistrationResult) -> None:
         oauth_status = str(result.get("oauth_status") or "not_requested")
+        normalized = provider_name.strip().lower()
+
         if oauth_status in {"pending", "failed"}:
             raise ValueError("refresh_token 尚未成功获取，拒绝写入 JSON 凭证")
+
         if "full_credential" in result:
             credential = dict(result["full_credential"])
+        elif normalized == "chatgpt":
+            # ChatGPT 凭证格式 - 只保留必要字段
+            session_data = result.get("profile", {}).get("session_data", {})
+            credential = {
+                "email": result["email"],
+                "accessToken": session_data.get("accessToken") or result["credential"],
+                "provider": "chatgpt",
+            }
         else:
+            # Grok 凭证格式
             credential = build_cockpit_grok_credential(
                 email=result["email"],
                 access_token=result["credential"],
                 profile=result.get("profile"),
             )
             credential["sso_token"] = result["credential"]
-        if oauth_status == "ready" and not str(credential.get("refresh_token") or "").strip():
+
+        # 只对 Grok 检查 refresh_token
+        if provider_name.lower() == "grok" and oauth_status == "ready" and not str(credential.get("refresh_token") or "").strip():
             raise ValueError("OAuth 状态为 ready，但完整凭证缺少 refresh_token")
+
         credential["oauth_exchange_status"] = oauth_status
         credential["oauth_exchange_error"] = result.get("oauth_error") or credential.get("oauth_exchange_error") or None
         credential["credential_enrichment_error"] = (
@@ -161,13 +177,39 @@ class JsonCredentialSink:
             or credential.get("credential_enrichment_error")
             or None
         )
+
+        # 保存 provider_name 用于 flush 时区分
+        credential["_provider_name"] = provider_name.lower()
         self._pending.append(credential)
 
     def flush(self) -> None:
         if not self._pending:
             return
-        filepath = self.output_dir / CREDENTIALS_FILENAME
-        pending = list(self._pending)
+
+        # 按 provider 分组
+        grok_credentials = []
+        chatgpt_credentials = []
+
+        for credential in self._pending:
+            provider = credential.pop("_provider_name", "grok")  # 移除临时字段
+            if provider == "chatgpt":
+                chatgpt_credentials.append(credential)
+            else:
+                grok_credentials.append(credential)
+
+        # 保存 Grok 凭证
+        if grok_credentials:
+            self._flush_to_file(CREDENTIALS_FILENAME, grok_credentials)
+
+        # 保存 ChatGPT 凭证
+        if chatgpt_credentials:
+            self._flush_to_file(CHATGPT_CREDENTIALS_FILENAME, chatgpt_credentials)
+
+        self._pending.clear()
+
+    def _flush_to_file(self, filename: str, pending: list[dict]) -> None:
+        """将凭证保存到指定文件"""
+        filepath = self.output_dir / filename
         try:
             existing = _load_existing_credentials(filepath)
             persisted: dict[int, dict] = {}
@@ -193,12 +235,10 @@ class JsonCredentialSink:
         except Exception as e:
             print(f"[JsonCredentialSink] 保存凭证失败: {e}")
             raise
-        finally:
-            self._pending.clear()
 
     def _persist_pending_to_database(self, filepath: Path, persisted: list[tuple[int, dict]]) -> None:
         try:
-            from ..api.services import database as account_db
+            from ..core import database as account_db
             from ..api.services.accounts import account_from_credential
 
             for item_index, credential in persisted:

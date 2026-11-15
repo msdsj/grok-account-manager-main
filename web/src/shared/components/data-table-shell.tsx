@@ -11,15 +11,15 @@ type DataTableShellProps = {
 
 export function DataTableShell({ toolbar, children, footer, className }: DataTableShellProps) {
   return (
-    <section className={cn("flex min-w-0 flex-col gap-4", className)}>
-      <div className="flex min-h-12 flex-wrap items-center justify-between gap-3 py-2">
+    <section className={cn("flex min-w-0 flex-col gap-3", className)}>
+      <div className="flex min-h-10 flex-wrap items-center justify-between gap-3">
         {toolbar}
       </div>
-      <div className="min-w-0">
+      <div className="min-w-0 overflow-hidden rounded-xl border border-border/80 bg-card shadow-[var(--shadow-card)]">
         {children}
       </div>
       {footer ? (
-        <div className="flex min-h-12 items-center py-2">
+        <div className="flex min-h-10 items-center">
           {footer}
         </div>
       ) : null}

@@ -46,6 +46,15 @@ def _command_path_argument(arguments: list[str], name: str) -> str:
     return ""
 
 
+def _options_language(options) -> str:
+    """从 ChromiumOptions 的启动参数里取出 ``--lang``，用于让指纹语言与页面语言一致。"""
+    try:
+        arguments = list(getattr(options, "arguments", None) or [])
+    except Exception:
+        return ""
+    return _command_path_argument(arguments, "--lang")
+
+
 def _validate_browser_isolation(
     *,
     profile_dir: Path,
@@ -244,8 +253,19 @@ def warn_runtime_compatibility():
         print("[提示] 当前 Python 为 3.14+；若出现 Mail.tm TLS 异常，建议改用 Python 3.12 或 3.13。")
 
 
+_CHROME_PATH_CACHE: str | None = None
+_CHROME_PATH_RESOLVED = False
+
+
 def _find_chrome_path() -> str | None:
-    """跨平台检测 Chrome 浏览器路径。"""
+    """跨平台检测 Chrome 浏览器路径。
+
+    每轮注册都会重建 options，这里缓存结果，避免对同一批路径反复 stat。
+    """
+    global _CHROME_PATH_CACHE, _CHROME_PATH_RESOLVED
+    if _CHROME_PATH_RESOLVED:
+        return _CHROME_PATH_CACHE
+
     if sys.platform == "darwin":  # macOS
         candidates = [
             "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -266,10 +286,10 @@ def _find_chrome_path() -> str | None:
             "/snap/bin/chromium",
         ]
 
-    for path in candidates:
-        if path and os.path.isfile(path):
-            return path
-    return None
+    found = next((path for path in candidates if path and os.path.isfile(path)), None)
+    _CHROME_PATH_CACHE = found
+    _CHROME_PATH_RESOLVED = True
+    return found
 
 
 def _screen_bounds() -> tuple[int, int, int, int]:
@@ -319,18 +339,30 @@ def calculate_window_bounds(
     window_count: int = 1,
     screen_bounds: tuple[int, int, int, int] | None = None,
 ) -> tuple[int, int, int, int]:
-    """Return a visible slot on the main display for up to six concurrent windows."""
+    """Return a visible slot on the main display for up to six concurrent windows.
+
+    超过六个并发窗口时，多出来的窗口会落到同一格上。此时按「圈数」做少量级联
+    偏移，避免多个窗口像素级完全重叠——完全重叠的窗口在 macOS 上会让同一块屏幕
+    区域反复重绘，看起来就是"窗口在抖/发卡"。
+    """
     screen_x, screen_y, screen_width, screen_height = screen_bounds or _screen_bounds()
     visible_count = max(1, min(6, int(window_count or 1)))
     columns = min(3, visible_count)
     rows = 1 if visible_count <= 3 else 2
-    slot = max(0, int(window_index)) % (columns * rows)
+    per_cycle = columns * rows
+    index = max(0, int(window_index))
+    slot = index % per_cycle
+    cycle = index // per_cycle
     column = slot % columns
     row = slot // columns
     slot_width = max(480, screen_width // columns)
     slot_height = max(360, screen_height // rows)
-    left = screen_x + column * slot_width
-    top = screen_y + row * slot_height
+    cascade = (cycle % 8) * 24
+    left = screen_x + column * slot_width + cascade
+    top = screen_y + row * slot_height + cascade
+    # 夹回屏幕内，保证窗口始终落在主显示器上。
+    left = min(left, screen_x + screen_width - 1)
+    top = min(top, screen_y + screen_height - 1)
     width = min(slot_width, screen_x + screen_width - left)
     height = min(slot_height, screen_y + screen_height - top)
     return left, top, width, height
@@ -409,6 +441,16 @@ def build_chromium_options(
         "--disable-default-apps",
         "--disable-sync",
         "--metrics-recording-only",
+        # 注册窗口通常被最小化或被其他窗口遮挡。Chrome 默认会把这些窗口的
+        # 定时器降频、把渲染进程降级为后台优先级，导致页面里的风控组件
+        # （Turnstile / React）跑得明显变慢、点击像"点不动"。以下开关让
+        # 每个注册窗口都保持前台优先级，多开时也稳定。
+        "--disable-background-timer-throttling",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-renderer-backgrounding",
+        "--disable-ipc-flooding-protection",
+        "--disable-hang-monitor",
+        "--no-pings",
         f"--disable-features={','.join(disabled_features)}",
     ]:
         co.set_argument(argument)
@@ -417,6 +459,10 @@ def build_chromium_options(
         # command line stay in sync. Authentication support remains governed
         # by Chromium/DrissionPage; the pool only validates the endpoint.
         co.set_proxy(normalized_proxy)
+        # 走代理时最容易暴露身份的就是 WebRTC：它可能绕过代理用真实网卡发 STUN，
+        # 把本机真实公网 IP 泄露给页面（风控拿到就是直接判定关联）。
+        # 只允许走代理的 UDP，禁止直连 UDP。
+        co.set_argument("--force-webrtc-ip-handling-policy=disable_non_proxied_udp")
     co._grok_proxy_server = normalized_proxy
     # Accept-Language 给一份带后备的列表，避免某些页面对 navigator.language 单值过敏
     accept_languages = f"{lang},{lang.split('-')[0]};q=0.9,en;q=0.8"
@@ -459,6 +505,9 @@ class DrissionBrowserSession:
         self._profile_dir: Path | None = None
         self._cache_dir: Path | None = None
         self._fingerprint_ext_dir: Path | None = None
+        # 本轮指纹脚本与它在 CDP 里的注册 id（见 _inject_fingerprint）。
+        self._fingerprint_script: str = ""
+        self._fingerprint_script_id: str = ""
         self._profile_claimed = False
         self._cache_claimed = False
         self.identity: fingerprint_mod.BrowserIdentity | None = None
@@ -512,30 +561,45 @@ class DrissionBrowserSession:
             raise
 
     def _prepare_fresh_fingerprint(self) -> None:
-        """每轮生成一套新的随机浏览器指纹身份，用同名扩展重新加载给 Chromium。"""
+        """每轮生成一套新的随机指纹身份。
+
+        ⚠️ 这里不再依赖浏览器扩展注入指纹。原因：Chrome 137+ 已停用
+        ``--load-extension``，而 DrissionPage 的 ``add_extension()`` 也只是把路径
+        记进内部列表、并不会写进 Chrome 启动参数（实测扩展完全不加载，指纹长期
+        处于失效状态）。改为在浏览器起来后用 CDP 的
+        ``Page.addScriptToEvaluateOnNewDocument`` 注入：它在任何页面脚本之前、
+        在主世界里执行，并且对 iframe 同样生效。
+        """
         if self._fingerprint_ext_dir is not None:
             shutil.rmtree(self._fingerprint_ext_dir, ignore_errors=True)
             self._fingerprint_ext_dir = None
-        self.identity = fingerprint_mod.random_identity()
+        self.identity = fingerprint_mod.random_identity(lang=_options_language(self._options))
+        self._fingerprint_script = fingerprint_mod.build_fingerprint_script(self.identity)
+        # turnstile_patch 仍按老方式挂着（当前 Chrome 版本下不会生效，保留兼容）。
         try:
-            ext_dir = Path(tempfile.mkdtemp(prefix="grok-chrome-fp-"))
-            self._fingerprint_ext_dir = ext_dir
-            ext_dir.chmod(0o700)
-            for filename, content in fingerprint_mod.build_fingerprint_extension_files(self.identity).items():
-                (ext_dir / filename).write_text(content, encoding="utf-8")
             self._options.remove_extensions()
             self._options.add_extension(TURNSTILE_EXTENSION_PATH)
-            self._options.add_extension(str(ext_dir))
         except Exception:
-            if self._fingerprint_ext_dir is not None:
-                _remove_temp_tree(self._fingerprint_ext_dir)
-                self._fingerprint_ext_dir = None
-            raise
+            pass
         print(
             f"[*] 已生成本轮浏览器指纹: id={self.identity.canvas_seed:08x}, "
             f"gpu={self.identity.gpu_renderer}, "
-            f"cpu={self.identity.hardware_concurrency}核, mem={self.identity.device_memory}GB"
+            f"cpu={self.identity.hardware_concurrency}核, mem={self.identity.device_memory}GB, "
+            f"lang={self.identity.languages[0]}"
         )
+
+    def _inject_fingerprint(self) -> None:
+        """把本轮指纹脚本注册到页面，保证在每个新文档创建前执行。"""
+        script = str(getattr(self, "_fingerprint_script", "") or "")
+        page = getattr(self, "_page", None)
+        if not script or page is None:
+            return
+        try:
+            result = page.run_cdp("Page.addScriptToEvaluateOnNewDocument", source=script)
+        except Exception as error:
+            print(f"[!] 注入浏览器指纹失败: {error}")
+            return
+        self._fingerprint_script_id = str((result or {}).get("identifier") or "")
 
     def _cleanup_profile(self) -> None:
         paths = tuple(
@@ -656,9 +720,11 @@ class DrissionBrowserSession:
         if self._browser is not None:
             raise RuntimeError("浏览器会话已启动，拒绝复用时再次初始化环境")
         self._closed_intentionally = False
-        # set_user_data_path() disables DrissionPage's auto_port flag. Allocate
-        # and bind each browser serially so concurrent workers cannot all fall
-        # back to the default 9222 endpoint and attach to one Chrome instance.
+        # 全局锁只保护「分配进程级独占资源」这一步：临时 Profile/缓存目录、
+        # 指纹扩展目录、调试端口都是跨 Worker 共享的进程级资源，必须串行分配，
+        # 否则并发 Worker 会退回到同一个 9222 端点并附着到同一个 Chrome 实例。
+        # 真正耗时的 Chrome 启动（1-3 秒）与隔离校验放到锁外，让各 Worker 的
+        # 浏览器并行拉起，避免 N 个 Worker 排队等同一个 Chrome 启动完成。
         with _BROWSER_START_LOCK:
             self._prepare_fresh_profile()
             self._prepare_fresh_fingerprint()
@@ -666,15 +732,17 @@ class DrissionBrowserSession:
                 raise RuntimeError("任务已停止：取消浏览器启动")
             debug_port = self._claim_debug_port()
             self._options.set_local_port(debug_port)
-            print(f"[*] 已为浏览器分配独立调试端口: {debug_port}")
-            self._browser = Chromium(self._options)
-            self._verify_isolation()
-            if self._stop_requested:
-                raise RuntimeError("任务已停止：浏览器启动后立即关闭")
-            tabs = self._browser.get_tabs()
-            # DrissionPage 的 /json tab 列表把最新 tab 放在第 0 位。
-            self._page = tabs[0] if tabs else self._browser.new_tab()
-            self._capture_browser_context()
+        print(f"[*] 已为浏览器分配独立调试端口: {debug_port}")
+        self._browser = Chromium(self._options)
+        self._verify_isolation()
+        if self._stop_requested:
+            raise RuntimeError("任务已停止：浏览器启动后立即关闭")
+        tabs = self._browser.get_tabs()
+        # DrissionPage 的 /json tab 列表把最新 tab 放在第 0 位。
+        self._page = tabs[0] if tabs else self._browser.new_tab()
+        self._capture_browser_context()
+        # 必须在第一次导航之前注册，否则首个文档拿不到指纹。
+        self._inject_fingerprint()
         self._apply_window_bounds()
         return self
 

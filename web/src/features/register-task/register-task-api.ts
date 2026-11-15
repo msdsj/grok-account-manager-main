@@ -23,6 +23,7 @@ export interface JobEvent {
 export interface RegistrationJob {
   id: string;
   status: JobStatus;
+  provider: string;
   total: number;
   concurrency: number;
   oauthExchange: boolean;
@@ -49,6 +50,7 @@ export interface RegistrationJob {
 export interface StartRegistrationInput {
   total: number;
   concurrency: number;
+  provider: string;
   oauthExchange: boolean;
   autoImportSub2Api: boolean;
   minimizeBrowsers: boolean;
@@ -57,13 +59,43 @@ export interface StartRegistrationInput {
   outlookAccountsFile?: string;
   googleData?: string;
   googleAccountsFile?: string;
+  duckMailApiBase?: string;
+  duckMailApiKey?: string;
+  duckMailDomain?: string;
   cloudMailApiBase?: string;
+  cloudMailAuthMode?: "public" | "login";
   cloudMailPublicToken?: string;
   cloudMailLoginEmail?: string;
   cloudMailLoginPassword?: string;
   cloudMailDomains?: string;
   proxyPoolEnabled?: boolean;
   proxyFile?: string;
+}
+
+export interface MailConfig {
+  emailSource: EmailSource;
+  duckMailApiBase: string;
+  duckMailDomain: string;
+  duckMailApiKeyConfigured: boolean;
+  cloudMailApiBase: string;
+  cloudMailDomains: string;
+  cloudMailAuthMode: "public" | "login";
+  cloudMailPublicTokenConfigured: boolean;
+  cloudMailLoginEmail: string;
+  cloudMailLoginPasswordConfigured: boolean;
+}
+
+export interface SaveMailConfigInput {
+  emailSource: EmailSource;
+  duckMailApiBase: string;
+  duckMailApiKey?: string;
+  duckMailDomain: string;
+  cloudMailApiBase: string;
+  cloudMailDomains: string;
+  cloudMailAuthMode: "public" | "login";
+  cloudMailPublicToken?: string;
+  cloudMailLoginEmail: string;
+  cloudMailLoginPassword?: string;
 }
 
 export interface OutlookMailboxPool {
@@ -116,10 +148,14 @@ export async function retryRegistration(): Promise<RegistrationJob> {
   return result.job;
 }
 
-export async function syncAccountsToPool(): Promise<{ requested: number }> {
-  return api<{ requested: number }>("/api/relay/sync-accounts", {
-    method: "POST",
-    body: JSON.stringify({ exportKeys: [] }),
+export function getMailConfig(): Promise<MailConfig> {
+  return api<MailConfig>("/api/register/mail-config");
+}
+
+export function saveMailConfig(input: SaveMailConfigInput): Promise<MailConfig> {
+  return api<MailConfig>("/api/register/mail-config", {
+    method: "PUT",
+    body: JSON.stringify(input),
   });
 }
 

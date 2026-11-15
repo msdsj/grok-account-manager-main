@@ -47,7 +47,7 @@ function PageSizeSelector({ pageSize, disabled = false, onChange }: { pageSize: 
     <div className="flex items-center gap-2 text-xs text-muted-foreground">
       <span>{t("common.perPage")}</span>
       <Select value={String(pageSize)} disabled={disabled} onValueChange={(value) => onChange(Number(value))}>
-        <SelectTrigger className="h-8 w-[76px] rounded-md bg-secondary px-3 text-xs shadow-none" aria-label={t("common.perPage")}><SelectValue /></SelectTrigger>
+        <SelectTrigger className="h-9 w-[76px] rounded-lg bg-secondary px-3 text-xs shadow-none" aria-label={t("common.perPage")}><SelectValue /></SelectTrigger>
         <SelectContent align="end">
           {PAGE_SIZE_OPTIONS.map((value) => <SelectItem key={value} value={String(value)}>{value}</SelectItem>)}
         </SelectContent>

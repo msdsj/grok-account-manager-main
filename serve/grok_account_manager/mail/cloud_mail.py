@@ -471,16 +471,22 @@ class CloudMailMailbox:
         for item in candidates:
             email_id = _integer(item.get("emailId") or item.get("id"))
             highest_seen = max(highest_seen, email_id)
+
+            subject = str(item.get("subject") or "")
+            sender = str(item.get("sendEmail") or item.get("sendName") or item.get("from") or "")
             explicit_code = str(item.get("code") or "").strip()
+            text = str(item.get("text") or item.get("textContent") or item.get("body") or "")
+            html_text = str(item.get("content") or item.get("html") or item.get("htmlContent") or "")
+
             text_parts = [
                 f"Verification code: {explicit_code}" if explicit_code else "",
-                str(item.get("text") or item.get("textContent") or item.get("body") or ""),
+                text,
             ]
             code = extract_verification_code(
-                subject=str(item.get("subject") or ""),
+                subject=subject,
                 text="\n".join(part for part in text_parts if part),
-                html_text=str(item.get("content") or item.get("html") or item.get("htmlContent") or ""),
-                sender=str(item.get("sendEmail") or item.get("sendName") or item.get("from") or ""),
+                html_text=html_text,
+                sender=sender,
             )
             if code:
                 self._last_email_id = highest_seen

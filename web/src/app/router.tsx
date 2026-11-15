@@ -1,7 +1,7 @@
 import { Navigate, createBrowserRouter } from "react-router-dom";
 
 import { AnonymousBoundary, AuthBoundary } from "@/app/auth-boundary";
-import { DeferredAccountsPage, DeferredApiDocsPage, DeferredAppShell, DeferredClientKeysPage, DeferredCreativeConsolePage, DeferredDashboardPage, DeferredGalleryPage, DeferredModelsPage, DeferredQualityGuardPage, DeferredRegisterTaskPage, DeferredRequestAuditsPage, DeferredSettingsPage, DeferredVideoGalleryPage } from "@/app/deferred-pages";
+import { DeferredApiDocsPage, DeferredAppShell, DeferredClientKeysPage, DeferredCreativeConsolePage, DeferredDashboardPage, DeferredManagedAccountsPage, DeferredModelsPage, DeferredOperationLogsPage, DeferredRegisterTaskPage, DeferredRequestAuditsPage, DeferredSettingsPage } from "@/app/deferred-pages";
 import { LoginPage } from "@/features/auth/login-page";
 
 export const router = createBrowserRouter([
@@ -18,14 +18,13 @@ export const router = createBrowserRouter([
           { index: true, element: <Navigate to="/dashboard" replace /> },
           { path: "/dashboard", element: <DeferredDashboardPage /> },
           { path: "/register", element: <DeferredRegisterTaskPage /> },
-          { path: "/accounts", element: <DeferredAccountsPage /> },
+          { path: "/accounts", element: <Navigate to="/managed-accounts" replace /> },
+          { path: "/managed-accounts", element: <DeferredManagedAccountsPage /> },
+          { path: "/operation-logs", element: <DeferredOperationLogsPage /> },
           { path: "/models", element: <DeferredModelsPage /> },
           { path: "/creative-console", element: <DeferredCreativeConsolePage /> },
           { path: "/client-keys", element: <DeferredClientKeysPage /> },
-          { path: "/gallery", element: <DeferredGalleryPage /> },
-          { path: "/video-gallery", element: <DeferredVideoGalleryPage /> },
           { path: "/request-audits", element: <DeferredRequestAuditsPage /> },
-          { path: "/quality-guard", element: <DeferredQualityGuardPage /> },
           { path: "/docs", element: <Navigate to="/docs/chat/completions" replace /> },
           { path: "/docs/:category/:endpoint", element: <DeferredApiDocsPage /> },
           { path: "/settings", element: <DeferredSettingsPage /> },

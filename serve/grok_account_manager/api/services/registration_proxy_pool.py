@@ -9,7 +9,7 @@ import threading
 from pathlib import Path
 
 from ...core.proxy_pool import ProxyPoolError, mask_proxy_server, parse_proxy_lines
-from ..config import REGISTRATION_PROXY_POOL_PATH
+from ...core.paths import REGISTRATION_PROXY_POOL_PATH
 
 _MAX_POOL_BYTES = 1_000_000
 _MAX_POOL_ENTRIES = 20_000

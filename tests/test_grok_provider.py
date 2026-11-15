@@ -2,8 +2,8 @@ import threading
 import unittest
 from unittest.mock import Mock, patch
 
-from grok_account_manager.grok.oauth_exchange import CloudflareBlockedError, OAuthTerminalError
-from grok_account_manager.providers.grok import (
+from grok_account_manager.providers.grok.oauth_exchange import CloudflareBlockedError, OAuthTerminalError
+from grok_account_manager.providers.grok.registration import (
     BrowserStepRetryRequested,
     GrokProvider,
     _dismiss_cookie_banner,
@@ -232,10 +232,10 @@ class GrokProviderTests(unittest.TestCase):
         session = _OtpSession()
         with (
             patch(
-                "grok_account_manager.providers.grok._wait_for_profile_after_code",
+                "grok_account_manager.providers.grok.registration._wait_for_profile_after_code",
                 return_value=False,
             ),
-            patch("grok_account_manager.providers.grok.time.sleep"),
+            patch("grok_account_manager.providers.grok.registration.time.sleep"),
         ):
             with self.assertRaisesRegex(RuntimeError, "未进入最终注册页"):
                 _fill_code_and_submit(
@@ -247,7 +247,7 @@ class GrokProviderTests(unittest.TestCase):
 
     def test_turnstile_click_survives_coordinate_patch_failure(self) -> None:
         page = _TurnstilePage()
-        with patch("grok_account_manager.providers.grok.time.sleep"):
+        with patch("grok_account_manager.providers.grok.registration.time.sleep"):
             token = _get_turnstile_token(page)
 
         self.assertTrue(page.clicked)
@@ -257,11 +257,11 @@ class GrokProviderTests(unittest.TestCase):
         session = _ProfileSession()
         with (
             patch(
-                "grok_account_manager.providers.grok.wait_for_cookie",
+                "grok_account_manager.providers.grok.registration.wait_for_cookie",
                 side_effect=[RuntimeError("not ready"), "browser-sso"],
             ) as wait_cookie,
             patch(
-                "grok_account_manager.providers.grok._resubmit_final_profile",
+                "grok_account_manager.providers.grok.registration._resubmit_final_profile",
                 return_value=True,
             ) as resubmit,
         ):
@@ -283,7 +283,7 @@ class GrokProviderTests(unittest.TestCase):
     def test_profile_resubmit_dismisses_cookie_banner_first(self) -> None:
         page = _ProfilePage()
         with patch(
-            "grok_account_manager.providers.grok._dismiss_cookie_banner",
+            "grok_account_manager.providers.grok.registration._dismiss_cookie_banner",
             return_value=True,
         ) as dismiss:
             self.assertTrue(_resubmit_final_profile(page))
@@ -312,7 +312,7 @@ class GrokProviderTests(unittest.TestCase):
         page = _OverlayPage()
 
         with patch(
-            "grok_account_manager.providers.grok._consume_browser_step_action",
+            "grok_account_manager.providers.grok.registration._consume_browser_step_action",
             return_value="retry",
         ):
             with self.assertRaises(BrowserStepRetryRequested):
@@ -339,23 +339,23 @@ class GrokProviderTests(unittest.TestCase):
         provider.result_callback = checkpoints.append
 
         with (
-            patch("grok_account_manager.providers.grok._click_email_signup_button"),
+            patch("grok_account_manager.providers.grok.registration._click_email_signup_button"),
             patch(
-                "grok_account_manager.providers.grok._fill_email_and_submit",
+                "grok_account_manager.providers.grok.registration._fill_email_and_submit",
                 return_value="registered@example.com",
             ),
-            patch("grok_account_manager.providers.grok._fill_code_and_submit"),
+            patch("grok_account_manager.providers.grok.registration._fill_code_and_submit"),
             patch(
-                "grok_account_manager.providers.grok._fill_profile_and_submit",
+                "grok_account_manager.providers.grok.registration._fill_profile_and_submit",
                 return_value={"first_name": "Test", "last_name": "User", "password": "secret"},
             ),
-            patch("grok_account_manager.providers.grok.wait_for_cookie", return_value="browser-sso"),
+            patch("grok_account_manager.providers.grok.registration.wait_for_cookie", return_value="browser-sso"),
             patch(
-                "grok_account_manager.providers.grok.exchange_sso_for_oauth_tokens",
+                "grok_account_manager.providers.grok.registration.exchange_sso_for_oauth_tokens",
                 side_effect=RuntimeError("rate limited"),
             ) as exchange,
             patch(
-                "grok_account_manager.providers.grok.fetch_complete_credential",
+                "grok_account_manager.providers.grok.registration.fetch_complete_credential",
                 return_value={
                     "id": "account-id",
                     "email": "registered@example.com",
@@ -381,27 +381,27 @@ class GrokProviderTests(unittest.TestCase):
         http_session = Mock()
 
         with (
-            patch("grok_account_manager.providers.grok._click_email_signup_button"),
+            patch("grok_account_manager.providers.grok.registration._click_email_signup_button"),
             patch(
-                "grok_account_manager.providers.grok._fill_email_and_submit",
+                "grok_account_manager.providers.grok.registration._fill_email_and_submit",
                 return_value="registered@example.com",
             ),
-            patch("grok_account_manager.providers.grok._fill_code_and_submit"),
+            patch("grok_account_manager.providers.grok.registration._fill_code_and_submit"),
             patch(
-                "grok_account_manager.providers.grok._fill_profile_and_submit",
+                "grok_account_manager.providers.grok.registration._fill_profile_and_submit",
                 return_value={"first_name": "Test", "last_name": "User", "password": "secret"},
             ),
-            patch("grok_account_manager.providers.grok.wait_for_cookie", return_value="browser-sso"),
+            patch("grok_account_manager.providers.grok.registration.wait_for_cookie", return_value="browser-sso"),
             patch(
-                "grok_account_manager.providers.grok.build_browser_http_session",
+                "grok_account_manager.providers.grok.registration.build_browser_http_session",
                 return_value=http_session,
             ) as build_session,
             patch(
-                "grok_account_manager.providers.grok.exchange_sso_for_oauth_tokens",
+                "grok_account_manager.providers.grok.registration.exchange_sso_for_oauth_tokens",
                 return_value={"access_token": "access-token", "refresh_token": "refresh-token"},
             ) as exchange,
             patch(
-                "grok_account_manager.providers.grok.fetch_complete_credential",
+                "grok_account_manager.providers.grok.registration.fetch_complete_credential",
                 return_value={
                     "id": "account-id",
                     "email": "registered@example.com",
@@ -423,23 +423,23 @@ class GrokProviderTests(unittest.TestCase):
         provider._interruptible_sleep = lambda _seconds: None
 
         with (
-            patch("grok_account_manager.providers.grok._click_email_signup_button"),
+            patch("grok_account_manager.providers.grok.registration._click_email_signup_button"),
             patch(
-                "grok_account_manager.providers.grok._fill_email_and_submit",
+                "grok_account_manager.providers.grok.registration._fill_email_and_submit",
                 return_value="registered@example.com",
             ),
-            patch("grok_account_manager.providers.grok._fill_code_and_submit"),
+            patch("grok_account_manager.providers.grok.registration._fill_code_and_submit"),
             patch(
-                "grok_account_manager.providers.grok._fill_profile_and_submit",
+                "grok_account_manager.providers.grok.registration._fill_profile_and_submit",
                 return_value={"first_name": "Test", "last_name": "User", "password": "secret"},
             ),
-            patch("grok_account_manager.providers.grok.wait_for_cookie", return_value="browser-sso"),
+            patch("grok_account_manager.providers.grok.registration.wait_for_cookie", return_value="browser-sso"),
             patch(
-                "grok_account_manager.providers.grok.exchange_sso_for_oauth_tokens",
+                "grok_account_manager.providers.grok.registration.exchange_sso_for_oauth_tokens",
                 side_effect=OAuthTerminalError("access_denied"),
             ) as exchange,
             patch(
-                "grok_account_manager.providers.grok.fetch_complete_credential",
+                "grok_account_manager.providers.grok.registration.fetch_complete_credential",
                 return_value={
                     "id": "account-id",
                     "email": "registered@example.com",
@@ -462,19 +462,19 @@ class GrokProviderTests(unittest.TestCase):
         provider.stop_event = stop_event
 
         with (
-            patch("grok_account_manager.providers.grok._click_email_signup_button"),
+            patch("grok_account_manager.providers.grok.registration._click_email_signup_button"),
             patch(
-                "grok_account_manager.providers.grok._fill_email_and_submit",
+                "grok_account_manager.providers.grok.registration._fill_email_and_submit",
                 return_value="registered@example.com",
             ),
-            patch("grok_account_manager.providers.grok._fill_code_and_submit"),
+            patch("grok_account_manager.providers.grok.registration._fill_code_and_submit"),
             patch(
-                "grok_account_manager.providers.grok._fill_profile_and_submit",
+                "grok_account_manager.providers.grok.registration._fill_profile_and_submit",
                 return_value={"first_name": "Test", "last_name": "User", "password": "secret"},
             ),
-            patch("grok_account_manager.providers.grok.wait_for_cookie", return_value="browser-sso"),
+            patch("grok_account_manager.providers.grok.registration.wait_for_cookie", return_value="browser-sso"),
             patch(
-                "grok_account_manager.providers.grok.exchange_sso_for_oauth_tokens",
+                "grok_account_manager.providers.grok.registration.exchange_sso_for_oauth_tokens",
                 side_effect=CloudflareBlockedError("You have been blocked"),
             ) as exchange,
         ):
@@ -483,6 +483,45 @@ class GrokProviderTests(unittest.TestCase):
 
         self.assertTrue(stop_event.is_set())
         self.assertEqual(exchange.call_count, 1)
+
+
+class GoogleLoginMultilingualTests(unittest.TestCase):
+    """Google 界面语言随账号 locale 变化，主操作按钮不能只认英文/中文文案。"""
+
+    def setUp(self) -> None:
+        import inspect
+
+        from grok_account_manager.providers.grok.registration import _handle_google_login_step
+
+        self.script = inspect.getsource(_handle_google_login_step)
+
+    def test_primary_action_is_located_by_stable_google_ids(self) -> None:
+        # 这些 id / jsname 与界面语言无关，必须优先使用。
+        for selector in ("#identifierNext", "#passwordNext", "#submit_approve_access"):
+            self.assertIn(selector, self.script)
+        self.assertIn('button[jsname="V67aGc"]', self.script)
+
+    def test_primary_action_keywords_cover_major_locales(self) -> None:
+        for keyword in (
+            "tiếptục",  # 越南语 continue（线上实际遇到的）
+            "tiếptheo",  # 越南语 next
+            "続行",  # 日语
+            "계속",  # 韩语
+            "weiter",  # 德语
+            "continuer",  # 法语
+            "продолжить",  # 俄语
+            "متابعة",  # 阿拉伯语
+            "ดำเนินการต่อ",  # 泰语
+            "lanjutkan",  # 印尼语
+            "继续",  # 简体中文
+        ):
+            self.assertIn(keyword, self.script)
+
+    def test_cancel_keywords_are_excluded_from_position_fallback(self) -> None:
+        self.assertIn("CANCEL_KEYWORDS", self.script)
+        self.assertIn("isCancelLike", self.script)
+        for keyword in ("huỷ", "cancel", "取消", "キャンセル", "отмена", "إلغاء"):
+            self.assertIn(keyword, self.script)
 
 
 if __name__ == "__main__":

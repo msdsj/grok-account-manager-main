@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState, type ReactNode } from "react";
 
 import {
   ApiError,
+  LEGACY_ADMIN_API_PREFIX,
   apiRequest,
   decodeAdminDTO,
   decodeLoggedOut,
@@ -31,7 +32,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
       if (refreshResult === "refreshed") {
         try {
-          const value = await apiRequest("/api/admin/v1/me", { retryAuth: false }, decodeAdminDTO);
+          const value = await apiRequest(`${LEGACY_ADMIN_API_PREFIX}/me`, { retryAuth: false }, decodeAdminDTO);
           setAdmin(value);
           setStatus("authenticated");
           return;
@@ -72,7 +73,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [restoreSession]);
 
   async function login(username: string, password: string): Promise<void> {
-    const response = await apiRequest("/api/admin/v1/auth/login", {
+    const response = await apiRequest(`${LEGACY_ADMIN_API_PREFIX}/auth/login`, {
       method: "POST",
       body: { username, password },
       authenticated: false,
@@ -85,7 +86,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   async function logout(): Promise<void> {
     try {
-      await apiRequest("/api/admin/v1/auth/logout", {
+      await apiRequest(`${LEGACY_ADMIN_API_PREFIX}/auth/logout`, {
         method: "POST",
         body: {},
         authenticated: false,
@@ -99,7 +100,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }
 
   async function changePassword(currentPassword: string, newPassword: string): Promise<void> {
-    await apiRequest("/api/admin/v1/me/password", {
+    await apiRequest(`${LEGACY_ADMIN_API_PREFIX}/me/password`, {
       method: "PUT",
       body: { currentPassword, newPassword },
     }, () => undefined);

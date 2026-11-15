@@ -7,7 +7,7 @@ from pathlib import Path
 import tempfile
 
 from ...mail.sources import OutlookAccount, parse_outlook_accounts
-from ..config import OUTLOOK_MAILBOX_POOL_PATH
+from ...core.paths import OUTLOOK_MAILBOX_POOL_PATH
 
 _MAX_POOL_BYTES = 1_000_000
 

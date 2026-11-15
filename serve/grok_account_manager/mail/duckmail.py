@@ -34,23 +34,26 @@ def _random_string(length=12):
     return "".join(secrets.choice(string.ascii_lowercase + string.digits) for _ in range(length))
 
 
-def get_email_and_token():
+def get_email_and_token(base_url=None, api_key=None, domain=None):
     try:
-        if not DUCKMAIL_API_KEY:
+        active_base_url = str(base_url or BASE_URL).rstrip("/")
+        active_api_key = str(api_key if api_key is not None else DUCKMAIL_API_KEY).strip()
+        active_domain = str(domain if domain is not None else DUCKMAIL_DOMAIN).strip()
+        if not active_api_key:
             print("[Error] 未配置 DUCKMAIL_API_KEY 环境变量")
             return None, None
 
         # 1. 生成随机邮箱和密码
         local_part = _random_string(10)
-        domain = DUCKMAIL_DOMAIN.lstrip("@")
-        email = f"{local_part}@{domain}"
+        active_domain = active_domain.lstrip("@")
+        email = f"{local_part}@{active_domain}"
         password = _random_string(16)
 
         # 2. 创建账户（需要 API Key 认证）
         r = requests.post(
-            f"{BASE_URL}/accounts",
+            f"{active_base_url}/accounts",
             json={"address": email, "password": password},
-            headers={"Authorization": f"Bearer {DUCKMAIL_API_KEY}"},
+            headers={"Authorization": f"Bearer {active_api_key}"},
             timeout=30,
         )
 
@@ -65,7 +68,7 @@ def get_email_and_token():
 
         # 3. 获取 token（不需要 API Key）
         r = requests.post(
-            f"{BASE_URL}/token",
+            f"{active_base_url}/token",
             json={"address": email, "password": password},
             timeout=30,
         )
@@ -90,13 +93,38 @@ def _is_trusted_xai_sender(sender: str) -> bool:
     return domain in {"x.ai", "grok.com"} or domain.endswith((".x.ai", ".grok.com"))
 
 
+def _is_trusted_openai_sender(sender: str) -> bool:
+    """检查发件人是否为可信的 OpenAI 域名。"""
+    address = parseaddr(str(sender or ""))[1].strip().lower()
+    if not address and "@" in str(sender or ""):
+        address = str(sender).strip().lower()
+    domain = address.rsplit("@", 1)[-1] if "@" in address else ""
+    return domain in {"openai.com", "auth.openai.com"} or domain.endswith((".openai.com",))
+
+
 def _extract_code(subject, text, html_text="", sender=""):
-    """只从明确验证码上下文或可信 xAI 邮件中提取 OTP。"""
+    """只从明确验证码上下文或可信 xAI/OpenAI 邮件中提取 OTP。"""
     text = text or ""
     html_text = html_text or ""
     subject = subject or ""
     full_text = f"{subject}\n{text}\n{html_text}"
 
+    # 对于 OpenAI 邮件，使用特定的 HTML 结构提取验证码
+    if _is_trusted_openai_sender(sender) and html_text:
+        # 优先从带有特定样式的 <p> 标签中提取（OpenAI 验证码专用样式）
+        # 匹配: <p style="...Menlo, Monaco, Lucida Console...font-size: 24px..."> 数字 </p>
+        pattern = r'<p\s+style="[^"]*(?:Menlo|Monaco|Lucida\s+Console)[^"]*font-size:\s*24px[^"]*">[\s\S]*?(\d{6})[\s\S]*?</p>'
+        match = re.search(pattern, html_text, re.IGNORECASE)
+        if match:
+            return match.group(1)
+
+        # 备用：查找任何大字号灰色背景的段落中的 6 位数字
+        pattern = r'<p[^>]*background-color:\s*#F3F3F3[^>]*>[\s\S]*?(\d{6})[\s\S]*?</p>'
+        match = re.search(pattern, html_text, re.IGNORECASE)
+        if match:
+            return match.group(1)
+
+    # 对于 xAI 邮件或其他情况，使用原有逻辑
     for pat in _VERIFICATION_PATTERNS:
         m = re.search(pat, full_text, re.IGNORECASE | re.DOTALL)
         if m:
@@ -104,6 +132,7 @@ def _extract_code(subject, text, html_text="", sender=""):
             if code:
                 return code.upper() if "-" in code else code
 
+    # 对可信的 xAI 发件人，使用宽松的模式匹配
     if _is_trusted_xai_sender(sender):
         m = re.search(rf"\b{_CODE_TOKEN_PATTERN}\b", full_text, re.IGNORECASE)
         if m:
@@ -119,7 +148,7 @@ def extract_verification_code(subject="", text="", html_text="", sender=""):
 
 def _is_verification_email(subject, sender):
     """判断是否为验证码邮件。"""
-    if _is_trusted_xai_sender(sender):
+    if _is_trusted_xai_sender(sender) or _is_trusted_openai_sender(sender):
         return True
     keywords = ["verification code", "confirmation code", "security code", "验证码", "确认码", "校验码"]
     text = f"{subject} {sender}".lower()
@@ -173,9 +202,11 @@ def get_oai_code(
     stop_event=None,
     timeout=180,
     interval=3,
+    base_url=None,
 ):
     try:
         headers = {"Authorization": f"Bearer {token}"}
+        active_base_url = str(base_url or BASE_URL).rstrip("/")
         timeout = max(0.0, float(timeout))
         interval = max(0.0, float(interval))
         deadline = time.monotonic() + timeout
@@ -185,7 +216,7 @@ def get_oai_code(
                 print("[*] 收到停止信号，取消验证码轮询")
                 return None
             r = _duckmail_get_with_retry(
-                f"{BASE_URL}/messages",
+                f"{active_base_url}/messages",
                 headers,
                 deadline,
                 interval,
@@ -228,7 +259,7 @@ def get_oai_code(
 
                 # 获取邮件详情
                 r = _duckmail_get_with_retry(
-                    f"{BASE_URL}/messages/{msg_id}",
+                    f"{active_base_url}/messages/{msg_id}",
                     headers,
                     deadline,
                     interval,
@@ -258,7 +289,7 @@ def get_oai_code(
                     print("[*] 已获取邮箱验证码")
                     # 标记为已读，避免重复提取
                     try:
-                        requests.patch(f"{BASE_URL}/messages/{msg_id}", headers={**headers, "Content-Type": "application/merge-patch+json"}, json={"seen": True}, timeout=10)
+                        requests.patch(f"{active_base_url}/messages/{msg_id}", headers={**headers, "Content-Type": "application/merge-patch+json"}, json={"seen": True}, timeout=10)
                     except Exception:
                         pass
                     return code

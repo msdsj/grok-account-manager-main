@@ -16,9 +16,6 @@ def main() -> int:
     log_file = Path(sys.argv[3]).resolve()
     command = root_dir / ".venv" / "bin" / "grok-account-manager-api"
     if not command.exists():
-        command = root_dir / ".venv" / "bin" / "grok-account-manager-web"
-
-    if not command.exists():
         print(f"missing command: {command}", file=sys.stderr)
         return 1
 

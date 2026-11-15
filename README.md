@@ -1,12 +1,20 @@
 # grok-account-manager
  
-Grok 账号注册与凭证管理工具。项目提供 Python 自动化注册流程和 React 本地控制台，支持 DuckMail、Cloud Mail、Outlook/Google 邮箱接码、GrokAccount JSON 凭证归档，以及可选推送到外部 Sub2API 实例。
+Grok / GPT / Kiro 三网关账号注册与凭证管理工具。项目提供 Python 自动化注册流程、内置 OpenAI 兼容网关和 React 控制台，支持 DuckMail、Cloud Mail、Outlook/Google 邮箱接码、账号数据库与标签、额度查看、导入导出，以及可选推送到外部 Sub2API 实例。
 
-本项目允许免费使用、学习和二次开发。本地中转默认以 `ghcr.io/chenyme/grok2api:latest` 作为官方候选镜像，同时保留仓库内置的 grok2api v3.1.4 源码和 Dockerfile 作为兼容回退；不需要另外克隆 grok2api 仓库。请勿把 `.env`、邮箱服务 Token/密码、Outlook refresh token、浏览器 cookie、SSO token 或 `output/` 里的凭证提交到 GitHub。
+本项目允许免费使用、学习和二次开发。全部后端能力都在同一条 Python FastAPI 进程中：注册任务、账号管理、三网关 `/v1` 调用与审计，不再依赖 Docker、Go 网关或 Node sidecar。请勿把 `.env`、邮箱服务 Token/密码、Outlook refresh token、浏览器 cookie、SSO token 或 `output/` 里的凭证提交到 GitHub。
+
+## 最快启动
+
+```bash
+./scripts/start.sh
+```
+
+打开 <http://127.0.0.1:43187>，默认账号 `admin` / `admin`。脚本会自动生成 `.env`、同步依赖、构建前端并启动完整应用。更多说明见 [QUICKSTART.md](QUICKSTART.md)。
 
 ## 文档
 
-- [完整部署、运行与使用指南](docs/deployment-and-usage.md)：环境准备、CLI、控制台、代理池、本地中转、更新与排错。
+- [完整部署、运行与使用指南](docs/deployment-and-usage.md)：环境准备、CLI、控制台、代理池、内置网关、更新与排错。
 - [快速使用教程](docs/getting-started.md)：从安装到启动前后端、运行注册任务和提交前安全检查。
 - [首次运行教程](docs/first-run.md)：新用户一键启动、注册机入口和后续更新。
 - [更新日志](CHANGELOG.md)：按日期整理的功能变更。
@@ -14,6 +22,8 @@ Grok 账号注册与凭证管理工具。项目提供 Python 自动化注册流�
 - [Cloud Mail 邮箱源](docs/cloud-mail.md)
 - [Outlook 邮箱池](docs/outlook-mailbox-pool.md)
 - [Grok OAuth Flow](docs/grok-oauth-flow.md)
+- [ChatGPT 注册流程](docs/chatgpt-registration.md)
+- [ChatGPT 使用说明](docs/chatgpt-usage.md)
 
 ## 项目界面
 
@@ -26,7 +36,7 @@ GitHub：<https://github.com/msdsj/grok-account-manager-main>
 如果这个项目帮到你，欢迎帮忙点一个 Star。使用中遇到账号池、Grok CLI 4.5、Chat 对话或图片生成问题。
 ## 更新日志
 
-完整版本记录见 [CHANGELOG.md](CHANGELOG.md)。当前版本重点更新 FastAPI 后端重构、账号数据库、Grok CLI 4.5 测试、Chat/图片测试、本地中转和新版控制台界面。
+完整版本记录见 [CHANGELOG.md](CHANGELOG.md)。当前版本重点更新全 Python 三网关（Grok / GPT / Kiro）、macOS 风格控制台、账号数据库、标签与日志、模型目录和请求审计。
 
 ## 功能
 
@@ -35,7 +45,8 @@ GitHub：<https://github.com/msdsj/grok-account-manager-main>
 - 可选注册代理池：每个注册浏览器随机领取一个未使用端点，下一轮重启浏览器时切换到新的端点。
 - 注册页、浏览器启动和 OAuth 短暂网络错误都有有界重试，任务停止后不会继续拉起浏览器。
 - 输出 cockpit-tools 可导入的 GrokAccount JSON 数组，并同步写入本地账号数据库。
-- React 控制台使用侧边栏路由，支持注册任务、账号列表、Grok CLI 4.5 测试、Chat 对话测试、图片生成测试和本地中转。
+- React 控制台使用 macOS 风格侧边栏路由，支持注册任务、账号与标签、额度、模型目录、密钥、请求审计、操作日志和配置中心。
+- 内置 OpenAI 兼容网关：Grok 对话/图片/视频、GPT 图片、Kiro 对话，统一账号池、密钥、审计与模型目录。
 - 可选 `sub2api` sink，把注册结果写入独立部署的 Sub2API 管理 API。
 
 ## 环境要求
@@ -197,7 +208,7 @@ GROK_ACCOUNT_MANAGER_DB_PATH=output/grok-account-manager.db
 
 ## 本地控制台
 
-后端现在是单一 FastAPI 服务，注册机 API、中转站管理 API 和 OpenAI 兼容代理都由它提供。开发模式运行两个进程：一个后端、一个前端。侧边栏中的“注册机”进入本项目内置的注册任务页面。
+后端现在是单一 FastAPI 服务，注册 API、账号管理、OpenAI 兼容网关与审计都由它提供。开发模式运行两个进程：一个后端、一个前端。侧边栏中的“注册机”进入本项目内置的注册任务页面，“密钥 / 请求审计 / 模型路由”管理内置网关。
 
 ```bash
 uv run grok-account-manager-api
@@ -230,11 +241,11 @@ cd ..
 uv run grok-account-manager-api
 ```
 
-然后打开 `http://127.0.0.1:43187`。旧命令 `uv run grok-account-manager-web` 仍然可用，内部指向同一个 FastAPI 入口。
+然后打开 `http://127.0.0.1:43187`。
 
 ### 一键更新
 
-从本仓库拉取代码后，使用下面的脚本同步本仓库、安装依赖、构建前端、预拉取官方网关候选镜像，并构建仓库内置的 v3.1.4 回退镜像：
+从本仓库拉取代码后，使用下面的脚本同步代码、安装依赖并构建前端：
 
 ```bash
 ./scripts/update.sh
@@ -246,31 +257,27 @@ uv run grok-account-manager-api
 ./scripts/update-and-run.sh
 ```
 
-默认候选为 `ghcr.io/chenyme/grok2api:latest`。如需指定版本 tag 或固定 digest，可在 `.env` 中设置，例如：
+### 内置网关
 
-```dotenv
-GROK_ACCOUNT_MANAGER_GATEWAY_IMAGE=ghcr.io/chenyme/grok2api:vX.Y.Z
-# GROK_ACCOUNT_MANAGER_GATEWAY_IMAGE=ghcr.io/chenyme/grok2api@sha256:<64 位摘要>
-```
+三网关都挂在同一个 FastAPI 进程上：
 
-`update.sh` 的预拉取读取当前 shell 环境；希望它提前准备同一固定版本时，可用 `GROK_ACCOUNT_MANAGER_GATEWAY_IMAGE=... ./scripts/update.sh` 调用。
+- `GET /v1/models`：模型目录
+- `POST /v1/chat/completions`：Grok / Kiro 对话（支持流式）
+- `POST /v1/images/generations`、`/v1/images/edits`：Grok / GPT 图片
+- `POST /v1/videos/generations`、`GET /v1/videos/{id}`：Grok 视频任务
 
-启动本地中转时，后端会拉取所选候选、解析其 `RepoDigest`，再使用临时配置和临时数据目录执行隔离探针；只有通过验证的不可变 digest 才会用于正式容器。新 digest 首次接触正式 SQLite 前会创建私有备份，正式启动或管理员握手失败时恢复数据库后再回退。候选无法拉取且没有可验证缓存、没有 `RepoDigest` 或探针失败时，会自动回退到仓库内置的 v3.1.4 镜像。FastAPI 每次重启都会执行一次强制更新检查；普通 API 请求会复用当前健康容器，不会反复重启。`update.sh` 的预拉取只是在更新阶段准备候选，不能代替启动时验证。
+控制台“密钥”页面创建 `gak_...` 客户端密钥后，请求头使用 `Authorization: Bearer <key>`。数据库里还没有密钥时，本机 `127.0.0.1` 直连模式放行，便于初始化。模型与 provider 的映射可以在“模型路由”页面查看，每次调用的状态、耗时与 token 会写入“请求审计”。
 
 ## 输出文件
 
-- `output/credentials/grok_credentials.json`：GrokAccount JSON 数组。
-- `output/grok-account-manager.db`：本地账号数据库。
-- `output/sso.txt`：使用 `txt` sink 时写入的 SSO 兜底文本。
+- `output/grok-account-manager.db`：统一账号、标签、任务日志、操作日志与待恢复队列的 SQLite 主库，是账号数据的唯一来源。
+- `output/credentials/`：历史上用于 JSON 导出，运行时不再读写；需要时通过控制台导出接口生成。
+- `output/sso.txt`：仅在 CLI 显式使用 `txt` sink 时生成。
 - `output/sso-failed.txt`：Sub2API 写入失败时的兜底文本。
-- `output/pending-registration-results.json`：控制台任务的未完成 OAuth checkpoint 和落盘失败恢复队列。
 - `output/registration-proxies.json`：控制台导入的注册节点池，仅当前用户可读写。
-- `output/grok2api-v2-data/`：本地中转 SQLite 与媒体数据，官方和回退镜像共用。
-- `output/grok2api-v2-backups/`：新官方 digest 首次正式启动前创建的私有 SQLite 回滚备份。
+- `output/backups/`：旧版本存储迁移时的自动备份。
 
-`output/` 是运行产物目录，默认不纳入 Git。
-
-恢复队列采用原子替换并设为 `0600` 权限。`persistence_failed` 会在 FastAPI 后端下次启动时自动重试；`oauth_pending` 只保留已注册的 SSO 恢复信息，不会自动写入正式账号库。如果现有 `grok_credentials.json` 无法解析或结构非法，sink 会生成同目录 `grok_credentials.json.broken-时间戳` 备份并拒绝覆盖原文件。
+`output/` 是运行产物目录，默认不纳入 Git。注册结果、操作日志、任务日志和待恢复队列均写入数据库；`persistence_failed` 会在后端下次启动时自动重试，`oauth_pending` 只保留恢复信息，不会自动写入正式账号库。
 
 ## OAuth Refresh Token
 
@@ -301,25 +308,47 @@ uv run grok-account-manager grok --count 1 --sink sub2api
 
 ```text
 serve/grok_account_manager/
-  api/
-    app.py                # FastAPI 应用工厂、CORS、SPA 静态入口
+  api/                    # HTTP 层
+    app.py                # FastAPI 应用工厂、健康检查、SPA 静态入口
     main.py               # 后端启动命令
-    routers/              # 注册、账号、中转站、代理 API 路由
-    services/             # 任务调度、账号数据库、中转站进程管理
+    routers/              # 账号、注册、日志、认证、网关、统计路由
+    services/             # 任务调度、账号、待恢复队列、邮箱配置
+  core/                   # 基础设施
+    browser.py            # Chromium 启停、扩展加载、cookie 等待
+    database.py           # SQLite 主库与全部数据访问
+    audit.py              # 操作/任务/系统日志
+    paths.py              # 运行目录与文件路径
+    utils.py              # 共享工具函数
+  gateway/                # 三网关共享层
+    catalog.py            # 模型目录聚合
+    pool.py               # 账号池、轮询与冷却
+    auth.py               # 客户端密钥
+    audit.py              # 网关请求审计
+    registry.py           # provider 适配器注册表
+  providers/              # 业务板块
+    base.py               # 注册流程抽象
+    grok/
+      registration.py     # Grok 注册页面自动化
+      client.py           # GrokAccount JSON 与额度 API
+      oauth_exchange.py   # xAI OAuth Device Flow
+      account_tester.py   # 账号能力探测
+      models.py           # 默认模型配置
+      gateway/            # 对话/图片/视频适配
+    gpt/
+      registration.py     # ChatGPT 注册自动化
+      utils.py            # Sentinel/PoW/PKCE 工具
+      models.py           # 默认图片模型配置
+      gateway/            # 图片生成与编辑适配
+    kiro/
+      models.py           # 模型映射与默认目录
+      gateway/            # 对话、事件流与协议转换
+  mail/                   # DuckMail / Cloud Mail / Outlook / Gmail
+  sinks/                  # JSON/TXT/CPA/Sub2API 输出
   cli.py                  # CLI 参数解析和轮次调度
-  core/browser.py         # Chromium 启停、扩展加载、cookie 等待
-  mail/cloud_mail.py      # Cloud Mail 创建邮箱与接码
-  mail/duckmail.py        # DuckMail 接码
-  mail/sources.py         # 邮箱源工厂及 Outlook / Gmail / Google 实现
-  grok/client.py          # GrokAccount JSON 构建与额度 API
-  grok/oauth_exchange.py  # xAI OAuth Device Flow
-  providers/grok.py       # Grok 注册页面自动化
-  sinks/                  # JSON/TXT/Sub2API 输出
-extensions/turnstile_patch/
-web/src/
-  routes.tsx              # 侧边栏页面路由配置
-scripts/
-docs/
+tests/                    # 单元测试与网关集成测试
+web/src/                  # React 控制台（app/components/features/entities/shared）
+scripts/                  # start / update / verify
+docs/                     # 部署、邮箱、OAuth 与快速启动文档
 ```
 
 ## 验证

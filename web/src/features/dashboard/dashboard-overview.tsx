@@ -30,7 +30,7 @@ export function DashboardOverview({ dashboard, locale, loading }: DashboardDataP
 
   return (
     <section aria-label={t("dashboard.usage")}>
-      <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-5">
+      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
         <DashboardMetric
           icon={UsersRound}
           label={t("dashboard.accountCount")}
@@ -162,13 +162,15 @@ export function DashboardResources({ dashboard, locale, loading }: DashboardData
 
 function DashboardMetric({ icon: Icon, label, value, detail, loading }: { icon: LucideIcon; label: string; value: string; detail: string; loading: boolean }) {
   return (
-    <article className="min-h-28 rounded-lg bg-card p-4" aria-busy={loading}>
+    <article className="rounded-xl border border-border/80 bg-card p-4 shadow-[var(--shadow-card)]" aria-busy={loading}>
       <header className="flex min-h-5 items-center justify-between gap-3">
-        <span className="text-xs text-muted-foreground">{label}</span>
-        <Icon className="size-4 shrink-0 text-muted-foreground" />
+        <span className="truncate text-[10px] font-semibold uppercase tracking-[0.1em] text-muted-foreground">{label}</span>
+        <span className="flex size-6 shrink-0 items-center justify-center rounded-md bg-secondary/70 text-muted-foreground">
+          <Icon className="size-3.5" strokeWidth={1.8} />
+        </span>
       </header>
-      <div className="mt-3 flex min-h-8 items-center text-2xl font-medium tracking-tight tabular-nums">{loading ? <Spinner /> : value}</div>
-      <p className={cn("mt-1.5 min-h-4 truncate text-[11px] text-muted-foreground", loading && "invisible")} title={detail}>{detail}</p>
+      <div className="mt-3 flex min-h-8 items-center text-[22px] font-semibold tracking-[-0.03em] tabular-nums">{loading ? <Spinner /> : value}</div>
+      <p className={cn("mt-1 min-h-4 truncate text-[11px] text-muted-foreground", loading && "invisible")} title={detail}>{detail}</p>
     </article>
   );
 }

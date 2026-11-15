@@ -5,7 +5,7 @@ from pathlib import Path
 import stat
 from unittest.mock import patch
 
-from grok_account_manager.api.services import database as account_db
+from grok_account_manager.core import database as account_db
 from grok_account_manager.sinks.json_credential import JsonCredentialSink
 from grok_account_manager.sinks.txt_file import TxtFileSink
 

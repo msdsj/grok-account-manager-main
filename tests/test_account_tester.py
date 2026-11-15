@@ -2,7 +2,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-from grok_account_manager.grok.account_tester import generate_grok_image, send_grok_chat, test_grok_account
+from grok_account_manager.providers.grok.account_tester import generate_grok_image, send_grok_chat, test_grok_account
 
 
 class _Response:
@@ -32,8 +32,8 @@ class AccountTesterTests(unittest.TestCase):
             return _Response(200, {"data": []})
 
         with (
-            patch("grok_account_manager.grok.account_tester.requests.post", side_effect=fake_post),
-            patch("grok_account_manager.grok.account_tester.requests.get", side_effect=fake_get),
+            patch("grok_account_manager.providers.grok.account_tester.requests.post", side_effect=fake_post),
+            patch("grok_account_manager.providers.grok.account_tester.requests.get", side_effect=fake_get),
         ):
             result, _ = test_grok_account({"email": "a@example.com", "access_token": "token"}, timeout=5)
 
@@ -55,8 +55,8 @@ class AccountTesterTests(unittest.TestCase):
             return _Response(200, {"data": []})
 
         with (
-            patch("grok_account_manager.grok.account_tester.requests.post", side_effect=fake_post),
-            patch("grok_account_manager.grok.account_tester.requests.get", side_effect=fake_get),
+            patch("grok_account_manager.providers.grok.account_tester.requests.post", side_effect=fake_post),
+            patch("grok_account_manager.providers.grok.account_tester.requests.get", side_effect=fake_get),
         ):
             result, _ = test_grok_account({"email": "a@example.com", "access_token": "token"}, timeout=5)
 
@@ -75,8 +75,8 @@ class AccountTesterTests(unittest.TestCase):
             return _Response(200, {"data": [{"id": "grok-imagine-image", "object": "model"}]})
 
         with (
-            patch("grok_account_manager.grok.account_tester.requests.post", side_effect=fake_post),
-            patch("grok_account_manager.grok.account_tester.requests.get", side_effect=fake_get),
+            patch("grok_account_manager.providers.grok.account_tester.requests.post", side_effect=fake_post),
+            patch("grok_account_manager.providers.grok.account_tester.requests.get", side_effect=fake_get),
         ):
             result, _ = test_grok_account({"email": "a@example.com", "access_token": "token"}, timeout=5)
 
@@ -104,8 +104,8 @@ class AccountTesterTests(unittest.TestCase):
             return _Response(200, {"data": []})
 
         with (
-            patch("grok_account_manager.grok.account_tester.requests.post", side_effect=fake_post),
-            patch("grok_account_manager.grok.account_tester.requests.get", side_effect=fake_get),
+            patch("grok_account_manager.providers.grok.account_tester.requests.post", side_effect=fake_post),
+            patch("grok_account_manager.providers.grok.account_tester.requests.get", side_effect=fake_get),
         ):
             result, updated = test_grok_account(
                 {
@@ -137,7 +137,7 @@ class AccountTesterTests(unittest.TestCase):
                 {"output": [{"content": [{"type": "output_text", "text": "chat ok"}]}]},
             )
 
-        with patch("grok_account_manager.grok.account_tester.requests.post", side_effect=fake_post):
+        with patch("grok_account_manager.providers.grok.account_tester.requests.post", side_effect=fake_post):
             result, updated = send_grok_chat(
                 {"email": "a@example.com", "refresh_token": "rt"},
                 model="grok-4.20-auto",
@@ -162,7 +162,7 @@ class AccountTesterTests(unittest.TestCase):
                 {"output": [{"content": [{"type": "output_text", "text": "chat ok"}]}]},
             )
 
-        with patch("grok_account_manager.grok.account_tester.requests.post", side_effect=fake_post):
+        with patch("grok_account_manager.providers.grok.account_tester.requests.post", side_effect=fake_post):
             result, updated = send_grok_chat(
                 {
                     "email": "a@example.com",
@@ -190,7 +190,7 @@ class AccountTesterTests(unittest.TestCase):
             self.assertNotIn("size", kwargs["json"])
             return _Response(200, {"data": [{"url": "https://example.com/image.png"}]})
 
-        with patch("grok_account_manager.grok.account_tester.requests.post", side_effect=fake_post):
+        with patch("grok_account_manager.providers.grok.account_tester.requests.post", side_effect=fake_post):
             result, updated = generate_grok_image(
                 {"email": "a@example.com", "refresh_token": "rt"},
                 model="grok-imagine-image",

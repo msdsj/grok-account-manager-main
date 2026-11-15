@@ -69,6 +69,36 @@ class BrowserIsolationTests(unittest.TestCase):
         self.assertIn("--incognito", options.arguments)
         self.assertNotIn("--disable-blink-features=AutomationControlled", options.arguments)
 
+    def test_background_throttling_is_disabled_for_registration_windows(self) -> None:
+        """最小化/被遮挡的注册窗口必须保持前台优先级，否则页面会明显变慢。"""
+        options = build_chromium_options()
+
+        for flag in (
+            "--disable-background-timer-throttling",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding",
+        ):
+            self.assertIn(flag, options.arguments)
+
+    def test_proxy_browsers_block_webrtc_ip_leak(self) -> None:
+        """走代理时 WebRTC 不能绕过代理直连，否则会泄露真实公网 IP。"""
+        options = build_chromium_options(proxy_url="198.51.100.10:8080")
+
+        self.assertIn(
+            "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+            options.arguments,
+        )
+
+    def test_fingerprint_is_injected_via_cdp_not_extension(self) -> None:
+        """Chrome 137+ 已停用 --load-extension，指纹必须走 CDP 注入才真的生效。"""
+        import inspect
+
+        from grok_account_manager.core import browser as browser_mod
+
+        source = inspect.getsource(browser_mod.DrissionBrowserSession)
+        self.assertIn("Page.addScriptToEvaluateOnNewDocument", source)
+        self.assertIn("_inject_fingerprint", source)
+
     def test_window_can_be_minimized_and_restored_to_assigned_bounds(self) -> None:
         options = ChromiumOptions()
         options._grok_window_bounds = (10, 20, 800, 600)
